@@ -17,7 +17,7 @@ from sparksi.activity import store as activity_store
 from sparksi.config import CFG, env
 from sparksi.health import DEFAULT_HEALTH_TIMEOUT_S
 from sparksi.launch import monitor_loaded, plan_drop, plan_run, plan_stage, plan_stop, plan_switch
-from sparksi.library import fleet, row_by_id
+from sparksi.library import catalog_serving, fleet, row_by_id
 from sparksi.log import logger
 from sparksi.never import launcher_refusal
 from sparksi.remote import SshRunner
@@ -463,8 +463,10 @@ def _stop_other_sides(exec_runner: Any, step: dict[str, Any], failed: dict[str, 
         host = side.get("host")
         if not host:
             continue
-        exec_runner.run_argv(host, argv, timeout=3600)
-        stopped.append(str(side.get("role") or host))
+        result = exec_runner.run_argv(host, argv, timeout=3600)
+        # Only a stop that answered ok counts: the page keeps Unload live for the rest.
+        if isinstance(result, dict) and result.get("ok") is not False:
+            stopped.append(str(side.get("role") or host))
     return stopped
 
 
@@ -741,10 +743,45 @@ def start_stop(catalog, row_id: str, *, lock_on: bool, runner=None) -> dict[str,
         return {"verdict": "REFUSE", "reasons": [f"unknown library id {row_id}"]}
     if load_in_progress():
         return {"verdict": "REFUSE", "reasons": ["still loading; stop does not interrupt a load"]}
+    if row.get("serving") is False:
+        # Not running: no stop command runs, so stopped containers and other harnesses are left alone.
+        name = row.get("title") or row_id
+        return {
+            "verdict": "REFUSE",
+            "not_running": True,
+            "stopped": False,
+            "error": f"{name} is not running; nothing was stopped",
+            "reasons": [f"{name} is not running; nothing was stopped"],
+        }
+    run_live = row.get("run_live")
+    if isinstance(run_live, dict) and run_live.get("up") and run_live.get("id"):
+        if catalog_serving(row, snap["probes"]) is not True:
+            # Sparksi launched what is up: stop that run's own containers, not the catalog script.
+            return _stop_run_of_row(catalog, row, str(run_live["id"]), lock_on=lock_on, runner=runner)
     plan = plan_stop(row, lock_on=lock_on)
     if plan["verdict"] != "READY":
         return plan
     return _start_argv(catalog, "stop", plan, runner)
+
+
+def _stop_run_of_row(catalog, row: dict[str, Any], run_id: str, *, lock_on: bool, runner=None) -> dict[str, Any]:
+    """Library-path stop of a row whose containers came from a Sparksi run: the run's own stop."""
+    if lock_on:
+        return {"verdict": "REFUSE", "reasons": ["lock is ON"]}
+    if str(row.get("id") or "").lower() in protect.protected_ids():
+        return {"verdict": "REFUSE", "reasons": ["refusing to stop the protected video service"]}
+    from sparksi.recipes.service import halt_run
+
+    _code, body = halt_run(catalog, _runner(catalog, runner), run_id)
+    stopped = bool(body.get("stopped"))
+    error = body.get("error") or ("" if stopped else "a stop of this run is already in progress")
+    return {
+        "verdict": "READY" if stopped else "REFUSE",
+        "stopped": stopped,
+        "run_id": run_id,
+        "error": error or None,
+        "reasons": [error] if error else [],
+    }
 
 
 def _copy_shards(exec_runner: Any, plan: dict[str, Any]) -> bool:

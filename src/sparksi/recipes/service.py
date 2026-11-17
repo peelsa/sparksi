@@ -1624,7 +1624,10 @@ def preview_recipe(catalog: dict[str, Any], runner: Any, model_id: str, query: d
     return 200, recipe
 
 
-def write_recipe(model_id: str, body: dict[str, Any], runner: Any = None) -> tuple[int, dict[str, Any]]:
+def write_recipe(
+    model_id: str, body: dict[str, Any], runner: Any = None, *, copied_from: str = ""
+) -> tuple[int, dict[str, Any]]:
+    """Save one recipe. ``copied_from`` comes from Save as only; a request body never sets it."""
     if not valid_id(model_id):
         return 400, {"error": "bad model id"}
     from sparksi.catalog import load_catalog
@@ -1633,6 +1636,7 @@ def write_recipe(model_id: str, body: dict[str, Any], runner: Any = None) -> tup
     found = card_by_id(build_cards(catalog, None, probe=False), model_id)
     saved = load_recipe(model_id)
     body = _fold_speculative(dict(body))
+    body.pop("copied_from", None)
     if str(body.get("kind") or saved.get("kind") or "") == "pinned" and not _leaving_pinned(saved, set(body), body):
         base = saved if saved.get("kind") == "pinned" else body
         if body.get("roles"):
@@ -1641,6 +1645,8 @@ def write_recipe(model_id: str, body: dict[str, Any], runner: Any = None) -> tup
         updated["kind"] = "pinned"
         if body.get("imported_from"):
             updated["imported_from"] = str(body["imported_from"])
+        if copied_from:
+            updated["copied_from"] = str(copied_from)
         if "port_note" in body:
             updated["port_note"] = str(body.get("port_note") or "")
         if body.get("rendezvous_ports") is not None:

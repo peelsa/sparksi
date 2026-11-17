@@ -172,7 +172,9 @@ def _stopped_copy(current: dict[str, Any]) -> dict[str, Any]:
 
 
 def _health_failure(run: dict[str, Any], incoming: str) -> bool:
-    """A pair/health/timeout failure, not a stop command that was refused."""
+    """A pair/health/timeout failure, not a stop command that was refused or errored."""
+    if run.get("stop_error") and incoming == "failed":
+        return False
     if incoming == "timed_out" or run.get("failed_side"):
         return True
     return bool(getattr(_WRITER, "monitor", False))
@@ -545,6 +547,15 @@ def _note_external(run: dict[str, Any], text: str) -> dict[str, Any]:
     return _save(run)
 
 
+def _stop_ok(result: Any) -> bool:
+    """A side counts as stopped only when its stop answered ok.
+
+    ``stopped_sides`` tells the page that nothing is left up; a refused or failed stop
+    leaves the side listed as maybe up, so Unload stays available for it.
+    """
+    return isinstance(result, dict) and result.get("ok") is not False
+
+
 def _fail_run(run: dict[str, Any], detail: str, *, side: str, host: str, stopped: list[str] | None = None) -> dict[str, Any]:
     """Record a failure unless a user stop landed while this probe was in flight."""
     settled = _settle_stop(str(run.get("id") or ""))
@@ -783,8 +794,9 @@ def _tick(run: dict[str, Any], runner: Any, *, now: float | None = None) -> dict
             for node in run.get("nodes") or []:
                 if node.get("role") == role:
                     continue
-                wrapped.run_argv(str(node.get("host") or ""), list(node.get("stop_argv") or []))
-                stopped.append(str(node.get("role") or ""))
+                result = wrapped.run_argv(str(node.get("host") or ""), list(node.get("stop_argv") or []))
+                if _stop_ok(result):
+                    stopped.append(str(node.get("role") or ""))
         return _fail_run(run, f"health on {host} failed", side=role, host=host, stopped=stopped)
     started = float(run.get("started") or clock)
     timeout_s = float(run.get("timeout_s") or 1800)
@@ -796,8 +808,9 @@ def _tick(run: dict[str, Any], runner: Any, *, now: float | None = None) -> dict
     if clock - started >= timeout_s:
         stopped = []
         for node in run.get("nodes") or []:
-            wrapped.run_argv(str(node.get("host") or ""), list(node.get("stop_argv") or []))
-            stopped.append(str(node.get("role") or ""))
+            result = wrapped.run_argv(str(node.get("host") or ""), list(node.get("stop_argv") or []))
+            if _stop_ok(result):
+                stopped.append(str(node.get("role") or ""))
         run["phase"] = "timed_out"
         run["ok"] = False
         run["error"] = f"port {port} did not answer"
@@ -1042,28 +1055,55 @@ def start_rendered(
     return get_run(run_id) or run
 
 
+_STOP_LOCK = threading.Lock()
+
+
+def _side_stopped(run: dict[str, Any], node: dict[str, Any]) -> bool:
+    """A side is stopped once its stop answered ok: node phase, or listed in stopped_sides."""
+    if str(node.get("phase") or "") == "stopped":
+        return True
+    role = node.get("role")
+    return bool(role) and role in (run.get("stopped_sides") or [])
+
+
+def _stop_settled(run: dict[str, Any]) -> bool:
+    """Nothing left to send: a stop is in flight, or every side is already stopped."""
+    phase = str(run.get("phase") or "")
+    if phase == "stopping":
+        return True
+    if phase in ("stopped", "cancelled"):
+        return all(_side_stopped(run, node) for node in run.get("nodes") or [] if isinstance(node, dict))
+    return False
+
+
 def stop_recorded(run: dict[str, Any], runner: Any) -> dict[str, Any]:
-    """Stop every side. Refuses port 8188 before any argv is sent.
+    """Stop every side that is not stopped yet. Refuses port 8188 before any argv is sent.
 
     ``stopping`` is written before the containers are removed, and it is terminal
     for the health monitor. A probe that is already in flight cannot put the run
     back to ``waiting_health`` or record the removed container as a failure.
     A side whose container disappears after this request is stopped.
+
+    A stop that errored leaves the run failed with that side not stopped, and a
+    second request retries only the sides still up. The claim (``stopping``) is
+    made under a lock, so two clicks never send two stops at once.
     """
-    current = get_run(str(run.get("id") or "")) or dict(run)
-    if protect.is_off_limits(int(current.get("port") or 0)):
-        current["phase"] = "failed"
-        current["ok"] = False
-        current["error"] = "port 8188 is off limits"
-        return _save(current)
-    if current.get("stop_requested") or str(current.get("phase") or "") in _USER_STOP:
-        return current
-    current["phase"] = "stopping"
-    current["stop_requested"] = True
-    current["ok"] = None
+    with _STOP_LOCK:
+        current = get_run(str(run.get("id") or "")) or dict(run)
+        if protect.is_off_limits(int(current.get("port") or 0)):
+            current["phase"] = "failed"
+            current["ok"] = False
+            current["error"] = "port 8188 is off limits"
+            return _save(current)
+        if _stop_settled(current):
+            return current
+        current["phase"] = "stopping"
+        current["stop_requested"] = True
+        current["ok"] = None
+        current = _save(current)
     free_at_stop: dict[str, float] = {}
     for node in current.get("nodes") or []:
-        if not isinstance(node, dict):
+        if not isinstance(node, dict) or _side_stopped(current, node):
             continue
         role = str(node.get("role") or "")
         free = _sample_free(runner, str(node.get("host") or ""))
@@ -1074,7 +1114,19 @@ def stop_recorded(run: dict[str, Any], runner: Any) -> dict[str, Any]:
     _audit("stop", f"unload {current.get('model_id') or ''}".rstrip(), phase="stopping")
     run = current
     errors = []
+    stopped_sides = list(run.get("stopped_sides") or [])
+    from sparksi.library import _superseded_by
+
+    others = list_runs()
     for node in run.get("nodes") or []:
+        if not isinstance(node, dict) or _side_stopped(run, node):
+            continue
+        newer = _superseded_by(run, str(node.get("host") or ""), str(node.get("container") or ""), others)
+        if node.get("container") and newer:
+            # A newer run reuses this name on this host: that container is not ours to stop.
+            node["phase"] = "stopped"
+            node["superseded_by"] = newer
+            continue
         argv = list(node.get("stop_argv") or [])
         blocked = launcher_refusal(argv) if argv else None
         if blocked:
@@ -1083,23 +1135,34 @@ def stop_recorded(run: dict[str, Any], runner: Any) -> dict[str, Any]:
         if any("dgx-announce" in part or part.rsplit("/", 1)[-1] == "video-mode.sh" for part in argv):
             errors.append("refusing forbidden command")
             continue
-        result = runner.invoke(
-            node.get("host"),
-            {"op": "stop", "run_id": node.get("run_id"), "argv": argv},
-            timeout=120,
-        )
+        try:
+            result = runner.invoke(
+                node.get("host"),
+                {"op": "stop", "run_id": node.get("run_id"), "argv": argv},
+                timeout=120,
+            )
+        except Exception as exc:  # noqa: BLE001 — a stuck "stopping" would block every retry
+            result = {"ok": False, "error": f"stop failed: {exc}"}
         if not isinstance(result, dict) or not result.get("ok", True):
+            # Leave the node's phase alone: the UI keeps Unload live until every side is stopped.
             errors.append(str((result or {}).get("error") or "stop failed"))
+            continue
         node["phase"] = "stopped"
+        role = str(node.get("role") or "")
+        if role and role not in stopped_sides:
+            stopped_sides.append(role)
+    run["stopped_sides"] = stopped_sides
     if errors:
         run["phase"] = "failed"
         run["ok"] = False
         run["error"] = errors[0]
+        run["stop_error"] = True
         _audit("stop", f"unload {run.get('model_id') or ''}".rstrip(), phase="failed", error=run["error"])
         return _save(run)
     run["phase"] = "stopped"
     run["ok"] = True
     run["error"] = None
+    run["stop_error"] = None
     run["stopped_at"] = time.time()
     _audit("stop", f"unload {run.get('model_id') or ''}".rstrip(), phase="stopped")
     return _save(run)

@@ -25,7 +25,7 @@ from sparksi.recipes.engines.vllm import build as build_vllm
 from sparksi.recipes.runs import reset_for_tests as reset_runs
 from sparksi.recipes.runs import tick
 from sparksi.recipes.spec import Spec
-from sparksi.recipes.store import load_recipe, save_recipe
+from sparksi.recipes.store import load_recipe, recipe_path, save_recipe
 from sparksi.recipes.validate import check_port, memory_conflict, validate_fields
 from sparksi.serve import STATE, DualServer, Handler
 
@@ -1529,11 +1529,13 @@ def test_save_never_rewrites_a_pinned_command(tmp_path) -> None:
         code, body = _json(port, base, "POST", {**fields, "name": "main", "overwrite": True})
         assert code == 409 and body["save_as"] is True, body
         assert recipe_path("pair-fast").read_bytes() == original
-        # Save as to a new name keeps the edit, as a second pinned recipe.
+        # Save as to a new name keeps the edit, as a second pinned recipe that is not locked.
         code, body = _json(port, base, "POST", {**fields, "name": "edited", "recipe_name": "main"})
         assert code == 200, body
         assert "8192" in (named_dir("pair-fast") / "edited.toml").read_text()
-        assert _json(port, base + "/edited", "PUT", fields)[0] == 409
+        # The copy is the user's own recipe now: Save updates it in place (no new row).
+        assert _json(port, base + "/edited", "PUT", fields)[0] == 200
+        assert _names(port) == ["main", "edited"]
         # With two pinned recipes the one that is not the default can go.
         assert _json(port, base + "/edited", "DELETE", {})[0] == 200
     finally:
@@ -1805,10 +1807,13 @@ def test_save_as_keeps_ipc_lock_and_dry_run_refuses_it_in_plain_words(tmp_path) 
         assert body["not_loadable"] == FABRIC_ONLY
         saved = (named_dir("pair-fast") / "tuned.toml").read_text()
         assert "IPC_LOCK" in saved
-        # Save on a pinned recipe never rewrites its command; the page asks for a name instead.
+        # tuned is a Save as copy, so Save updates it in place and keeps its flags.
         code, body = _json(port, "/api/models/pair-fast/recipes/tuned", "PUT", {"kind": "pinned", "port": 8014, "from_ui": True})
+        assert code == 200, body
+        assert "IPC_LOCK" in (named_dir("pair-fast") / "tuned.toml").read_text()
+        # The original is still never rewritten by Save.
+        code, body = _json(port, "/api/models/pair-fast/recipes/default", "PUT", {"kind": "pinned", "port": 8014, "from_ui": True})
         assert code == 409 and body["save_as"] is True, body
-        assert (named_dir("pair-fast") / "tuned.toml").read_text() == saved
         code, plan = _json(port, "/api/models/pair-fast/plan", "POST", {"recipe_name": "tuned"})
         assert code == 400, plan
         assert FABRIC_ONLY in plan["conflicts"], plan["conflicts"]
@@ -1878,3 +1883,62 @@ def test_recipe_list_carries_the_list_columns() -> None:
     assert rows["spec-one"]["ctx"] == 32768
     assert rows["spec-one"]["max_num_seqs"] is None
     assert rows["spec-one"]["speculative"] == "eagle"
+
+
+def test_save_as_copy_of_a_pinned_recipe_saves_in_place(tmp_path) -> None:
+    """Regression: Save on a Save as copy of a pinned recipe made yet another row.
+
+    The copy inherited kind "pinned" from the original, and Save refuses every pinned
+    recipe, so the page fell back to Save as. A copy carries copied_from and is unlocked.
+    """
+    from sparksi.recipes.store import named_dir
+
+    lock = Lock(tmp_path / "lock")
+    lock.acquire("test")
+    save_recipe("pair-fast", PINNED_DEFAULT)
+    httpd, port = _serve(lock)
+    base = "/api/models/pair-fast/recipes"
+    fields = {"engine": "vllm", "placement": "head", "port": 8014, "from_ui": True}
+    try:
+        code, body = _json(port, base, "POST", {**fields, "ctx": 8192, "name": "tuned", "recipe_name": "default"})
+        assert code == 200, body
+
+        def rows() -> dict:
+            code, body = _json(port, base, "GET", None)
+            assert code == 200, body
+            return {item["name"]: item for item in body["recipes"]}
+
+        listed = rows()
+        assert listed["default"]["locked"] is True and listed["default"]["copied_from"] == ""
+        assert listed["tuned"]["kind"] == "pinned"
+        assert listed["tuned"]["locked"] is False and listed["tuned"]["copied_from"] == "default"
+        code, body = _json(port, base + "/tuned", "PUT", {**fields, "ctx": 16384})
+        assert code == 200, body
+        assert list(rows()) == ["default", "tuned"]
+        text = (named_dir("pair-fast") / "tuned.toml").read_text()
+        assert "16384" in text and 'copied_from = "default"' in text
+        assert rows()["tuned"]["locked"] is False
+        # The original stays locked, and a client cannot unlock it by sending copied_from.
+        code, body = _json(port, base + "/default", "PUT", {**fields, "ctx": 4096, "copied_from": "x"})
+        assert code == 409 and body["save_as"] is True, body
+        code, body = _json(port, base, "POST", {**fields, "name": "default", "overwrite": True, "copied_from": "x"})
+        assert code == 409, body
+        assert rows()["default"]["locked"] is True
+    finally:
+        httpd.shutdown()
+        STATE.runner = None
+
+
+def test_legacy_recipe_put_drops_copied_from(tmp_path) -> None:
+    """Only Save as sets copied_from; the old one-recipe PUT cannot write it either."""
+    lock = Lock(tmp_path / "lock")
+    lock.release(ttl_s=120)
+    httpd, port = _serve(lock)
+    try:
+        code, saved = _json(port, "/api/models/pair-fast/recipe", "PUT", dict(_UI_FORM_BODY, copied_from="default"))
+        assert code == 200, saved
+        assert "copied_from" not in load_recipe("pair-fast")
+        assert "copied_from" not in recipe_path("pair-fast").read_text()
+    finally:
+        httpd.shutdown()
+        STATE.runner = None

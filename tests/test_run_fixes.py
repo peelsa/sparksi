@@ -1766,3 +1766,269 @@ def test_exclusive_conflict_names_the_running_recipe(monkeypatch, tmp_path) -> N
     assert "second-model (Second Recipe) is already running" in text
     assert "First Recipe" not in text
     reset_runs()
+
+
+def _timed_out_with_stop(monkeypatch, tmp_path, stop_answer: dict) -> dict:
+    from sparksi.recipes.runs import tick as run_tick
+
+    monkeypatch.setenv("SPARKSI_STATE_DIR", str(tmp_path))
+    reset_runs()
+
+    class Runner:
+        def invoke(self, host, req, timeout=20):
+            if req.get("op") == "status":
+                return {"ok": True, "container_status": "running"}
+            if req.get("op") in ("stop", "run"):
+                return dict(stop_answer)
+            return {"ok": True, "listening": {"8010": False}, "http": {}, "containers": ["sparksi-slow"]}
+
+        def run_argv(self, host, argv, timeout=0):
+            return dict(stop_answer)
+
+    run = _save({
+        "id": "slow1",
+        "model_id": "demo",
+        "engine": "vllm",
+        "placement": "head",
+        "port": 8010,
+        "phase": "waiting_health",
+        "started": time.time() - 100,
+        "timeout_s": 30,
+        "health_paths": ["/health"],
+        "version": 1,
+        "nodes": [{
+            "role": "head",
+            "host": HEAD,
+            "run_id": "slow1-head",
+            "container": "sparksi-slow",
+            "stop_argv": ["docker", "rm", "-f", "sparksi-slow"],
+            "phase": "started",
+        }],
+    })
+    final = run_tick(run, Runner())
+    reset_runs()
+    return final
+
+
+def test_a_timed_out_side_is_only_listed_stopped_when_its_stop_answered_ok(monkeypatch, tmp_path) -> None:
+    # The UI keeps Unload live on a timed_out run until every side is in stopped_sides.
+    stuck = _timed_out_with_stop(monkeypatch, tmp_path, {"ok": False, "error": "docker hung"})
+    assert stuck["phase"] == "timed_out"
+    assert stuck["stopped_sides"] == []
+    clean = _timed_out_with_stop(monkeypatch, tmp_path, {"ok": True})
+    assert clean["phase"] == "timed_out"
+    assert clean["stopped_sides"] == ["head"]
+
+
+def test_stop_on_a_failed_run_with_a_side_up_still_stops_it(monkeypatch, tmp_path) -> None:
+    from sparksi.recipes.runs import stop_recorded
+
+    monkeypatch.setenv("SPARKSI_STATE_DIR", str(tmp_path))
+    reset_runs()
+    calls: list[tuple[str, list]] = []
+
+    class Runner:
+        def invoke(self, host, req, timeout=20):
+            if req.get("op") == "stop":
+                calls.append((host, list(req.get("argv") or [])))
+                return {"ok": True}
+            return {"ok": True, "listening": {}, "http": {}, "containers": []}
+
+        def run_argv(self, host, argv, timeout=0):
+            calls.append((host, list(argv)))
+            return {"ok": True}
+
+    run = _save({
+        "id": "half1",
+        "model_id": "demo-pair",
+        "engine": "vllm",
+        "placement": "both",
+        "port": 8010,
+        "phase": "failed",
+        "ok": False,
+        "error": "launcher refused the worker",
+        "failed_side": "worker",
+        "stopped_sides": [],
+        "started": time.time(),
+        "version": 1,
+        "nodes": [
+            {"role": "head", "host": HEAD, "run_id": "half1-head", "container": "sparksi-head",
+             "stop_argv": ["docker", "rm", "-f", "sparksi-head"], "phase": "started"},
+            {"role": "worker", "host": WORKER, "run_id": "half1-worker", "container": "sparksi-worker",
+             "stop_argv": ["docker", "rm", "-f", "sparksi-worker"], "phase": "failed"},
+        ],
+    })
+    stopped = stop_recorded(run, Runner())
+    assert stopped["phase"] == "stopped"
+    assert any(host == HEAD for host, _argv in calls), calls
+    reset_runs()
+
+
+def test_a_side_whose_stop_failed_is_not_marked_stopped(monkeypatch, tmp_path) -> None:
+    from sparksi.recipes.runs import stop_recorded
+
+    monkeypatch.setenv("SPARKSI_STATE_DIR", str(tmp_path))
+    reset_runs()
+
+    class Runner:
+        def invoke(self, host, req, timeout=20):
+            if req.get("op") == "stop":
+                return {"ok": host != WORKER, "error": "docker hung"}
+            return {"ok": True, "listening": {}, "http": {}, "containers": []}
+
+    run = _save({
+        "id": "hung1",
+        "model_id": "demo-pair",
+        "engine": "vllm",
+        "placement": "both",
+        "port": 8010,
+        "phase": "ready",
+        "started": time.time(),
+        "version": 1,
+        "nodes": [
+            {"role": "head", "host": HEAD, "run_id": "hung1-head", "container": "sparksi-head",
+             "stop_argv": ["docker", "rm", "-f", "sparksi-head"], "phase": "started"},
+            {"role": "worker", "host": WORKER, "run_id": "hung1-worker", "container": "sparksi-worker",
+             "stop_argv": ["docker", "rm", "-f", "sparksi-worker"], "phase": "started"},
+        ],
+    })
+    after = stop_recorded(run, Runner())
+    assert after["phase"] == "failed"
+    phases = {node["role"]: node["phase"] for node in after["nodes"]}
+    assert phases == {"head": "stopped", "worker": "started"}
+    reset_runs()
+
+
+class _FlakyWorker:
+    """Stub runner: stop on the worker errors until ``worker_ok``; nothing leaves the test."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.worker_ok = False
+
+    def invoke(self, host, req, timeout=20):
+        if req.get("op") == "stop":
+            self.sent.append(host)
+            if host == WORKER and not self.worker_ok:
+                return {"ok": False, "error": "docker hung"}
+            return {"ok": True}
+        return {"ok": True, "listening": {}, "http": {}, "containers": []}
+
+
+def _pair_run(run_id: str, **extra) -> dict:
+    run = {
+        "id": run_id,
+        "model_id": "demo-pair",
+        "engine": "vllm",
+        "placement": "both",
+        "port": 8010,
+        "phase": "ready",
+        "started": time.time(),
+        "version": 1,
+        "nodes": [
+            {"role": "head", "host": HEAD, "run_id": run_id + "-head", "container": "sparksi-head",
+             "stop_argv": ["docker", "rm", "-f", "sparksi-head"], "phase": "started"},
+            {"role": "worker", "host": WORKER, "run_id": run_id + "-worker", "container": "sparksi-worker",
+             "stop_argv": ["docker", "rm", "-f", "sparksi-worker"], "phase": "started"},
+        ],
+    }
+    run.update(extra)
+    return _save(run)
+
+
+def test_a_stop_that_errored_can_be_retried_and_only_stops_the_side_still_up(monkeypatch, tmp_path) -> None:
+    from sparksi.recipes.runs import get_run
+    from sparksi.recipes.service import halt_run
+
+    monkeypatch.setenv("SPARKSI_STATE_DIR", str(tmp_path))
+    reset_runs()
+    _pair_run("retry1")
+    runner = _FlakyWorker()
+
+    code, body = halt_run({"models": []}, runner, "retry1")
+    assert code == 400 and body["stopped"] is False, body
+    stored = get_run("retry1")
+    assert stored["phase"] == "failed" and stored["error"] == "docker hung"
+    assert [node["phase"] for node in stored["nodes"]] == ["stopped", "started"]
+    assert stored["stopped_sides"] == ["head"]
+    assert runner.sent == [HEAD, WORKER]
+
+    runner.worker_ok = True
+    runner.sent.clear()
+    code, body = halt_run({"models": []}, runner, "retry1")
+    assert code == 200 and body["stopped"] is True, body
+    assert runner.sent == [WORKER]
+    stored = get_run("retry1")
+    assert stored["phase"] == "stopped" and stored["ok"] is True
+    assert [node["phase"] for node in stored["nodes"]] == ["stopped", "stopped"]
+    assert stored["stopped_sides"] == ["head", "worker"]
+
+    # Settled: another click sends nothing.
+    code, body = halt_run({"models": []}, runner, "retry1")
+    assert code == 200 and runner.sent == [WORKER]
+    reset_runs()
+
+
+def test_an_errored_stop_on_a_failed_pair_is_not_recorded_as_stopped(monkeypatch, tmp_path) -> None:
+    """A run with failed_side used to be rewritten to stopped by _save even when the stop errored."""
+    from sparksi.recipes.runs import get_run, stop_recorded
+
+    monkeypatch.setenv("SPARKSI_STATE_DIR", str(tmp_path))
+    reset_runs()
+    run = _pair_run("retry2", phase="failed", failed_side="head", error="health on spark-a failed", stopped_sides=[])
+    runner = _FlakyWorker()
+    first = stop_recorded(run, runner)
+    assert first["phase"] == "failed" and first["error"] == "docker hung"
+    assert [node["phase"] for node in get_run("retry2")["nodes"]] == ["stopped", "started"]
+    runner.worker_ok = True
+    runner.sent.clear()
+    second = stop_recorded(get_run("retry2"), runner)
+    assert second["phase"] == "stopped"
+    assert runner.sent == [WORKER]
+    reset_runs()
+
+
+def test_two_clicks_at_once_send_one_stop_per_side(monkeypatch, tmp_path) -> None:
+    import threading
+
+    from sparksi.recipes.runs import stop_recorded
+
+    monkeypatch.setenv("SPARKSI_STATE_DIR", str(tmp_path))
+    reset_runs()
+    run = _pair_run("race2")
+    entered = threading.Event()
+    release = threading.Event()
+    sent: list[str] = []
+
+    class Slow:
+        def invoke(self, host, req, timeout=20):
+            if req.get("op") == "stop":
+                sent.append(host)
+                entered.set()
+                release.wait(5)
+                return {"ok": True}
+            return {"ok": True, "listening": {}, "http": {}, "containers": []}
+
+    box: dict[str, dict] = {}
+    first = threading.Thread(target=lambda: box.setdefault("a", stop_recorded(run, Slow())))
+    first.start()
+    assert entered.wait(5)
+    second = stop_recorded(run, Slow())
+    assert second["phase"] == "stopping"
+    release.set()
+    first.join(5)
+    assert box["a"]["phase"] == "stopped"
+    assert sent == [HEAD, WORKER]
+    reset_runs()
+
+
+def test_stop_other_sides_lists_only_stops_that_answered_ok() -> None:
+    from sparksi.jobs import _stop_other_sides
+
+    class Runner:
+        def run_argv(self, host, argv, timeout=0):
+            return {"ok": host != "spark-c", "error": "docker hung"}
+
+    step = {"stop_argv": ["stop-pair"], "sides": [
+        {"role": "head", "host": HEAD}, {"role": "worker", "host": WORKER}, {"role": "worker2", "host": "spark-c"}]}
+    assert _stop_other_sides(Runner(), step, {"role": "head"}) == ["worker"]

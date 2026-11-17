@@ -79,6 +79,8 @@ HASHES = {
 
 SKIP_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", "build", "dist", "planning"}
 SKIP_FILES = {"LICENSE"}
+# Tracked files inside a skipped directory that are published and so are checked.
+SCAN_ANYWAY = {"planning/pr-lessons.md"}
 BAD_NAMES = re.compile(r"(\.bak|unlock\.token$|^sparksi\.toml$|^catalog\.yaml$)")
 HOME_RE = re.compile(r"/home/([a-z][a-z0-9_-]*)/")
 IPV4_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
@@ -133,7 +135,7 @@ def main(argv: list[str]) -> int:
     extra = [w.strip() for w in os.environ.get("SPARKSI_IDENTITY_DENYLIST", "").splitlines() if w.strip()]
     bad = 0
     for path in sorted(root.rglob("*")):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+        if path.relative_to(root).as_posix() not in SCAN_ANYWAY and any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
         if not path.is_file() or path.name in SKIP_FILES:
             continue

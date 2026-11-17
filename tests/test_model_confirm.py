@@ -206,11 +206,26 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   if (plan) await plan.response();
   await sleep(300);  // let the plan's note settle before the next step
 
+  // 10 Pair Fast has no run and no serving container: Unload and Restart are greyed out.
+  const actionState = () => page.evaluate(() => ["model-unload", "model-restart"].map((id) => {
+    const b = document.getElementById(id);
+    return [b.disabled, b.getAttribute("aria-disabled"), b.title];
+  }));
+  out.s10_idle = await actionState();
+  const libStops10 = posts.filter((p) => p.indexOf("/api/library/stop") !== -1).length;
+  // A stale enabled button still sends nothing: the guard in unloadModel refuses.
+  await page.evaluate(() => { const b = document.getElementById("model-unload"); b.disabled = false; b.click(); });
+  await sleep(300);
+  out.s10_note = await txt("#model-load-note");
+  out.s10_open = await open();
+  out.s10_lib_delta = posts.filter((p) => p.indexOf("/api/library/stop") !== -1).length - libStops10;
+
   // 7 Unload blocked while locked
   // Back to the model with the live run, so Unload takes the run path.
   await page.evaluate(() => { const b = Array.from(document.querySelectorAll("button")).find((x) => /Single A/.test(x.textContent)); b.click(); });
   await page.waitForFunction(() => document.getElementById("model-title").textContent.indexOf("Single A") !== -1);
   await sleep(300);
+  out.s10_live = await actionState();
   const statusSeen = () => page.waitForResponse((r) => r.url().endsWith("/api/status") && r.request().method() === "GET", { timeout: 25000 }).catch(() => null);  // the page reads the lock every 20 s
   await click("model-unload");
   await dialogOpen();
@@ -256,6 +271,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     assert got["s1_no_post"] is True
     assert got["s2_plan_post"] is True
     assert got["s3_ok"] == "Unload"
+    # Nothing running on the card: Unload and Restart are greyed out and send nothing.
+    assert got["s10_idle"] == [[True, "true", "Not running"], [True, "true", "Not running"]], got
+    assert got["s10_note"] == "Not running. Nothing to unload.", got
+    assert got["s10_open"] is False and got["s10_lib_delta"] == 0, got
+    assert got["s10_live"] == [[False, "false", ""], [False, "false", ""]], got
     assert "spark-a" in got["s3_machines"]
     assert got["s3_port"] == "8013"
     assert got["s3_closed"] is True
@@ -276,3 +296,90 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     assert "8188" in got["s8_note"]
     assert "/api/models/single-a/plan" in got["s9_plan_url"]
     assert "pair-fast" not in got["s9_plan_url"]
+
+
+def _run_probe(recipe_server, probe: str) -> dict:
+    node_path = os.environ.get("SPARKSI_PLAYWRIGHT_NODE", "")
+    node = Path(node_path) if node_path else None
+    required = os.environ.get("SPARKSI_WEBKIT_REQUIRED") == "1"
+    if node is None or not (node / "playwright").is_dir():
+        if required:
+            raise AssertionError("CI requires the WebKit model-confirm regression")
+        pytest.skip("Playwright WebKit is not installed")
+    env = os.environ.copy()
+    env["NODE_PATH"] = str(node)
+    env["RECIPE_PORT"] = str(recipe_server)
+    proc = subprocess.run(["node"], input=probe, text=True, capture_output=True, check=False, env=env)
+    if proc.returncode != 0:
+        if "Executable doesn't exist" in (proc.stderr or "") and not required:
+            pytest.skip("Playwright WebKit browser is not installed")
+        raise AssertionError(proc.stderr or proc.stdout)
+    raw = proc.stdout
+    marker = "__RESULT__"
+    return json.loads(raw[raw.index(marker) + len(marker) :].strip().splitlines()[-1])
+
+
+def test_a_failed_run_with_a_side_still_up_can_be_unloaded(recipe_server) -> None:
+    """A failed pair whose head is still up keeps Unload live; a timed-out run with every side stopped does not."""
+    probe = r"""
+const { webkit } = require("playwright");
+const port = process.env.RECIPE_PORT;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(async () => {
+  const browser = await webkit.launch();
+  const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+  const errors = [];
+  page.on("pageerror", (err) => errors.push(String(err)));
+  const runs = [
+    {id: "rp", model_id: "pair-fast", phase: "failed", failed_side: "worker", stopped_sides: [],
+     error: "launcher refused the worker", port: 8012, placement: "both", started: 2,
+     nodes: [{host: "spark-a", role: "head", phase: "started"}, {host: "spark-b", role: "worker", phase: "failed"}]},
+    {id: "rs", model_id: "single-a", phase: "timed_out", stopped_sides: ["head"], port: 8013,
+     placement: "head", started: 1, nodes: [{host: "spark-a", role: "head", phase: "started"}]},
+  ];
+  await page.route("**/api/runs", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ runs }) });
+  });
+  let stops = 0;
+  await page.route("**/api/runs/rp/stop", async (route) => {
+    stops += 1;
+    await route.fulfill({ status: 200, contentType: "application/json", body: '{"ok":true}' });
+  });
+  await page.route("**/api/runs/rp", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    await route.fulfill({ status: 200, contentType: "application/json", body: '{"run":{"id":"rp","phase":"stopped"}}' });
+  });
+  const state = () => page.evaluate(() => ["model-unload", "model-restart"].map((id) => document.getElementById(id).disabled));
+  const pick = async (name) => {
+    await page.getByRole("button", { name: new RegExp(name) }).first().click();
+    await page.waitForFunction((n) => document.getElementById("model-title").textContent.indexOf(n) !== -1, name);
+    await sleep(300);
+  };
+  const seen = page.waitForResponse((r) => r.url().endsWith("/api/runs") && r.request().method() === "GET");
+  await page.goto("http://127.0.0.1:" + port + "/models");
+  await seen;
+  await page.waitForSelector("#model-unload");
+  const out = {};
+  await pick("Single A");
+  out.timed_out = await state();
+  await pick("Pair Fast");
+  out.pair = await state();
+  await page.evaluate(() => document.getElementById("model-unload").click());
+  await page.waitForFunction(() => document.getElementById("model-confirm").open);
+  await page.evaluate(() => document.getElementById("model-confirm-ok").click());
+  await sleep(800);
+  out.stops = stops;
+  out.errors = errors;
+  console.log("__RESULT__" + JSON.stringify(out));
+  await browser.close();
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+    got = _run_probe(recipe_server, probe)
+    assert got["timed_out"] == [True, True], got
+    assert got["pair"] == [False, False], got
+    assert got["stops"] == 1, got
+    assert got["errors"] == [], got

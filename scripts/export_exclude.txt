@@ -1,9 +1,10 @@
 # Paths removed from a public export after git archive.
 # A line ending in / matches that directory and everything under it.
 # Any other line is a glob matched against the relative path and the file name.
-# planning notes, backup files, and local tool directories stay private.
+# Backup files and local tool directories stay private. Local planning notes are
+# untracked (.gitignore), so git archive never sees them; the one tracked file in
+# planning/, the shared pr-lessons.md, is published with AGENTS.md.
 
-planning/
 *.bak*
 *.log
 .opencode/

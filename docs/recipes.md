@@ -67,7 +67,7 @@ sparksi recipes import <model-id> --from container:NAME|compose:FILE|unit:NAME|s
 
 `--dry-run` prints the result without saving. `--all` surveys every catalog row that has a launcher.
 
-Save never rewrites a pinned recipe; use Save as to keep changes as a new recipe. The only pinned recipe of a model cannot be deleted.
+Save never rewrites an imported pinned recipe: on one, Save is greyed out with "Pinned recipe: use Save As". Save as keeps your changes as a new recipe. That copy records `copied_from = "<source name>"`, is not locked, and Save updates it in place. The list API reports this as `locked` per recipe. The only pinned recipe of a model cannot be deleted.
 
 The only rewrite at render time is the listen address, which becomes that Spark's tailnet address.
 

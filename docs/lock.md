@@ -52,6 +52,7 @@ Cancel has the focus and sends nothing. The lock and port checks run before the 
 
 - **Load** uses the machines of the chosen placement. After you confirm, the plan runs first. A refused plan shows "Not loaded" with every reason and "Nothing was started."
 - **Unload** uses the machines the run is on. For a model that is serving but was not started by a Sparksi run, the note says "Started outside a Sparksi run."
+- Unload and Restart with changes are greyed out, with the tooltip "Not running", when the model has no live run and none of its containers is up. A failed or timed-out run still counts as live until every side is stopped, and a pair counts as up while either side is. The server agrees: `POST /api/library/stop` for a model that is not running answers 409 with `not_running: true` and runs no stop command, so stopped containers and other harnesses on the same port are left alone. When the controller cannot list containers, it lets the stop through and the page keeps Unload enabled rather than guess. If a stop errors on one side, the run is left failed with that side not stopped, and Unload again retries only the sides still up. Two clicks at once never send two stops.
 - **Restart with changes** says "Stops this run, then loads it with the changes."
 
 Other prompts:

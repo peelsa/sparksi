@@ -36,6 +36,7 @@ KEYS = (
     "timeout_s",
     "extra_flags",
     "imported_from",
+    "copied_from",
     "port_note",
     "token_note",
     "evict_page_cache",

@@ -367,16 +367,26 @@ const { webkit } = require("playwright");
       await menu("recipe-cmd-save");
       out.saved = await settle();
     } else if (mode === "pinned") {
-      await menu("recipe-cmd-save");
-      out.asked = await state();
+      /* Save is greyed out on the original pinned recipe and says why. */
+      const saveState = () => page.evaluate(() => {
+        const b = document.getElementById("recipe-cmd-save");
+        const why = document.getElementById("recipe-save-why");
+        return { disabled: b.disabled, aria: b.getAttribute("aria-disabled"), title: b.title, why: why.hidden ? "" : why.textContent };
+      });
+      out.locked = await saveState();
+      out.lockedState = await state();
+      await menu("recipe-cmd-save-as");
       await page.fill("#recipe-name", "edited");
       await page.click("#recipe-name-ok");
       out.savedAs = await settle();
+      await page.waitForFunction(() => document.querySelectorAll("#recipe-files .recipe-file-row").length === 2);
+      out.copy = await saveState();
       await page.selectOption("#field-ctx", "8192");
       await page.evaluate(() => { document.getElementById("recipe-note").textContent = ""; });
       await menu("recipe-cmd-save");
       out.saved = await settle();
-      out.putsBefore = calls.filter((c) => c.method === "PUT").length;
+      await page.waitForTimeout(300);
+      out.rows = await page.$$eval("#recipe-files .recipe-file-row", (els) => els.map((el) => el.getAttribute("data-name")));
     } else {
       await page.route("**/api/models/pair-fast/recipes/default", (route) => {
         if (route.request().method() === "PUT") {
@@ -458,11 +468,12 @@ def test_file_save_writes_the_default_recipe_at_phone_width(bar_server) -> None:
     assert load_recipe("pair-fast")["ctx"] == 16384
 
 
-def test_save_on_a_pinned_recipe_saves_a_new_named_recipe(bar_server) -> None:
-    """The staging path: a pinned imported default, File > Save, then Save again on the pinned copy.
+def test_save_on_a_pinned_recipe_is_greyed_out_and_its_copy_saves_in_place(bar_server) -> None:
+    """The staging path: a pinned imported default, Save as a copy, then Save on the copy.
 
-    Neither Save rewrites a pinned launch command: both ask for a name instead."""
-    from sparksi.recipes.store import named_recipe_path, recipe_path
+    Save is disabled on the original with "Pinned recipe: use Save As". Regression: Save on the
+    Save as copy used to make yet another new row, because the copy inherited the pinned lock."""
+    from sparksi.recipes.store import named_recipe_path, recipe_path, using_recipe
 
     port, _tmp_path = bar_server
     pinned = {
@@ -479,21 +490,21 @@ def test_save_on_a_pinned_recipe_saves_a_new_named_recipe(bar_server) -> None:
     got = _save_probe(port, "pinned")
     assert "crash" not in got, got
     assert got["errors"] == [], got
-    assert got["asked"]["row"] is True, got
-    assert got["asked"]["note"].startswith("default runs a pinned launch command"), got
+    assert got["locked"] == {"disabled": True, "aria": "true", "title": "Pinned recipe: use Save As", "why": "Pinned recipe: use Save As"}, got
+    assert got["lockedState"]["row"] is False, got
     assert got["savedAs"]["note"].startswith("Saved as edited at "), got
-    assert got["saved"]["row"] is True, got
-    assert got["saved"]["note"].startswith("edited runs a pinned launch command"), got
-    assert got["putsBefore"] == 0, got
+    assert got["copy"] == {"disabled": False, "aria": "false", "title": "", "why": ""}, got
+    assert got["saved"]["note"].startswith("Saved edited at "), got
+    assert got["saved"]["row"] is False, got
+    assert sorted(got["rows"]) == ["default", "edited"], got
+    puts = [c for c in got["calls"] if c["method"] == "PUT"]
+    assert puts == [{"method": "PUT", "path": "/api/models/pair-fast/recipes/edited", "status": 200}], got
     assert recipe_path("pair-fast").read_bytes() == original
     assert named_recipe_path("pair-fast", "edited").is_file()
-    from sparksi.recipes.store import using_recipe
-
     with using_recipe("pair-fast", "edited"):
         saved = load_recipe("pair-fast")
-    assert saved["kind"] == "pinned"
-    assert "16384" in json.dumps(saved) and "8192" not in json.dumps(saved)
-    assert not any(c["method"] == "PUT" for c in got["calls"]), got
+    assert saved["kind"] == "pinned" and saved["copied_from"] == "default"
+    assert "8192" in json.dumps(saved) and "16384" not in json.dumps(saved)
 
 
 def test_every_recipe_write_failure_is_shown_in_the_bar(bar_server) -> None:
