@@ -83,9 +83,12 @@ page. Add any new browser test to that list in the same commit.
 
 A step passes only when you have its real output and exit code 0. Paste
 the last lines and the exit codes into the PR body. "Should pass",
-"passes on my side" and "no new failures" are not a pass. Never weaken,
-skip or delete a test or an assertion to get green; if an old assertion
-encoded the bug, say so in the PR body.
+"passes on my side" and "no new failures" are not a pass. A rerun after
+a failure is not a pass either: if any check fails, even once, find the
+cause and fix it before you report. Re-running a failed job does not
+count as passing. Never weaken, skip or delete a test or an assertion
+to get green; if an old assertion encoded the bug, say so in the PR
+body.
 
 ### 7. Fresh-eyes review of the whole diff
 
@@ -103,6 +106,15 @@ report it without opening the PR. Do not open a PR whose body says
 "known issue", "follow-up", "WIP" or "part 1 of 2" unless the maintainer
 asked for that split in writing.
 
+Anything that comes up in the work — a failing or flaky test, a
+warning, or a broken path you touched or saw — gets fixed in this job
+before the final report. If it is out of scope, fix it on its own
+branch or pull request first. Never leave it as an offer or a
+question. The final report has no "came up", "want me to", or
+follow-up items. Ask the owner only when the decision is theirs:
+spending money, model or live-runtime operations beyond the brief, the
+five-file or public-API limits, or a change of plan.
+
 ### 9. Open it ready
 
 Finish steps 1-8 and run the local acceptance commands first. Then push
@@ -112,13 +124,17 @@ and raw check output. One topic per PR.
 
 CI on this repo runs on pull requests to the branches listed in
 `.github/workflows/ci.yml` (feature-branch pushes are not in the `push`
-filter). Wait for those checks to go green after the PR opens. Do not
-merge.
+filter). Wait for those checks to go green after the PR opens. If a
+check fails, fix the cause; a rerun is not a pass. Do not merge.
 
 ### After the PR is open
 
 - Push only fixes for review or CI findings. New scope goes in a new PR
   after this one merges.
+- A failed check, even one that later passes on a rerun, is not green.
+  Find the cause and fix it; do not rerun a failed job to get a pass.
+  Findings that come up after the PR opens are fixed in this job
+  before the final report, not offered as a follow-up.
 - When a review finds something you missed, add one line to the lessons
   file (`planning/pr-lessons.md`; read it before step 1 if it exists):
   what was missed, and the check that would have caught it.
