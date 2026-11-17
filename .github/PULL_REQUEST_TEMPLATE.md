@@ -2,13 +2,27 @@
 
 <!-- What changed, and why. -->
 
+## Contract
+
+- **Goal:**
+- **Root cause:**
+- **Allowed files:**
+- **Edge cases and tests:**
+- **Sibling sweep:** commands run and what they hit
+
 ## Tests and guards
 
+Paste the last lines and the exit code for each command.
+
 - [ ] Tests cover this change and use fakes or fixtures
-- [ ] `python3 scripts/check_identifiers.py` is clean
+- [ ] `python3 -m pytest -q` — exit code:
+- [ ] `python3 scripts/check_identifiers.py` is clean — exit code:
 - [ ] `python3 scripts/check_stdlib.py` is clean
 - [ ] `python3 scripts/check_ui_colors.py` is clean when the UI changed
 - [ ] `ruff check src tests scripts` is clean
+- [ ] Sibling sweep done
+- [ ] Whole diff re-read
+- [ ] No known issues or follow-ups
 
 ## Screenshots
 

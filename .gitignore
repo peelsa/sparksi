@@ -34,8 +34,9 @@ targets.json
 .opencode/
 opencode.json
 
-# Local planning notes. Never commit.
-planning/
+# Local planning notes. Never commit, except the shared PR lessons file.
+planning/*
+!planning/pr-lessons.md
 
 # Saved per-model launch recipes. Site-local, never committed.
 recipes/*.toml
