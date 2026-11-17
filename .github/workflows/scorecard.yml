@@ -1,0 +1,71 @@
+name: scorecard
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "20 7 * * 1"
+
+permissions: read-all
+
+jobs:
+  scorecard:
+    name: scorecard
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+      issues: read
+      pull-requests: read
+      checks: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Upload when Code Security is on. A private repository without it
+      # rejects the upload, which would fail the job. Until then the SARIF
+      # is kept as an artifact.
+      - name: Code scanning
+        id: scanning
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          code=$(curl -sS -o /tmp/code-scanning.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/code-scanning/alerts?per_page=1")
+          # 404 "no analysis found" means scanning is on but nothing has been uploaded yet.
+          if [ "$code" = "200" ] || { [ "$code" = "404" ] && grep -qi "no analysis found" /tmp/code-scanning.json; }; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Code scanning returned HTTP ${code}. SARIF is saved as an artifact until Code Security is enabled."
+          fi
+
+      - name: Scorecard
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_results: false
+
+      - name: Upload SARIF
+        if: steps.scanning.outputs.enabled == 'true'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: results.sarif
+
+      - name: Save SARIF
+        if: steps.scanning.outputs.enabled != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          if-no-files-found: error

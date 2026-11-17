@@ -1,0 +1,22 @@
+# Sparksi controller, user unit template.
+# Render with: sparksi install-unit --print --unit controller --prefix /home/USER/src/sparksi
+# That command only prints. It does not write, enable, or start the unit.
+#
+# `sparksi serve` binds [controller] bind from sparksi.toml. The built-in
+# default is loopback 127.0.0.1 plus the tailnet address 100.64.0.1.
+# 0.0.0.0 and :: are refused. This unit does not pass a bind address.
+[Unit]
+Description=Sparksi controller (UI/API :7500, announce listener)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PREFIX@
+Environment=SPARKSI_CONFIG=%h/.config/sparksi/sparksi.toml
+ExecStart=@PREFIX@/.venv/bin/sparksi serve --port 7500
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

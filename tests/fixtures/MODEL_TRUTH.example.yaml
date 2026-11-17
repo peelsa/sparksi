@@ -1,0 +1,17 @@
+# Fake MODEL_TRUTH for tests. Generic names only.
+stack:
+  mode: always_on
+  approx_vram_gb: 103
+models:
+  - name: Brain-A
+    role: brain
+    served_name: brain-a
+    port: 8007
+  - name: Vision-A
+    role: vision
+    served_name: vision-a
+    port: 8004
+  - name: Counsel-A
+    role: counsel
+    served_name: counsel-a
+    port: 8011

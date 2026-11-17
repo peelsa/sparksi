@@ -1,0 +1,454 @@
+# Sparksi side-view catalog: EXAMPLE. Copy to ~/.config/sparksi/catalog.yaml
+# and edit for your nodes. Not production topology: if you keep a separate
+# model inventory file ([paths] model_truth), Sparksi only reads it and
+# `sparksi inventory` diffs the two. Sparksi never writes that file.
+#
+# Every name, path and address below is a placeholder. Addresses use the
+# documentation ranges (192.0.2.0/24, 198.51.100.0/24, 198.18.0.0/15) and the
+# tailnet range 100.64.0.0/24.
+
+schema_version: 1
+
+host:
+  name: spark-a
+  gpu: GB10
+  uma: true
+  uma_gib: 121
+  swap: "off"
+  bind_allow:
+    - "127.0.0.1"
+    - "100.64.0.11"     # tailscale0
+  bind_deny:
+    - "0.0.0.0"
+    - "192.0.2.11"      # LAN
+    - "198.51.100.11"   # WiFi
+  ui_port: 7500
+  front_door_port: 8000   # later; do not bind
+  reserved_ports: [8000, 8001, 8004, 8007, 8011, 8188]
+  dry_run_margin_gib: 4.0
+
+# Seats are names; whoever is seated is a catalog id, not a property of the weights.
+seats:
+  brain: brain-a
+  vision: vision-a
+  counsel: counsel-a
+  video: comfy
+
+# Compatibility aliases only. Do not bind a new front door on 8000.
+port_aliases:
+  8007: brain-a
+  8004: vision-a
+  8011: counsel-a
+
+never_touch:
+  tmux_sessions: ["1", "agent-session"]
+  do_not_stop: ["comfy"]   # built-in rules also protect port 8188 and the video service
+  do_not_invoke:
+    - /home/USER/scripts/video-mode.sh
+    - /home/USER/scripts/vllm-coresident-start.sh
+    - /home/USER/scripts/vllm-coresident-stop.sh
+
+tenants:
+  os:
+    always: true
+    measure: catalog_min
+    min_gib: 6.0
+    notes: "Kernel, desktop, nvidia persistenced, journal: catalog floor, not free(1)"
+  docker:
+    always: true
+    measure: rss
+    comm: [dockerd, containerd]
+    notes: "Engine only. vLLM container RSS is a resident/recipe, not floor."
+  agent:
+    always: true
+    measure: rss
+    user: USER-agent
+    cmdline_substr: ["agent-gateway"]
+    notes: "Agent gateways + dashboard if those processes exist. Missing measure → UNCERTAIN."
+  infra:
+    always: true
+    measure: docker_stats
+    name_substr: ["infra"]
+    notes: "Infra compose (no host ports)."
+  comfy:
+    always: false
+    measure: rss
+    port: 8188
+    listen_host: "127.0.0.1"
+    cmdline_substr: ["comfy", "main.py"]
+    notes: "Count only if :8188 is already listening. Never start or stop."
+
+residents:
+  - id: brain-a
+    kind: vllm
+    role: brain
+    served_name: brain-a
+    port: 8007
+    probe: /v1/models
+    unit: vllm-brain-a.service
+    container: vllm-brain-a
+    weights: /home/USER/.cache/huggingface/brain-a-nvfp4
+    gpu_memory_utilization: 0.20
+    modalities: {audio: 0, image: 1, video: 1}
+  - id: vision-a
+    kind: vllm
+    role: vision
+    served_name: vision-a
+    port: 8004
+    probe: /v1/models
+    unit: vllm-vision-a.service
+    container: vllm-vision-a
+    weights: /home/USER/.cache/huggingface/vision-a-nvfp4
+    gpu_memory_utilization: 0.28
+    modalities: {audio: 1, image: 1, video: 1}
+  - id: counsel-a
+    kind: vllm
+    role: counsel
+    served_name: counsel-a
+    port: 8011
+    probe: /v1/models
+    unit: vllm-counsel-a.service
+    container: vllm-counsel-a
+    weights: /home/USER/services/vllm-counsel-a/models/counsel-a-nvfp4
+    gpu_memory_utilization: 0.28
+    modalities: {audio: 0, image: 1, video: 1}
+  - id: comfy
+    kind: comfy
+    role: video
+    served_name: comfy
+    display: Video service
+    port: 8188
+    probe: /system_stats
+    listen_host: "127.0.0.1"
+    unit: null
+    container: null
+    notes: "Protected video service. Exclusive vs the core stack. No systemd unit."
+    modalities: {audio: 1, image: 1, video: 1}
+  - id: retired-a
+    kind: vllm
+    role: retired
+    served_name: retired-a
+    port: 8009
+    probe: /v1/models
+    unit: vllm-retired-a.service
+    container: vllm-retired-a
+    modalities: {audio: 0, image: 1, video: 0}
+  - id: retired-b
+    kind: vllm
+    role: retired
+    served_name: retired-b
+    port: 8013
+    probe: /v1/models
+    unit: vllm-retired-b.service
+    container: vllm-retired-b
+    modalities: {audio: 0, image: 0, video: 0}
+  - id: retired-gguf
+    kind: llamacpp
+    role: retired
+    served_name: retired-gguf
+    port: 8015
+    probe: /v1/models
+    unit: null
+    modalities: {audio: 0, image: 0, video: 0}
+  - id: sandbox-a
+    kind: vllm
+    role: sandbox
+    served_name: sandbox-a
+    port: 8016
+    probe: /v1/models
+    unit: null
+    container: null
+    modalities: {audio: 0, image: 0, video: 0}
+  - id: sandbox-big
+    kind: vllm
+    role: sandbox
+    served_name: sandbox-big
+    port: 8017
+    probe: /v1/models
+    unit: vllm-sandbox-big.service
+    container: vllm-sandbox-big
+    weights: /home/USER/.cache/huggingface/sandbox-big-bf16
+    gpu_memory_utilization: 0.72
+    modalities: {audio: 0, image: 1, video: 1}
+    notes: "BF16 sandbox. Exclusive vs the core stack."
+
+units_status:
+  - vllm-coresident.service
+  - vllm-brain-a.service
+  - vllm-vision-a.service
+  - vllm-counsel-a.service
+  - infra.service
+  - vllm-sandbox-big.service
+
+recipes:
+  coresident-3:
+    aliases: [trio, coresident]
+    core: true            # the co-resident core LLM stack
+    estimate_gib: 103
+    unit: declared_vram_gib
+    source: inventory
+    confidence: declared
+    members: [brain-a, vision-a, counsel-a]
+    seats: [brain, vision, counsel]
+    apply_unit: vllm-coresident.service
+    notes: "Declared VRAM from the model inventory file, not RSS."
+  video:
+    aliases: [video-service]
+    estimate_gib: null
+    unit: declared_vram_gib
+    source: none
+    confidence: unknown
+    members: [comfy]
+    seats: [video]
+    notes: "No trusted video runtime ceiling. dry-run is UNCERTAIN."
+  svg-b:
+    aliases: [svg]
+    estimate_gib: 17
+    unit: declared_vram_gib
+    source: readme
+    confidence: declared
+    members: [svg-b]
+    seats: []
+    notes: "Worker node only. The head keeps its own seat."
+  sandbox-big:
+    aliases: [big]
+    estimate_gib: 72
+    unit: declared_vram_gib
+    source: catalog
+    confidence: declared
+    members: [sandbox-big]
+    seats: [sandbox]
+    apply_unit: vllm-sandbox-big.service
+    notes: "BF16 ~56 GiB weights + KV. Will not fit next to the core stack. Stop it first."
+
+# Controller bind. Used when this process runs on the controller (hostname
+# equal to [controller] name in sparksi.toml, or SPARKSI_CONTROLLER_MODE).
+# Node-side serve keeps host.bind_allow.
+controller:
+  name: controller
+  bind_allow:
+    - "127.0.0.1"
+    - "100.64.0.1"
+  bind_deny:
+    - "0.0.0.0"
+    - "192.0.2.1"
+    - "198.18.0.10"
+    - "198.18.0.11"
+
+hosts:
+  spark-a:
+    ssh: spark-a
+    local_when_hostname: spark-a
+    uma_gib: 121
+    floor_gib: 6
+    margin_gib: 4
+  spark-b:
+    ssh: spark-b
+    local_when_hostname: spark-b
+    uma_gib: 121
+    floor_gib: 6
+    margin_gib: 4
+
+# Pair models that must not run at the same time. Run refuses if any other
+# member is listening.
+exclusive_groups:
+  big-pair: [pair-fast, pair-exl3, pair-tf]
+
+# Hand-written rows. Archive tar releases are merged in at probe time.
+# Run calls only the argv listed here.
+# Row flags: no_stage (nothing to copy first), port_live (seat shows up only
+# by its port), start_note (shown after the start step).
+library:
+  - id: pair-fast
+    title: Pair Fast NVFP4
+    placement: pair
+    gib: 124
+    bytes: 133143986176
+    archive_tar: null
+    estimate_gib: 110
+    port: 8888
+    listen_host: spark-a
+    exclusive: big-pair
+    identity:   # live = :8888 answers /v1/models with this id AND the container is running
+      served: [pair-fast-model]
+      served_prefix: Pair-Fast
+      container: vllm-pf
+      worker_container: vllm-pf
+    local:
+      spark-a: /home/USER/.cache/huggingface/hub/models--example--pair-fast-nvfp4
+      spark-b: /home/USER/.cache/huggingface/hub/models--example--pair-fast-nvfp4
+    launch:
+      host: spark-a
+      start: [/home/USER/projects/pair-fast-harness/start.sh, --launch]
+      stop: [/home/USER/projects/pair-fast-harness/stop.sh]
+  - id: pair-exl3
+    title: Pair EXL3 4bpw
+    placement: pair
+    gib: 164
+    bytes: 175700000000
+    archive_flat: /mnt/archive/models/pair-exl3-4bpw
+    shards: 120
+    estimate_gib: 110
+    port: 8014
+    listen_host: spark-a
+    exclusive: big-pair
+    identity:   # both pair harnesses serve the same id; the container tells them apart
+      served: [Pair-EXL3]
+      served_prefix: Pair-EXL3
+      container: pair-exl3-head
+      worker_container: pair-exl3-worker
+    local:
+      spark-a: /home/USER/.cache/huggingface/hub/models--example--pair-exl3-4bpw
+      spark-b: /home/USER/.cache/huggingface/hub/models--example--pair-exl3-4bpw
+    launch:
+      host: spark-a
+      start: [/home/USER/projects/pair-exl3-harness/start.sh]
+      stop: [/home/USER/projects/pair-exl3-harness/start.sh, stop]
+  - id: pair-tf
+    title: Pair EXL3 TensorFold
+    placement: pair
+    gib: 164
+    bytes: 176000000000
+    archive_tar: null
+    no_stage: true   # start.sh downloads its own checkpoint
+    start_timeout_s: 57600
+    estimate_gib: 110
+    port: 8014
+    listen_host: spark-a
+    exclusive: big-pair
+    identity:
+      served: [Pair-EXL3]
+      container: pair-tf
+      worker_container: pair-tf
+    local:
+      spark-a: /home/USER/.cache/huggingface/hub/models--example--pair-tf-4bpw
+      spark-b: /home/USER/.cache/huggingface/hub/models--example--pair-tf-4bpw
+    launch:
+      host: spark-a
+      start: [/home/USER/projects/pair-tf-harness/start.sh]
+      stop: [/home/USER/projects/pair-tf-harness/stop.sh]
+  - id: single-a
+    title: Single A
+    placement: single
+    gib: 40
+    bytes: 42949672960
+    archive_tar: null
+    estimate_gib: 90
+    port: 8014
+    listen_host: spark-a
+    hosts: [spark-a]
+    identity:
+      served: [single-a]
+      container: vllm-single-a
+    local:
+      spark-a: /home/USER/services/vllm-single-a
+    seats:
+      spark-a:
+        port: 8014
+        start: [sudo, systemctl, start, vllm-single-a]
+        stop: [sudo, systemctl, stop, vllm-single-a]
+    launch:
+      host: spark-a
+      start: [sudo, systemctl, start, vllm-single-a]
+      stop: [sudo, systemctl, stop, vllm-single-a]
+  - id: single-gguf
+    title: Single GGUF 27B Q2
+    placement: single
+    gib: 8
+    bytes: 8349689920
+    archive_tar: null
+    estimate_gib: 28
+    port: 8014
+    listen_host: spark-a
+    hosts: [spark-a]
+    weights_note: "One GGUF, 8349689920 bytes. One sequence, Q8 KV. Shares :8014 with the other harnesses; one at a time."
+    identity:   # plain llama-server process, no container
+      served: [single-gguf-model]
+    local:
+      spark-a: /home/USER/services/single-gguf/models/single-gguf-q2.gguf
+    seats:
+      spark-a:
+        port: 8014
+        start: [/home/USER/services/single-gguf/start.sh]
+        stop: [/home/USER/services/single-gguf/stop.sh]
+    launch:
+      host: spark-a
+      start: [/home/USER/services/single-gguf/start.sh]
+      stop: [/home/USER/services/single-gguf/stop.sh]
+  - id: video-seat
+    title: Video service
+    placement: single
+    gib: 40
+    bytes: 0
+    archive_tar: null
+    no_stage: true
+    start_note: "The video service starts empty. The model loads into memory on the first job."
+    estimate_gib: 40
+    port: 8188
+    listen_host: spark-a
+    hosts: [spark-a]
+    resident_min_gib: 15
+    weights_note: "The video service starts empty. The model loads into memory on the first job."
+    identity:   # the video service is up only when /system_stats answers (tailscale serve can also bind :8188)
+      http: /system_stats
+    local:
+      spark-a: /home/USER/services/video
+    seats:
+      spark-a:
+        port: 8188
+        start: [/home/USER/scripts/video-mode.sh, video]
+        stop: [/home/USER/scripts/video-mode.sh, stop-video]
+    launch:
+      host: spark-a
+      start: [/home/USER/scripts/video-mode.sh, video]
+      stop: [/home/USER/scripts/video-mode.sh, stop-video]
+  - id: studio-b
+    title: Studio B
+    placement: single
+    gib: 1
+    bytes: 0
+    archive_tar: null
+    port_live: true
+    estimate_gib: 8
+    port: 8765
+    listen_host: spark-b
+    hosts: [spark-b]
+    weights_note: "Loopback web tool on spark-b. Nothing listens on the LAN."
+    identity:
+      http: /
+    local:
+      spark-b: /home/USER/projects/studio-b
+    seats:
+      spark-b:
+        port: 8765
+        start: [sudo, systemctl, start, studio-b]
+        stop: [sudo, systemctl, stop, studio-b]
+    launch:
+      host: spark-b
+      start: [sudo, systemctl, start, studio-b]
+      stop: [sudo, systemctl, stop, studio-b]
+  - id: svg-b
+    title: SVG B 4B
+    placement: single
+    gib: 17
+    bytes: 0
+    archive_tar: null
+    port_live: true
+    estimate_gib: 17
+    port: 8195
+    listen_host: spark-b
+    hosts: [spark-b]
+    weights_note: "Weights stay on the archive mount. :8195 is loopback and only listens while a job runs."
+    identity:
+      http: /
+    local:
+      spark-b: /home/USER/services/svg-b
+    seats:
+      spark-b:
+        port: 8195
+        start: [/home/USER/services/svg-b/start.sh]
+        stop: [/home/USER/services/svg-b/stop.sh]
+    launch:
+      host: spark-b
+      start: [/home/USER/services/svg-b/start.sh]
+      stop: [/home/USER/services/svg-b/stop.sh]

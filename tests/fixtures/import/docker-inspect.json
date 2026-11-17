@@ -1,0 +1,55 @@
+[
+  {
+    "Name": "/example-vllm",
+    "Config": {
+      "Image": "example.invalid/vllm:patched",
+      "Entrypoint": null,
+      "Cmd": [
+        "vllm", "serve", "/srv/example/cache/weights",
+        "--served-model-name", "example",
+        "--host", "0.0.0.0",
+        "--port", "8888",
+        "--max-model-len", "850000",
+        "--kv-cache-memory-bytes", "1073741824",
+        "--kv-cache-dtype", "fp8",
+        "--max-num-seqs", "4",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "qwen3_coder",
+        "--reasoning-parser", "glm45",
+        "--speculative-config", "{\"method\":\"dflash\",\"model\":\"/srv/example/builds/drafter\",\"num_speculative_tokens\":3}",
+        "--trust-remote-code",
+        "--attention-backend", "FLASH_ATTN",
+        "--tensor-parallel-size", "2",
+        "--master-port", "29501"
+      ],
+      "Env": [
+        "PATH=/usr/bin",
+        "HOME=/root",
+        "HF_HUB_OFFLINE=1",
+        "NCCL_IB_DISABLE=0"
+      ]
+    },
+    "HostConfig": {
+      "NetworkMode": "host",
+      "Privileged": false,
+      "PidMode": "",
+      "CapAdd": null,
+      "SecurityOpt": null,
+      "IpcMode": "host",
+      "ShmSize": 17179869184,
+      "DeviceRequests": [{"Driver": "nvidia", "Capabilities": [["gpu"]]}],
+      "Devices": [],
+      "Binds": [
+        "/srv/example/cache:/root/.cache/huggingface",
+        "/srv/example/builds:/srv/example/builds"
+      ]
+    },
+    "Mounts": [
+      {
+        "Type": "bind",
+        "Source": "/srv/example/builds/patches/engine.py",
+        "Destination": "/opt/vllm/engine.py"
+      }
+    ]
+  }
+]

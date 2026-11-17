@@ -1,0 +1,153 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+
+jobs:
+  identity-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Site-identity guard
+        env:
+          # Optional extra plain-text denylist, one word per line, kept as a repo secret.
+          SPARKSI_IDENTITY_DENYLIST: ${{ secrets.SPARKSI_IDENTITY_DENYLIST }}
+        run: python scripts/check_identifiers.py .
+
+  stdlib-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Node scripts import only the standard library
+        run: python scripts/check_stdlib.py .
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install ruff (version pinned in pyproject dev extra)
+        run: |
+          pin=$(python -c "import tomllib; d = tomllib.load(open('pyproject.toml', 'rb')); print(next(r for r in d['project']['optional-dependencies']['dev'] if r.startswith('ruff')))")
+          echo "Installing $pin"
+          python -m pip install "$pin"
+      - name: Ruff
+        run: ruff check src tests scripts
+
+  ui-colors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: UI colors stay on the Peelsa card
+        run: python scripts/check_ui_colors.py
+
+  design-detect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install Impeccable engine 0.1.17
+        run: |
+          mkdir -p "$RUNNER_TEMP/impeccable"
+          curl -4 -sSfL --retry 5 --retry-delay 4 --retry-all-errors -o "$RUNNER_TEMP/impeccable/impeccable" \
+            https://github.com/pbakaus/impeccable/releases/download/engine-v0.1.17/impeccable-linux-x64
+          curl -4 -sSfL --retry 5 --retry-delay 4 --retry-all-errors -o "$RUNNER_TEMP/impeccable/impeccable.sha256" \
+            https://github.com/pbakaus/impeccable/releases/download/engine-v0.1.17/impeccable-linux-x64.sha256
+          echo "$(cut -d' ' -f1 "$RUNNER_TEMP/impeccable/impeccable.sha256")  $RUNNER_TEMP/impeccable/impeccable" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/impeccable/impeccable"
+      - name: Detect the dashboard
+        env:
+          IMPECCABLE_BIN: ${{ runner.temp }}/impeccable/impeccable
+        run: python scripts/check_design.py src/sparksi/static/index.html
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -4 -sSfL --retry 5 --retry-delay 4 --retry-all-errors -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Secret scan
+        run: gitleaks detect --source . --redact --verbose
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: System tools used by tests
+        run: sudo apt-get update && sudo apt-get install -y rsync
+      - name: Install
+        run: python -m pip install -e '.[dev]'
+      - name: Tests
+        run: python -m pytest
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Build the wheel, install it in a clean venv, run the first-run path
+        run: python scripts/check_wheel.py
+
+  webkit-scroll:
+    # Playwright 1.55 ships WebKit for Ubuntu 24.04, not for 26.04.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Install
+        run: python -m pip install -e '.[dev]'
+      - name: Install WebKit
+        run: |
+          mkdir -p /tmp/webkit-test
+          cd /tmp/webkit-test
+          npm init -y
+          npm install playwright@1.55.0
+          export PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright
+          npx playwright install webkit
+          sudo npx playwright install-deps webkit
+      - name: WebKit regressions
+        env:
+          SPARKSI_PLAYWRIGHT_NODE: /tmp/webkit-test/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: /tmp/ms-playwright
+          SPARKSI_WEBKIT_REQUIRED: "1"
+        run: python -m pytest tests/test_scroll_refresh.py tests/test_load_default_recipe.py tests/test_serving_state_page.py tests/test_monitor_overlap.py tests/test_recipe_bar.py tests/test_sync_page.py tests/test_ui_posts_json.py tests/test_network_page.py tests/test_network_setup_page.py tests/test_options_page.py tests/test_monitored_hosts_page.py tests/test_unmanaged_page.py tests/test_route_reload.py tests/test_model_confirm.py tests/test_ribbon_layout.py tests/test_archive_gb.py tests/test_network_add_row.py tests/test_temps_section.py tests/test_site_menu.py tests/test_default_badge.py tests/test_ribbon_stale.py tests/test_header_follow_up.py tests/test_recipe_name_prefill.py tests/test_recipe_explorer.py tests/test_pinned_default_rename.py tests/test_n_sparks_page.py tests/test_network_remove_spark.py -q -rA

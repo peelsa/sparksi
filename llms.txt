@@ -1,0 +1,28 @@
+# Sparksi
+
+> Peelsa model manager for NVIDIA DGX Spark clusters of one to four Sparks.
+
+Sparksi is the Peelsa model manager for NVIDIA DGX Spark (one to four Sparks). A controller (`sparksi serve`, port 7500) serves a dashboard and HTTP API; each Spark runs a stdlib-only announcer sending UDP to port 7501; node operations go over SSH with a stdlib-only agent sent per request. Requires Python 3.12+; the only dependency is PyYAML. Config lives in `~/.config/sparksi/sparksi.toml` (site values) and `catalog.yaml` (models); neither is committed. Declare 1-4 `[[nodes]]`: head, worker, Spark 3, Spark 4 in file order. Multi-Spark runs use exactly two Sparks. Only the last Spark can be removed. Recipes are named per model (suggested `model-quant-concurrency-kvcache-notes`), with exactly one default per model. The lock is ON by default; Load, Unload, Restart and Network edits need Unlock, and Load, Unload and Restart ask for confirmation with the model, machines and port. The browser sends fields, never shell strings. Port 8188 is never started, stopped or probed. Dashboard pages: Overview, Model Manager, Library, Archive, Network, Options, Token totals, Activity.
+
+## Docs
+
+- [README](README.md): Overview and quick start.
+- [Getting started](docs/getting-started.md): Install, first run, user service.
+- [Configuration](docs/config.md): sparksi.toml, one to four Sparks, environment.
+- [Dashboard pages](docs/pages.md): Overview, Model Manager, Library, Archive, Network, Options, Token totals, Activity.
+- [Recipes](docs/recipes.md): Recipes, naming, default, list, engines, validation.
+- [Lock](docs/lock.md): Lock and confirmations.
+- [CLI](docs/cli.md): Commands, exit codes, JSON output.
+
+## Optional
+
+- [Deployment](docs/deploy.md): systemd user units, announcer, firewall, SSH, sudo.
+- [Architecture](docs/architecture.md): Modules and rules.
+- [Telemetry](docs/telemetry.md): Durable telemetry files and API.
+- [Staging](docs/stage.md): Read-only staging feed.
+- [State machines](docs/state-machines.md): Serving and run states.
+- [Contributing](CONTRIBUTING.md): How to contribute.
+- [Security](SECURITY.md): Security policy.
+- [Changelog](CHANGELOG.md): Release history.
+- [Example sparksi.toml](config/sparksi.example.toml): Annotated site config template.
+- [Example catalog.yaml](config/catalog.example.yaml): Annotated model catalog template.

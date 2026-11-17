@@ -1,0 +1,6 @@
+[Unit]
+Description=Example model
+
+[Service]
+ExecStart=/usr/bin/docker compose -f /srv/example/builds/compose.yaml up -d
+Restart=no

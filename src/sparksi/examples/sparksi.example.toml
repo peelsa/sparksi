@@ -1,0 +1,116 @@
+# Sparksi site config: EXAMPLE. Copy to ~/.config/sparksi/sparksi.toml.
+# The real file is gitignored. Every value here is a placeholder:
+# tailnet 100.64.0.x, LAN 192.0.2.x / 198.51.100.x, direct link 198.18.0.x.
+
+[controller]
+name = "controller"                 # gethostname() of the machine running `sparksi serve`
+bind = ["127.0.0.1", "100.64.0.1"]  # loopback + tailnet address; LAN is refused
+bind_deny = ["0.0.0.0", "::"]
+access_log = "slow"                 # request timing in the service log: "slow" (over 1 s), "all", or "off"
+monitor_upstream = ""               # optional read-only mirror: GET /api/monitor from e.g. "http://127.0.0.1:7500" (loopback or tailnet only)
+allowed_hosts = []                  # extra names this controller answers to; its own names, addresses and tailnet name are found at startup
+ui_port = 7500
+announce_port = 7501
+announce_addr = "100.64.0.1"
+reserved_ports = [8000, 8001, 8004, 8007, 8011]
+state_dir = ""                      # default: $XDG_RUNTIME_DIR/sparksi. `sparksi serve --state-dir` overrides this process only.
+catalog = "~/.config/sparksi/catalog.yaml"
+recipes_dir = ""                    # default: $XDG_CONFIG_HOME/sparksi/recipes. SPARKSI_RECIPES_DIR wins.
+metrics_url = "http://127.0.0.1:8428"   # optional VictoriaMetrics
+
+# One to four [[nodes]]. The first is the head; the second, when present, is
+# the pair worker for two-Spark recipes.
+# `id` is the short key in announce packets and /api/monitor.
+[[nodes]]
+id = "a"
+name = "spark-a"            # display name, catalog host key
+ssh = "spark-a"             # ssh destination, or "local"
+tailscale = "100.64.0.11"   # announce packets are accepted only from here
+bind_deny = ["192.0.2.11", "198.51.100.11"]   # LAN / WiFi to refuse
+uma_gib = 121
+# Extra host directories a pinned recipe may bind, besides the model cache.
+# Each path is a placeholder. "/" is never a root.
+mount_roots = ["/srv/example/cache", "/srv/example/builds"]
+
+# Fabric link for two-Spark recipes. Read only; launch code never writes this file.
+# interface is the ConnectX port that is Up. ip is that port's address.
+# hcas are the RoCE device names passed to NCCL_IB_HCA. These values are examples.
+[nodes.fabric]
+interface = "enp1s0f1np1"
+ip = "192.0.2.11"
+hcas = ["roce0", "roce1"]
+
+[[nodes]]
+id = "b"
+name = "spark-b"
+ssh = "spark-b"
+tailscale = "100.64.0.12"
+uma_gib = 121
+mount_roots = ["/srv/example/cache", "/srv/example/worker"]
+
+[nodes.fabric]
+interface = "enp1s0f1np1"
+ip = "192.0.2.12"
+hcas = ["roce0", "roce1"]
+
+# Pinned inference images. Never "latest". A recipe may only select allowed_images.
+[engines]
+vllm_image = "nvcr.io/nvidia/vllm:26.05-py3"
+sglang_image = "nvcr.io/nvidia/sglang:26.02-py3"
+trtllm_image = "nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6"
+vllm_master_port = 29501
+sglang_dist_port = 50000
+kv_reserve_gib = 8
+allowed_images = [
+  "nvcr.io/nvidia/vllm:26.05-py3",
+  "nvcr.io/nvidia/sglang:26.02-py3",
+  "nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6",
+]
+
+[archive]
+id = "archive"
+node = "a"                          # node id that owns the archive store
+root = "/mnt/archive"
+label = "Archive (RAID 1 DAS)"
+extra_blocked = ["/mnt/archive-raw"]   # raw mount behind a bind mount, if any
+
+[paths]                             # paths on the nodes
+home = "/home/USER"
+hf_hub = "/home/USER/.cache/huggingface/hub"
+video_service_root = "/home/USER/services/video"   # protected video service root
+model_inventory = "/home/USER/ops/model-inventory.yaml"   # optional model inventory file; read-only, never written
+disk_inventory = "/home/USER/scripts/dgx_models.py"
+blocked_prefixes = ["/home/USER-agent"]
+too_broad = ["/home/USER/.cache", "/home/USER/services"]
+direct_prefixes = ["198.18.0.", "198.18.1."]      # node-to-node direct link
+lan_prefixes = []                                  # empty: any private non-CGNAT IPv4
+
+[extra_machines.tailscale]          # extra rows for the Machines panel
+# "TailscaleHostName" = "shown-id"
+
+# Exact argv lists the node agent may run for a catalog service. Matched
+# verbatim, including every element. Placeholders only.
+service_commands = [
+  ["/srv/example/web/start.sh"],
+  ["/srv/example/web/stop.sh"],
+]
+
+# Protection presets. Off by default. "video-service" reserves port 8188 and never
+# starts, stops or evicts the video service (catalog kind video_service); see docs/config.md.
+[protect]
+presets = []
+
+# Opt-in start/stop for one protected service. The table name is the catalog
+# service id. user_controllable stays false until both commands are set.
+# Use a command that starts only that service. Do not point start at a script
+# that also stops other model units or removes their containers.
+[services.video-seat]
+user_controllable = false
+reserve_gib = 40
+start = ["/srv/example/bin/studio-start"]
+stop = ["/srv/example/bin/studio-stop"]
+
+[compat]                            # serve older API readers; empty for new installs
+legacy_archive_id = ""
+legacy_mount_key = ""
+legacy_row_keys = {}               # e.g. { old_key = "archive_tar" }

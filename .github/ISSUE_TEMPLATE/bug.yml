@@ -1,0 +1,51 @@
+name: Bug
+description: Something failed
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Redact addresses, host names, and tokens before you paste anything.
+        Use the placeholders `spark-a`, `spark-b`, `100.64.0.x`, `192.0.2.x`, and `/home/USER`.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, in one or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: What you ran, with placeholder hosts and paths.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The Sparksi version you are running, for example 0.7.0.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: sparksi doctor
+      description: |
+        Paste the output of `sparksi doctor`.
+        Redact addresses before you paste. A real tailnet, LAN, or home path does not belong in the issue.
+      render: text
+    validations:
+      required: true

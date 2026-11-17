@@ -1,0 +1,26 @@
+# Sparksi controller, user unit.
+# Install by hand. Nothing in this repository enables or starts it, and
+# nothing switches an existing unit over to this name.
+#
+#   cp packaging/systemd/sparksi.service ~/.config/systemd/user/sparksi.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sparksi.service
+#
+# `sparksi serve` binds [controller] bind from sparksi.toml. The built-in
+# default is loopback 127.0.0.1 plus the tailnet address 100.64.0.1.
+# 0.0.0.0 and :: are refused. This unit does not pass a bind address.
+[Unit]
+Description=Sparksi controller (UI/API :7500, announce listener)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/sparksi
+Environment=SPARKSI_CONFIG=%h/.config/sparksi/sparksi.toml
+ExecStart=%h/src/sparksi/.venv/bin/sparksi serve --port 7500
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

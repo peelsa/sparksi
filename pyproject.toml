@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparksi"
+version = "0.6.0"
+description = "DGX Spark unified-memory side view: inventory, probe, dry-run, lock, apply, UI (Xanthsi suite)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Peelsa" }]
+requires-python = ">=3.12"
+dependencies = ["pyyaml"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff==0.17.5"]
+monitor = ["psutil"]
+
+[project.scripts]
+sparksi = "sparksi.cli:main"
+sparksi-announce = "sparksi.announce:main"
+sparksi-monitor = "sparksi.monitor.__main__:main"
+# Deprecated alias, kept for one release so the existing unit keeps working.
+dgx-mem = "sparksi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sparksi = ["static/*", "static/fonts/*", "examples/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+# Real errors only. Formatting and style rules stay off so a lint run
+# does not turn into a mass reformat.
+select = ["E", "F"]
+ignore = ["E501"]

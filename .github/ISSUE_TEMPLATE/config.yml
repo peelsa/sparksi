@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security and conduct reports
+    url: https://github.com/peelsa/sparksi/security/advisories/new
+    about: Private report to Peelsa. This is the only contact. A public issue is the wrong place.
+  - name: Contributing
+    url: https://github.com/peelsa/sparksi/blob/main/CONTRIBUTING.md
+    about: Setup, checks, pull request rules, and the sign-off.

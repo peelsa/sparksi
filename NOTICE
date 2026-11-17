@@ -1,0 +1,9 @@
+Sparksi
+Copyright the Sparksi authors
+
+This product includes a counter-delta token ledger in the style of SparkDash,
+licensed under the Apache License, Version 2.0, from SparkDash version 2.0.0.
+
+The method is: poll each engine's own counters, add the increase since the
+previous sample, treat a drop as a counter reset, and do not add the value
+the first time a counter is seen.

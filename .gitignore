@@ -1,0 +1,41 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Site config and catalog: never commit
+sparksi.toml
+config/sparksi.toml
+catalog.yaml
+config/catalog.yaml
+catalog/catalog.yaml
+.env
+*.local.*
+
+# Backups, logs, runtime state, secrets
+*.bak
+*.bak-*
+*.bak*
+*.orig
+*.log
+logs/
+state/
+unlock.token
+*.ledger.json
+llama-day.json
+token-ledger.json
+targets.json
+
+# Tooling
+.opencode/
+opencode.json
+
+# Local planning notes. Never commit.
+planning/
+
+# Saved per-model launch recipes. Site-local, never committed.
+recipes/*.toml

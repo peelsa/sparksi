@@ -1,0 +1,35 @@
+name: Config help
+description: Help with sparksi.toml or catalog.yaml
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste a real config. Redact addresses, host names, paths, and tokens.
+        Describe the shape with placeholders: `spark-a`, `spark-b`, `100.64.0.x`, `192.0.2.x`, `/home/USER`.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - controller bind or ports
+        - nodes
+        - catalog or recipes
+        - engines
+        - archive or paths
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: What you are trying to set
+      description: The keys you changed, with placeholder values only.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened
+      description: The message Sparksi printed, with addresses removed.
+    validations:
+      required: true

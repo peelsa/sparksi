@@ -1,0 +1,14 @@
+[Unit]
+Description=Point the token ledger at the models Sparksi says are serving
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SPARKSI_HOSTS=a=spark-a,b=spark-b
+ExecStart=%h/.local/bin/token-discover
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

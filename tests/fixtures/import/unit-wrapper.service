@@ -1,0 +1,7 @@
+[Unit]
+Description=Example compose wrapper
+
+[Service]
+WorkingDirectory=/srv/example/stack
+ExecStart=/srv/example/stack/up.sh
+Restart=no

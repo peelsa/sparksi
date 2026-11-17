@@ -1,0 +1,14 @@
+# Paths removed from a public export after git archive.
+# A line ending in / matches that directory and everything under it.
+# Any other line is a glob matched against the relative path and the file name.
+# planning notes, backup files, and local tool directories stay private.
+
+planning/
+*.bak*
+*.log
+.opencode/
+opencode.json
+.cursor/
+.cursorrules
+.vscode/
+.idea/

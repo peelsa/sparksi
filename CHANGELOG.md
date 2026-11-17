@@ -1,0 +1,21 @@
+# Changelog
+
+## 0.6.0
+
+First public release.
+
+- Added `sparksi serve`, a controller with a dashboard and HTTP API on the default port 7500, plus the `sparksi` CLI. Pages: Overview, Model Manager, Library, Archive, Tokens, Activity, Network, Options.
+- All site values, including hosts, addresses, paths and users, live in `sparksi.toml` and the catalog. Examples use placeholder names and documentation addresses.
+- Added a node announcer: a stdlib-only script per Spark that sends one UDP datagram with memory, GPU, temperature and serving state. It is configured by `SPARKSI_NODE_ID`, `SPARKSI_CONTROLLER`, `SPARKSI_ADVERTISE` and `SPARKSI_PROTECT`.
+- `sparksi install-unit --print` prints a user unit and never enables or starts it.
+- Added a node agent, stdlib only, whose configuration the controller sends with every request.
+- Added launch recipes for vLLM, SGLang, TensorRT-LLM (two-node is experimental) and llama.cpp. The browser sends fields, never a command string; argv is generated and checked against allowed images, ports 8010-8099, the memory budget and refused docker flags.
+- Pinned recipes keep an imported launch per role.
+- Loads are memory-aware: each Spark's free memory is checked and the load waits on health for the recipe timeout, 1800 s by default.
+- Mutating calls require the lock to be off or the unlock token.
+- The controller listens on loopback plus one tailnet address, refusing 0.0.0.0, :: and * and any address in a deny list.
+- Added optional protection presets: `[protect] presets = ["video-service"]` keeps a video service and its port 8188 off limits. This is off by default and turned on automatically for configs that still use older key names.
+- Overview shows one shared resource chart with GPU, CPU, memory and temperature in Fahrenheit, serving models on the cards, and a fleet power estimate.
+- The Archive page copies archived weights onto a Spark; the Library page lists weights per machine.
+- Older config keys, env vars and API field names are still read for one release; `docs/config.md` lists them.
+- CI runs ruff, pytest on Python 3.12-3.14, gitleaks, an identity guard and a stdlib-only check of the agent and announcer.

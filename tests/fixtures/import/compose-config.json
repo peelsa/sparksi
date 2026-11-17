@@ -1,0 +1,24 @@
+{
+  "services": {
+    "head": {
+      "image": "example.invalid/tensorfold:1",
+      "container_name": "example-tensorfold",
+      "network_mode": "host",
+      "ipc": "host",
+      "shm_size": "16g",
+      "command": ["tensorfold", "serve", "--host", "0.0.0.0", "--port", "8014", "--max-model-len", "8192"],
+      "environment": {"FOLD_CONFIG": "/srv/example/builds/fold.toml"},
+      "volumes": ["/srv/example/builds:/opt/fold"],
+      "deploy": {"resources": {"reservations": {"devices": [{"capabilities": ["gpu"]}]}}}
+    },
+    "worker": {
+      "image": "example.invalid/tensorfold:1",
+      "container_name": "example-tensorfold-worker",
+      "network_mode": "host",
+      "ipc": "host",
+      "command": ["tensorfold", "serve", "--host", "0.0.0.0", "--port", "8014", "--rank", "1"],
+      "environment": {"FOLD_CONFIG": "/srv/example/worker/fold.toml"},
+      "volumes": ["/srv/example/worker:/opt/fold"]
+    }
+  }
+}

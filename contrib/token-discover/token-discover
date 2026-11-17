@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
+"""Point a VictoriaMetrics ledger at whatever Sparksi says is serving.
+
+Reads <controller>/api/monitor. Each serving vLLM or OpenAI row becomes a
+scrape target. A headless worker is not its own row, so it is not scraped.
+The served name is attached as model_name for engines whose counters do not
+carry one (TensorFold). If the card does not answer, the last targets file is
+left alone.
+
+Environment:
+  SPARKSI_CARD   monitor URL (default http://127.0.0.1:7500/api/monitor)
+  SPARKSI_HOSTS  node id -> scrape host, e.g. "a=spark-a,b=spark-b"
+  SPARKSI_TARGETS  output file (default ~/.config/victoria-metrics/targets.json)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+CARD = os.environ.get("SPARKSI_CARD", "http://127.0.0.1:7500/api/monitor")
+OUT = os.path.expanduser(os.environ.get("SPARKSI_TARGETS", "~/.config/victoria-metrics/targets.json"))
+HOSTS = dict(
+    item.split("=", 1)
+    for item in os.environ.get("SPARKSI_HOSTS", "a=spark-a,b=spark-b").split(",")
+    if "=" in item
+)
+KINDS = {"vllm", "openai"}
+
+
+def targets_from(card: dict) -> list[dict]:
+    rows = []
+    seen: set[tuple[str, int]] = set()
+    for rec in card.get("loaded") or []:
+        if rec.get("kind") not in KINDS:
+            continue
+        if not rec.get("head_up", True):
+            continue
+        port = rec.get("port")
+        host = HOSTS.get(rec.get("host") or "")
+        if not port or not host:
+            continue
+        key = (host, int(port))
+        if key in seen:
+            continue
+        seen.add(key)
+        labels = {"spark": host, "role": "head"}
+        # TensorFold counters have no model_name. vLLM already has one;
+        # scrape.yml sets honor_labels so this does not replace it.
+        model = rec.get("served") or rec.get("name")
+        if model:
+            labels["model_name"] = str(model)
+        rows.append(
+            {
+                "targets": [f"{host}:{int(port)}"],
+                "labels": labels,
+            }
+        )
+    rows.sort(key=lambda row: row["targets"][0])
+    return rows
+
+
+def write(rows: list[dict]) -> None:
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    data = json.dumps(rows, indent=2) + "\n"
+    try:
+        with open(OUT) as fh:
+            if fh.read() == data:
+                return
+    except FileNotFoundError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(OUT), prefix=".targets.")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, OUT)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def once() -> list[dict]:
+    with urllib.request.urlopen(CARD, timeout=8) as resp:
+        card = json.load(resp)
+    if card.get("ok") is False:
+        raise RuntimeError(card.get("error") or "monitor card not ok")
+    rows = targets_from(card)
+    # A card can answer before its first peer poll. An empty list is real
+    # only once a host snapshot is fresh. Otherwise keep the last targets.
+    if not rows:
+        hosts = card.get("hosts") or []
+        fresh = [h for h in hosts if h.get("fresh") and not h.get("unreachable")]
+        if not fresh:
+            raise RuntimeError("monitor card has no fresh host yet")
+    write(rows)
+    return rows
+
+
+def main() -> int:
+    single = "--once" in sys.argv[1:]
+    while True:
+        try:
+            rows = once()
+            if single:
+                print(f"{len(rows)} target(s) -> {OUT}")
+                return 0
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError) as exc:
+            print(f"token-discover: kept last targets ({exc})", flush=True)
+            if single:
+                return 1
+        time.sleep(15)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

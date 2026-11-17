@@ -1,0 +1,1 @@
+/srv/example/builds/llama/bin/llama-server -m /srv/example/cache/example.gguf --host 0.0.0.0 --port 8014 -c 262144
