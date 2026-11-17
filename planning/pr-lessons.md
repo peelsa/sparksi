@@ -18,3 +18,14 @@ one line: what was missed, and the check that would have caught it.
 - Do not open a pull request until the local acceptance commands have
   passed and, when the branch name is in the workflow `push` filter, CI
   on the branch is green.
+- A rerun after a failure is not a pass. If any check fails, even once,
+  find the cause and fix it before you report. Re-running a failed job
+  does not count as passing.
+- Anything that comes up in the work — a failing or flaky test, a
+  warning, or a broken path you touched or saw — gets fixed in this
+  job before the final report, on its own branch or pull request if it
+  is out of scope. Do not leave it as an offer or a question. The
+  final report has no "came up", "want me to", or follow-up items.
+  Ask the owner only for spending money, model or live-runtime
+  operations beyond the brief, the five-file or public-API limits, or
+  a change of plan.
