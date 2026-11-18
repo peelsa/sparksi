@@ -140,8 +140,9 @@ jobs:
   webkit-scroll:
     # Playwright 1.55 ships WebKit for Ubuntu 24.04, not for 26.04.
     runs-on: ubuntu-24.04
-    # A normal run takes about 6 minutes; a stalled download must not hold the job for hours.
-    timeout-minutes: 30
+    # A normal run takes about 6 minutes; a slow apt mirror once stretched the
+    # WebKit install to 24. Generous, but never hours.
+    timeout-minutes: 45
     env:
       PLAYWRIGHT_VERSION: "1.55.0"
       PLAYWRIGHT_BROWSERS_PATH: /tmp/ms-playwright
@@ -164,7 +165,7 @@ jobs:
           key: playwright-webkit-${{ env.PLAYWRIGHT_VERSION }}-ubuntu-24.04
       - name: Install WebKit
         # Each command is time-limited and retried with backoff in the script.
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: scripts/ci-install-webkit.sh /tmp/webkit-test
       - name: WebKit regressions
         env:
