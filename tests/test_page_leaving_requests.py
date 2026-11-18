@@ -15,8 +15,9 @@ import os
 import subprocess
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -34,34 +35,48 @@ SLOW: list[int] = []
 STATUS: list[int] = []
 
 
-class _SinkHandler(Handler):
-    """The real server, plus a blank page and a write sink for the wrapper tests."""
+class _SinkHandler(BaseHTTPRequestHandler):
+    """A blank page and a write sink for the wrapper tests, apart from the app server.
+
+    It shares no code with the app's ``Handler``, so nothing a test request carries
+    reaches the app's own request handling.
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args) -> None:  # noqa: A002
+        pass
+
+    def _answer(self, code: int, body: bytes = b"", kind: str = "application/json") -> None:
+        self.send_response(code)
+        if body:
+            self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _body(self) -> bytes:
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/__blank":
-            body = b"<!doctype html><title>blank</title>"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        super().do_GET()
+            self._answer(200, b"<!doctype html><title>blank</title>", "text/html")
+        else:
+            self._answer(404, b"{}")
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.startswith("/__status"):
+        route = urlsplit(self.path)
+        query = parse_qs(route.query)
+        if route.path == "/__status":
             # A write answered with a status of the caller's choice and no body (204, 205).
-            code = int(parse_qs(urlsplit(self.path).query)["code"][0])
-            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            code = int(query["code"][0])
+            self._body()
             STATUS.append(code)
-            self.send_response(code)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if self.path.startswith("/__slow"):
+            self._answer(code)
+        elif route.path == "/__slow":
             # Answers late (``delay`` ms before the headers), then sends the body slowly (``ms``).
-            query = parse_qs(urlsplit(self.path).query)
-            SLOW.append(len(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            SLOW.append(len(self._body()))
             time.sleep(int(query.get("delay", ["0"])[0]) / 1000)
             steps = max(1, int(query.get("ms", ["0"])[0]) // 100)
             self.send_response(200)
@@ -75,17 +90,27 @@ class _SinkHandler(Handler):
                     time.sleep(0.1)
             except OSError:
                 pass
-            return
-        if self.path == "/__sink":
-            SINK.append(len(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
-            body = b"{}"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        super().do_POST()
+        elif route.path == "/__sink":
+            SINK.append(len(self._body()))
+            self._answer(200, b"{}")
+        else:
+            self._body()
+            self._answer(404, b"{}")
+
+
+@pytest.fixture()
+def sink_port():
+    SINK.clear()
+    SLOW.clear()
+    STATUS.clear()
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _SinkHandler)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield httpd.server_address[1]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 class _Quiet:
@@ -108,10 +133,7 @@ def port(monkeypatch, tmp_path):
     lock.release(ttl_s=120)
     STATE.lock = lock
     STATE.runner = _Quiet()
-    SINK.clear()
-    SLOW.clear()
-    STATUS.clear()
-    httpd = DualServer(("127.0.0.1", 0), _SinkHandler)
+    httpd = DualServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         yield httpd.server_address[1]
@@ -398,9 +420,9 @@ const base = 'http://127.0.0.1:' + process.env.SPARKSI_PORT;
 
 
 @pytest.mark.parametrize("engine", ["webkit", "chromium"])
-def test_keepalive_writes_stay_inside_the_shared_byte_budget(port, engine) -> None:
+def test_keepalive_writes_stay_inside_the_shared_byte_budget(sink_port, engine) -> None:
     """Writes while leaving are never refused: the 64 KiB keepalive budget is bytes, shared by every request in flight."""
-    data = _run(BUDGET, port, ENGINE=engine, WRAPPER=_wrapper())
+    data = _run(BUDGET, sink_port, ENGINE=engine, WRAPPER=_wrapper())
     assert data["errors"] == []
     assert data["multibyte"] == "ok 200", data
     assert data["big"] == "ok 200", data
