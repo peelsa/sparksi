@@ -31,3 +31,4 @@ one line: what was missed, and the check that would have caught it.
 - Hash-pin the Playwright npm install: `package.json`, `package-lock.json` and `npm ci`.
 - Add job timeouts to `release.yml`, `codeql.yml` and `scorecard.yml`, and hash-pin the `pip install build` in `release.yml`.
 - Add a Dependabot entry for the `/.github` pip requirements.
+- Pin runner images (for example `ubuntu-24.04`) across all workflows before `ubuntu-latest` moves to Ubuntu 26.
