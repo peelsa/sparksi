@@ -159,7 +159,7 @@ jobs:
           python -m pip install --require-hashes -r .github/requirements-ci.txt
           python -m pip install --no-deps --no-build-isolation -e .
       - name: Cache the Playwright WebKit build
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/ms-playwright
           key: playwright-webkit-${{ env.PLAYWRIGHT_VERSION }}-ubuntu-24.04
