@@ -26,6 +26,35 @@ from sparksi.recipes.runs import reset_for_tests as reset_runs
 from sparksi.serve import STATE, DualServer, Handler
 
 ROOT = Path(__file__).resolve().parents[1]
+PAGE = ROOT / "src" / "sparksi" / "static" / "index.html"
+SINK: list[int] = []
+
+
+class _SinkHandler(Handler):
+    """The real server, plus a blank page and a write sink for the wrapper tests."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/__blank":
+            body = b"<!doctype html><title>blank</title>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/__sink":
+            SINK.append(len(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_POST()
 
 
 class _Quiet:
@@ -48,7 +77,8 @@ def port(monkeypatch, tmp_path):
     lock.release(ttl_s=120)
     STATE.lock = lock
     STATE.runner = _Quiet()
-    httpd = DualServer(("127.0.0.1", 0), Handler)
+    SINK.clear()
+    httpd = DualServer(("127.0.0.1", 0), _SinkHandler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         yield httpd.server_address[1]
@@ -78,6 +108,8 @@ def _run(script: str, port: int, **extra: object) -> dict:
     proc = subprocess.run(["node"], input=script, env=env, capture_output=True, text=True, timeout=120, check=False)
     if proc.returncode != 0 and "Executable doesn't exist" in proc.stderr and os.environ.get("SPARKSI_WEBKIT_REQUIRED") != "1":
         pytest.skip("Playwright WebKit is not installed")
+    if "__SKIP__" in proc.stdout:
+        pytest.skip(proc.stdout.split("__SKIP__", 1)[1].strip())
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.split("__RESULT__", 1)[1].strip())
 
@@ -205,3 +237,96 @@ def test_a_stopped_navigation_raises_no_page_error_and_polls_go_on(port) -> None
     assert data["errors"] == []
     assert data["path"] == "/overview", data
     assert data["after"] >= 2, data
+
+
+STOPPED_WRITE = COMMON + """
+(async () => {
+  const { browser, page, errors, requests, t0 } = await open('/overview');
+  await page.addInitScript(() => { window.SPARKSI_LEAVING_HOLD_MS = 1500; });
+  await page.goto(base + '/models');
+  await page.waitForSelector('#btn-lock:not([hidden])');
+  // A navigation that is stopped: the page stays, and requests stay keepalive from here on.
+  await page.evaluate(() => { location.href = '/overview'; setTimeout(() => window.stop(), 1000); });
+  await page.waitForTimeout(2500);
+  const at = Date.now() - t0;
+  await page.evaluate(() => document.getElementById('btn-lock').click());
+  await page.waitForFunction(() => !document.getElementById('btn-unlock').hidden, null, { timeout: 10000 });
+  const path = await page.evaluate(() => location.pathname);
+  const lock = requests.filter((r) => r.method === 'POST' && r.path === '/api/lock' && r.t >= at);
+  done({ errors, path, lockPosts: lock.length });
+  await browser.close();
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+
+
+def test_writes_still_go_after_a_stopped_navigation(port) -> None:
+    data = _run(STOPPED_WRITE, port, HOLD_MS=4000)
+    assert data["errors"] == []
+    assert data["path"] == "/models", data
+    assert data["lockPosts"] == 1, data
+    assert STATE.lock.read().locked, "the write never reached the server"
+
+
+def _wrapper() -> str:
+    """The page's own leaving-page fetch wrapper, exactly as shipped."""
+    text = PAGE.read_text(encoding="utf-8")
+    return text.split("/* leaving-fetch-start */", 1)[1].split("/* leaving-fetch-end */", 1)[0]
+
+
+BUDGET = """
+const pw = require('playwright');
+const base = 'http://127.0.0.1:' + process.env.SPARKSI_PORT;
+(async () => {
+  let browser;
+  try { browser = await pw[process.env.ENGINE].launch(); } catch (e) {
+    if (process.env.ENGINE !== 'webkit' && /Executable doesn't exist/.test(String(e))) { console.log('__SKIP__ ' + process.env.ENGINE + ' is not installed'); return; }
+    throw e;
+  }
+  const page = await browser.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  await page.goto(base + '/__blank');
+  const out = await page.evaluate(async (code) => {
+    window.SPARKSI_LEAVING_HOLD_MS = 300;
+    const made = new Function(code + ';return { fetch: fetch, bytes: function () { return typeof keepaliveBytes === "number" ? keepaliveBytes : null; } };')();
+    const send = made.fetch;
+    const post = (body) => send('/__sink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+      .then((r) => 'ok ' + r.status, (e) => 'refused ' + e.name);
+    const ascii = (n) => JSON.stringify({ pad: 'a'.repeat(n) });
+    window.dispatchEvent(new Event('beforeunload'));
+    const result = {};
+    result.multibyte = await post(JSON.stringify({ pad: String.fromCharCode(0x20ac).repeat(30000) }));
+    result.big = await post(ascii(70000));
+    const first = post(ascii(40000));
+    result.inflight = [made.bytes()];
+    const rest = [post(ascii(40000)), post(ascii(40000))];
+    result.inflight.push(made.bytes());  // the other two would go over: sent as ordinary requests
+    result.concurrent = await Promise.all([first].concat(rest));
+    await new Promise((r) => setTimeout(r, 600));  // past the hold: sticky keepalive, no pageshow
+    result.sequential = [];
+    for (let i = 0; i < 5; i++) result.sequential.push(await post(ascii(50000)));
+    result.small = await Promise.all([post(ascii(10)), post(ascii(10))]);
+    await new Promise((r) => setTimeout(r, 300));
+    result.bytesAfter = made.bytes();
+    return result;
+  }, process.env.WRAPPER);
+  console.log('__RESULT__' + JSON.stringify(Object.assign({ errors }, out)));
+  await browser.close();
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+
+
+@pytest.mark.parametrize("engine", ["webkit", "chromium"])
+def test_keepalive_writes_stay_inside_the_shared_byte_budget(port, engine) -> None:
+    """Writes while leaving are never refused: the 64 KiB keepalive budget is bytes, shared by every request in flight."""
+    data = _run(BUDGET, port, ENGINE=engine, WRAPPER=_wrapper())
+    assert data["errors"] == []
+    assert data["multibyte"] == "ok 200", data
+    assert data["big"] == "ok 200", data
+    assert data["concurrent"] == ["ok 200"] * 3, data
+    assert data["sequential"] == ["ok 200"] * 5, data
+    assert data["small"] == ["ok 200"] * 2, data
+    assert data["inflight"] == [40010, 40010], data  # only the first 40 kB write counts against the budget
+    assert data["bytesAfter"] == 0, data  # every keepalive byte is given back once its response has loaded
+    assert sorted(SINK)[-1] >= 90000  # the multi-byte body arrived whole
+    assert len(SINK) == 12, SINK  # 1 + 1 + 3 + 5 + 2 writes, none lost

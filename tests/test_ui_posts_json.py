@@ -35,8 +35,8 @@ def test_every_write_fetch_in_the_page_sends_json() -> None:
     forwards = 0
     for start in calls:
         chunk = text[start:start + 300]
-        if chunk.startswith("pageFetch(url, options);"):
-            forwards += 1  # the leaving-page wrapper: sends the caller's own options on
+        if chunk.startswith(("pageFetch(url, options);", "pageFetch(url, copy);")):
+            forwards += 1  # the leaving-page wrapper: the caller's own options, or a copy that only adds keepalive
             continue
         method = re.search(r"method:\s*\"([A-Z]+)\"", chunk)
         assert method, chunk
@@ -44,7 +44,7 @@ def test_every_write_fetch_in_the_page_sends_json() -> None:
             continue
         writes += 1
         assert '"Content-Type": "application/json"' in chunk, chunk
-    assert forwards == 1  # one way out to the browser's fetch, and it adds no method of its own
+    assert forwards == 2  # the only ways out to the browser's fetch, and they add no method of their own
     assert writes == 5  # jpost, jpostRead, jpostTimed, jput, jdel: every POST, PUT and DELETE goes through one of them
 
 
