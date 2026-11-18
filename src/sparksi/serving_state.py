@@ -21,6 +21,9 @@ _SERVED: ContextVar[dict[str, tuple[set[str], list[str]]]] = ContextVar("serving
 # Every run record of this reconcile, so a newer run that reuses a container name wins it.
 _RUNS: ContextVar[list[dict[str, Any]]] = ContextVar("serving_runs", default=[])
 _NAME_FLAGS = ("--served-model-name", "--alias", "-a")
+# TensorFold names the served model with --name inside the container args. Only there:
+# elsewhere --name is docker's container name, never a served name.
+_TENSORFOLD_FLAGS = _NAME_FLAGS + ("--name",)
 
 
 def reconcile(
@@ -147,14 +150,15 @@ def _recipe_served(model_id: str) -> set[str]:
             if recipe.get("alias"):
                 found.add(str(recipe["alias"]))
             roles = recipe.get("roles") if isinstance(recipe.get("roles"), dict) else {}
+            flags = _TENSORFOLD_FLAGS if str(recipe.get("engine") or "") == "tensorfold" else _NAME_FLAGS
             for side in roles.values():
                 if not isinstance(side, dict):
                     continue
                 args = [str(part) for part in side.get("args") or []] if isinstance(side.get("args"), list) else []
                 for index, arg in enumerate(args):
-                    if arg in _NAME_FLAGS and index + 1 < len(args):
+                    if arg in flags and index + 1 < len(args):
                         found.add(args[index + 1])
-                    for flag in _NAME_FLAGS:
+                    for flag in flags:
                         if arg.startswith(flag + "="):
                             found.add(arg.split("=", 1)[1])
                 env = side.get("env") if isinstance(side.get("env"), dict) else {}

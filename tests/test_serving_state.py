@@ -735,3 +735,27 @@ def test_page_owner_needs_an_active_run_and_a_name_its_model_declares() -> None:
     assert got["serverNamed"] == "gamma"
     # Equal starts: the larger id wins in either order.
     assert got["tieForward"] == got["tieBackward"] == "beta"
+
+
+def test_tensorfold_recipe_declares_its_served_name_with_name(monkeypatch, tmp_path) -> None:
+    """TensorFold's --name inside the container args is the served name; other engines' is not."""
+    from sparksi.serving_state import served_names_for
+
+    monkeypatch.setenv("SPARKSI_RECIPES_DIR", str(tmp_path))
+    (tmp_path / "beta.toml").write_text(
+        'kind = "pinned"\nengine = "tensorfold"\n'
+        '[roles.head]\ncontainer = "run-beta-head"\n'
+        'args = ["tensorfold", "serve", "/models/beta", "--name", "Fold-Served"]\n'
+    )
+    (tmp_path / "gamma.toml").write_text(
+        'kind = "pinned"\nengine = "vllm"\n[roles.head]\nargs = ["serve", "--name", "not-served", "--name=also-not"]\n'
+    )
+    got = served_names_for(["beta", "gamma"], {"library": []})
+    assert "fold-served" in got["beta"][0]
+    assert "run-beta-head" not in got["beta"][0]
+    assert got["gamma"] == ({"gamma"}, [])
+    # The declared name lets the run's own containers own a process serving it.
+    live = dict(_shared_pair())
+    live.update(served="Fold-Served", name="Fold-Served")
+    rows = _pair_rows([live], [_beta_run()], served_names={"beta": got["beta"]})
+    assert {row["run_id"] for row in rows} == {"beta-run"}
