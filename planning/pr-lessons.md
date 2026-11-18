@@ -38,3 +38,4 @@ one line: what was missed, and the check that would have caught it.
 - Add job timeouts to `release.yml`, `codeql.yml` and `scorecard.yml`, and hash-pin the `pip install build` in `release.yml`.
 - Add a Dependabot entry for the `/.github` pip requirements.
 - Pin runner images (for example `ubuntu-24.04`) across all workflows before `ubuntu-latest` moves to Ubuntu 26.
+- `library.newest_run`, the page `newestRun` and `displayedRuns` let the later record win on equal start times; break ties on id, like `serving_state` does.
