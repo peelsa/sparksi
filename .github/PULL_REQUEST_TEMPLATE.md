@@ -9,6 +9,7 @@
 - **Allowed files:**
 - **Edge cases and tests:**
 - **Sibling sweep:** commands run and what they hit
+- **Out of scope:**
 
 ## Tests and guards
 
@@ -21,8 +22,10 @@ Paste the last lines and the exit code for each command.
 - [ ] `python3 scripts/check_ui_colors.py` is clean when the UI changed
 - [ ] `ruff check src tests scripts` is clean
 - [ ] Sibling sweep done
-- [ ] Whole diff re-read
-- [ ] No known issues or follow-ups
+- [ ] Whole diff re-read independently
+- [ ] No check passed only on retry; any failure was traced and fixed
+- [ ] In-scope issues are fixed
+- [ ] Out-of-scope findings (if any) are one line in `planning/pr-lessons.md` and listed below, not started in this PR
 
 ## Screenshots
 
