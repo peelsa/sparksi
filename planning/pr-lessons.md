@@ -32,3 +32,6 @@ one line: what was missed, and the check that would have caught it.
 - Add job timeouts to `release.yml`, `codeql.yml` and `scorecard.yml`, and hash-pin the `pip install build` in `release.yml`.
 - Add a Dependabot entry for the `/.github` pip requirements.
 - Pin runner images (for example `ubuntu-24.04`) across all workflows before `ubuntu-latest` moves to Ubuntu 26.
+- Break equal-start ties on run id in the other newest-run pickers too (`library.newest_run`, page `newestRun` and `displayedRuns`), as `serving_state` does.
+- Cache `serving_state._recipe_served` by recipe file mtime instead of reading every saved recipe on each `/api/runs` that needs a container to decide.
+- `tests/test_refresh_after_write.py`: wait on the refresh thread's done event instead of the fixed 4 s `_wait_for` budget, which a scheduler stall can exhaust.

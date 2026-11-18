@@ -685,3 +685,85 @@ def test_a_late_recipe_list_does_not_undo_a_rename(bar_server) -> None:
     assert got["held"] == 1, got
     assert got["beforeRelease"] == "long", got
     assert got["afterRelease"] == "long", got
+
+
+REPAINT_PROBE = r"""
+const { webkit } = require("playwright");
+(async () => {
+  const base = "http://127.0.0.1:" + process.env.RECIPE_PORT;
+  const browser = await webkit.launch();
+  const errors = [];
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  page.on("pageerror", (err) => errors.push(String(err)));
+  const out = { errors };
+  const menuOpen = () => page.evaluate(() => !document.getElementById("recipe-menu").hidden);
+  /* Any paintRecipeFiles with nothing new: the sort control repaints with the same order. */
+  const repaint = (value) => page.evaluate((v) => {
+    const sel = document.getElementById("recipe-sort");
+    sel.value = v;
+    sel.dispatchEvent(new Event("change"));
+  }, value);
+  try {
+    await page.goto(base + "/models", { waitUntil: "networkidle" });
+    await page.click("button:has-text('Pair Fast')");
+    await page.waitForFunction(() => document.getElementById("recipe-current-name").textContent === "default");
+    await page.evaluate(() => { window.__row = document.querySelector("#recipe-files tr.is-open"); });
+    /* Press on the row's more button, repaint, then release: the click must still land. */
+    const more = await page.$("#recipe-files tr.is-open .recipe-row-more");
+    await more.scrollIntoViewIfNeeded();
+    const box = await more.boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await repaint("default:asc");
+    await page.mouse.up();
+    await page.waitForTimeout(100);
+    out.openAfterRepaint = await menuOpen();
+    out.sameRow = await page.evaluate(() => document.querySelector("#recipe-files tr.is-open") === window.__row);
+    /* A repaint that changes what the rows show still rebuilds, and an open menu stays open
+       with its button still marked expanded. */
+    await repaint("name:asc");
+    out.rebuilt = await page.evaluate(() => document.querySelector("#recipe-files tr.is-open") !== window.__row);
+    out.openAfterRebuild = await menuOpen();
+    out.expanded = await page.evaluate(() => document.querySelector("#recipe-files tr.is-open .recipe-row-more").getAttribute("aria-expanded"));
+  } catch (err) {
+    out.crash = String(err && err.stack || err);
+  }
+  await browser.close();
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+def test_a_repaint_with_nothing_new_keeps_the_row_under_a_click(bar_server) -> None:
+    """Regression: every recipe-list repaint rebuilt the rows. A poll or preview repaint that
+    lands between the press and release on a row's more button swapped the button, so WebKit
+    dropped the click and the row menu never opened (seen once in CI as a 30 s wait for
+    #recipe-cmd-rename)."""
+    port, _tmp_path = bar_server
+    from sparksi.recipes.store import using_recipe
+
+    with using_recipe("pair-fast", "alt"):
+        save_recipe("pair-fast", {"engine": "vllm", "placement": "head", "port": 8012, "ctx": 8192})
+    node_path = os.environ.get("SPARKSI_PLAYWRIGHT_NODE", "")
+    node = Path(node_path) if node_path else None
+    required = os.environ.get("SPARKSI_WEBKIT_REQUIRED") == "1"
+    if node is None or not (node / "playwright").is_dir():
+        if required:
+            raise AssertionError("CI requires the WebKit recipe-bar regression")
+        pytest.skip("Playwright WebKit is not installed")
+    env = os.environ.copy()
+    env["NODE_PATH"] = str(node)
+    env["RECIPE_PORT"] = str(port)
+    proc = subprocess.run(["node"], input=REPAINT_PROBE, text=True, capture_output=True, check=False, env=env)
+    if proc.returncode != 0:
+        if "Executable doesn't exist" in (proc.stderr or "") and not required:
+            pytest.skip("Playwright WebKit browser is not installed")
+        raise AssertionError(proc.stderr or proc.stdout)
+    got = json.loads(proc.stdout)
+    assert "crash" not in got, got
+    assert got["errors"] == [], got
+    assert got["openAfterRepaint"] is True, got
+    assert got["sameRow"] is True, got
+    assert got["rebuilt"] is True, got
+    assert got["openAfterRebuild"] is True, got
+    assert got["expanded"] == "true", got
