@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PAGE = ROOT / "src" / "sparksi" / "static" / "index.html"
 SINK: list[int] = []
 SLOW: list[int] = []
+STATUS: list[int] = []
 
 
 class _SinkHandler(Handler):
@@ -48,6 +49,15 @@ class _SinkHandler(Handler):
         super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.startswith("/__status"):
+            # A write answered with a status of the caller's choice and no body (204, 205).
+            code = int(parse_qs(urlsplit(self.path).query)["code"][0])
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            STATUS.append(code)
+            self.send_response(code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/__slow"):
             # Answers late (``delay`` ms before the headers), then sends the body slowly (``ms``).
             query = parse_qs(urlsplit(self.path).query)
@@ -100,6 +110,7 @@ def port(monkeypatch, tmp_path):
     STATE.runner = _Quiet()
     SINK.clear()
     SLOW.clear()
+    STATUS.clear()
     httpd = DualServer(("127.0.0.1", 0), _SinkHandler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
@@ -358,6 +369,21 @@ const base = 'http://127.0.0.1:' + process.env.SPARKSI_PORT;
     result.bytesMidBody = made.bytes();
     await sleep(2000);
     result.bytesEnd = made.bytes();
+    // A write with a signal answered 204 or 205: both browsers give those a body that is
+    // empty but not null, and a rebuilt Response may not have one.
+    result.nullBody = {};
+    for (const code of [204, 205]) {
+      ac = new AbortController();
+      const answer = send('/__status?code=' + code, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: ascii(100), signal: ac.signal })
+        .then((r) => r.text().then((t) => 'ok ' + r.status + ' [' + t + ']'), (e) => 'rejected ' + e.name);
+      result.nullBody[code] = await Promise.race([answer, sleep(3000).then(() => 'no answer in 3 s')]);
+    }
+    // A signal aborted before the call: nothing is sent.
+    ac = new AbortController();
+    ac.abort();
+    result.preAborted = await send('/__sink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: ascii(100), signal: ac.signal })
+      .then(() => 'sent', (e) => 'rejected ' + e.name);
+    result.bytesAfterPreAborted = made.bytes();
     return result;
   }, process.env.WRAPPER);
   console.log('__RESULT__' + JSON.stringify(Object.assign({ errors }, out)));
@@ -379,7 +405,7 @@ def test_keepalive_writes_stay_inside_the_shared_byte_budget(port, engine) -> No
     assert data["inflight"] == [40010, 40010], data  # only the first 40 kB write counts against the budget
     assert data["bytesAfter"] == 0, data  # every keepalive byte is given back once its response has loaded
     assert sorted(SINK)[-1] >= 90000  # the multi-byte body arrived whole
-    assert len(SINK) == 13, SINK  # 1 + 1 + 3 + 5 + 2 writes and the one after the abort, none lost
+    assert len(SINK) == 13, SINK  # 1 + 1 + 3 + 5 + 2 writes and the one after the abort; the pre-aborted one never went
     assert data["abortBefore"] == "AbortError", data
     assert data["bytesAfterAbort"] == 30010, data  # still held: the request runs on without its signal
     assert data["afterAbort"] == "ok 200", data  # 30 kB + 56 kB is over the budget: sent as an ordinary request
@@ -391,3 +417,7 @@ def test_keepalive_writes_stay_inside_the_shared_byte_budget(port, engine) -> No
     assert data["bytesMidBody"] == 30010, data
     assert data["bytesEnd"] == 0, data
     assert SLOW == [30010, 30010], SLOW
+    assert data["nullBody"] == {"204": "ok 204 []", "205": "ok 205 []"}, data
+    assert STATUS == [204, 205], STATUS
+    assert data["preAborted"] == "rejected AbortError", data
+    assert data["bytesAfterPreAborted"] == 0, data  # and the sink count above shows nothing was sent

@@ -1354,7 +1354,12 @@
   }
   /* The caller's view of a keepalive request sent without its signal: the promise
      rejects on abort, and so does a body still loading when the abort comes. The
-     request itself runs on, so its bytes stay counted until it really ends. */
+     request itself runs on, so its bytes stay counted until it really ends.
+     The body is handed on through a new Response, which keeps status, statusText
+     and headers but not url, redirected or type; no caller in this page reads
+     those. A null-body status (101, 103, 204, 205, 304) cannot be rebuilt with a
+     body, and has nothing to read, so the original response is handed on. */
+  var NULL_BODY_STATUS = [101, 103, 204, 205, 304];
   function abortable(sent, signal) {
     return new Promise(function (resolve, reject) {
       if (signal.aborted) { reject(abortError()); return; }
@@ -1363,7 +1368,17 @@
       sent.then(function (response) {
         signal.removeEventListener("abort", early);
         if (signal.aborted) { reject(abortError()); return; }
-        if (!response.body) { resolve(response); return; }
+        try {
+          handOn(response);
+        } catch (err) {
+          reject(err);
+        }
+      }, function (err) {
+        signal.removeEventListener("abort", early);
+        reject(signal.aborted ? abortError() : err);
+      });
+      function handOn(response) {
+        if (!response.body || NULL_BODY_STATUS.indexOf(response.status) >= 0) { resolve(response); return; }
         var reader = response.body.getReader();
         var body = new ReadableStream({
           start: function (controller) {
@@ -1391,13 +1406,13 @@
           }
         });
         resolve(new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }));
-      }, function (err) {
-        signal.removeEventListener("abort", early);
-        reject(signal.aborted ? abortError() : err);
-      });
+      }
     });
   }
   function sendRequest(url, options, keep) {
+    /* An already-aborted signal sends nothing, as the browser's fetch does; the
+       keepalive path below drops the signal, so it must not get that far. */
+    if (options && options.signal && options.signal.aborted) return Promise.reject(abortError());
     var bytes = keep ? bodyBytes(options && options.body) : Infinity;
     if (keepaliveBytes + bytes > KEEPALIVE_BUDGET) return pageFetch(url, options);
     var signal = options && options.signal;
