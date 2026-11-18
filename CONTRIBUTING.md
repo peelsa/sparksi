@@ -70,6 +70,8 @@ Never commit `sparksi.toml`, `catalog.yaml`, the unlock token or backups.
 - One topic per pull request.
 - Sign off every commit: `git commit -s` adds a `Signed-off-by` line.
 - No force-push to shared branches. No bypassing branch rules.
+- The maintainer merges; do not merge your own PR. After a PR is
+  open, push only fixes a review or a check asked for.
 - Describe what changed and how it was tested.
 
 ## Docs
