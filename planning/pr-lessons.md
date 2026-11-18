@@ -33,3 +33,4 @@ one line: what was missed, and the check that would have caught it.
 - Add a Dependabot entry for the `/.github` pip requirements.
 - Pin runner images (for example `ubuntu-24.04`) across all workflows before `ubuntu-latest` moves to Ubuntu 26.
 - `library.newest_run`, the page `newestRun` and `displayedRuns` let the later record win on equal start times; break ties on id, like `serving_state` does.
+- `serving_state._recipe_served` reads every saved recipe on each reconcile when the container rule is needed; cache it by recipe mtime if recipe counts grow.
