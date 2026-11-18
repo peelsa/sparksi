@@ -11,6 +11,7 @@ import logging.handlers
 import os
 import socket
 import tempfile
+import threading
 
 import pytest
 
@@ -100,3 +101,31 @@ def test_syslog_that_dies_later_drops_quietly_and_reconnects(syslog_path, capsys
         assert b"sparksi INFO after restart" in restarted.recv(4096)
     finally:
         restarted.close()
+
+
+def test_stuck_stream_listener_does_not_hang_start_up(syslog_path, capsys):
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(syslog_path)
+    server.listen(0)
+    queued = []
+    try:
+        for _ in range(4):  # fill the backlog: a blocking connect now waits forever
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.setblocking(False)
+            queued.append(client)
+            try:
+                client.connect(syslog_path)
+            except BlockingIOError:
+                break
+        found = []
+        probe = threading.Thread(target=lambda: found.append(journal.logger()), daemon=True)
+        probe.start()
+        probe.join(5)
+        assert not probe.is_alive(), "logger() hung on a stuck syslog listener"
+        assert _syslog_handlers(found[0]) == []
+        found[0].info("still logs")
+        assert "INFO sparksi still logs" in capsys.readouterr().err
+    finally:
+        for client in queued:
+            client.close()
+        server.close()

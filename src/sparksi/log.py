@@ -39,6 +39,7 @@ def _syslog_reachable(address: str) -> bool:
     """
     for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
         probe = socket.socket(socket.AF_UNIX, kind)
+        probe.settimeout(1.0)  # a stuck listener must not hang start-up
         try:
             probe.connect(address)
         except OSError:
