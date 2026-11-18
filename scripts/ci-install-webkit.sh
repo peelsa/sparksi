@@ -47,5 +47,6 @@ mkdir -p "$dir"
 cd "$dir"
 [ -f package.json ] || npm init -y > /dev/null
 attempt 180 npm install --no-audit --no-fund "playwright@${version}"
-attempt 300 npx --no-install playwright install webkit
+# System libraries first, so the browser install does not warn that they are missing.
 attempt 480 sudo npx --no-install playwright install-deps webkit
+attempt 300 npx --no-install playwright install webkit
