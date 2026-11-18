@@ -1308,6 +1308,36 @@
 <script>
 (function () {
   "use strict";
+  /* Requests wait while the page is leaving. Once a navigation away starts
+     (beforeunload), WebKit keeps this page's timers running until the next page
+     arrives, but refuses every request started in that window and logs each as
+     "Fetch API cannot load ... due to access control checks." A busy machine
+     stretches the window, so the 1 s polls landed in it now and then. A request
+     made while leaving waits: if the page goes, it never leaves; if it stays (a
+     download link, a cancelled navigation), it goes out once the hold ends or the
+     page is shown again. Every fetch in this script comes through here. */
+  var LEAVING_HOLD_MS = window.SPARKSI_LEAVING_HOLD_MS || 5000;
+  var pageFetch = window.fetch.bind(window);
+  var leavingPage = false;
+  var heldRequests = [];
+  function stopLeaving() {
+    leavingPage = false;
+    var held = heldRequests;
+    heldRequests = [];
+    held.forEach(function (send) { send(); });
+  }
+  window.addEventListener("beforeunload", function () {
+    leavingPage = true;
+    setTimeout(stopLeaving, LEAVING_HOLD_MS);
+  });
+  window.addEventListener("pageshow", stopLeaving);
+  var fetch = function (url, options) {
+    if (!leavingPage) return pageFetch(url, options);
+    return new Promise(function (resolve, reject) {
+      heldRequests.push(function () { pageFetch(url, options).then(resolve, reject); });
+    });
+  };
+
   var HEAD_ID = "head", WORKER_ID = "worker";
   var HEAD_NAME = "", WORKER_NAME = "";
   var ARCHIVE_LABEL = "Archive";
