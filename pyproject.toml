@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "sparksi"
 version = "0.6.0"
 description = "DGX Spark unified-memory side view: inventory, probe, dry-run, lock, apply, UI (Xanthsi suite)"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Peelsa" }]
 requires-python = ">=3.12"
 dependencies = ["pyyaml"]
