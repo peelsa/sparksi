@@ -514,3 +514,152 @@ def test_a_directory_named_as_the_file_is_reported(tmp_path, capsys) -> None:
     (tmp_path / "sparksi.toml").mkdir()
     assert main(["config", "validate", "--file", str(tmp_path / "sparksi.toml")]) == 1
     assert "cannot read" in capsys.readouterr().err
+
+
+# --- second audit: hyphenated and plural secret names, URL parameters, file kinds ---
+
+
+def test_redact_reads_hyphen_as_underscore_and_allows_a_plural() -> None:
+    value = {
+        "x-api-key": "L10",
+        "api-key": "L11",
+        "private-key": "L12",
+        "Client-Secret": "L13",
+        "secrets": "L20",
+        "tokens": ["L21", {"inner": "L22"}],
+        "passwords": "L23",
+        "credentials": {"user": "bob"},
+        "token_count": 7,
+        "token-count": 7,
+        "keys": "keep",
+        "monkey": "keep",
+        "tokenizer": "keep",
+    }
+    out = redact(value)
+    for key in ("x-api-key", "api-key", "private-key", "Client-Secret", "secrets", "passwords"):
+        assert out[key] == "<redacted>", key
+    assert out["tokens"] == ["<redacted>", {"inner": "<redacted>"}]
+    assert out["credentials"] == {"user": "<redacted>"}
+    assert out["token_count"] == out["token-count"] == 7
+    assert out["keys"] == out["monkey"] == out["tokenizer"] == "keep"
+
+
+def test_redact_matrix_case_dates_numbers_lists_and_values_left_alone() -> None:
+    import datetime
+
+    value = {
+        "API_TOKEN": "a",
+        "Secret": {"when": datetime.date(2026, 1, 2), "at": datetime.datetime(2026, 1, 2, 3, 4)},
+        "pin_secret": 0,
+        "pw_password": 1.5,
+        "api_key": [1, "b", [2, None, ""], False],
+        "empty_token": "",
+        "none_secret": None,
+        "flag_password": False,
+        "yes_password": True,
+        "token_count": 7,
+        "created": datetime.date(2026, 1, 2),
+    }
+    out = redact(value)
+    assert out["API_TOKEN"] == "<redacted>"
+    assert out["Secret"] == {"when": "<redacted>", "at": "<redacted>"}
+    assert out["pin_secret"] == out["pw_password"] == "<redacted>"
+    assert out["api_key"] == ["<redacted>", "<redacted>", ["<redacted>", None, ""], False]
+    assert out["empty_token"] == "" and out["none_secret"] is None
+    assert out["flag_password"] is False and out["yes_password"] is True
+    assert out["token_count"] == 7
+    assert out["created"] == datetime.date(2026, 1, 2)
+
+
+def test_show_redacts_hyphenated_and_plural_keys(tmp_path, capsys) -> None:
+    text = _nodes(1) + (
+        '\n[controller]\nx-api-key = "L10"\nprivate-key = "L12"\ntoken_count = 7\n'
+        '\n[extra]\nsecrets = "L20"\ntokens = ["L21", "L22"]\n'
+    )
+    path = _write(tmp_path, text)
+    assert main(["config", "show", "--file", str(path)]) == 0
+    out = capsys.readouterr().out
+    for clear in ("L10", "L12", "L20", "L21", "L22"):
+        assert clear not in out, clear
+    data = json.loads(out)
+    assert data["controller"]["x-api-key"] == data["controller"]["private-key"] == "<redacted>"
+    assert data["extra"] == {"secrets": "<redacted>", "tokens": ["<redacted>", "<redacted>"]}
+    assert data["controller"]["token_count"] == 7
+
+
+def test_redact_hides_secret_url_parameters_and_keeps_the_rest() -> None:
+    out = redact(
+        {
+            "db": "postgres://u:p@db.example:5432/x?token=abc&sslmode=require&X-Api-Key=k1&user=bob#frag",
+            "cb": "https://h.example/cb#access_token=zzz&state=ok",
+            "semi": "https://h.example/p;secret=s1;mode=a",
+            "plain": "http://100.64.0.9:7500/path?page=2&token_count=7",
+            "not-a-url": "a?token=abc",
+            "empty": "https://h.example/?token=&x=1",
+        }
+    )
+    assert out["db"] == "postgres://<redacted>@db.example:5432/x?token=<redacted>&sslmode=require&X-Api-Key=<redacted>&user=bob#frag"
+    assert out["cb"] == "https://h.example/cb#access_token=<redacted>&state=ok"
+    assert out["semi"] == "https://h.example/p;secret=<redacted>;mode=a"
+    assert out["plain"] == "http://100.64.0.9:7500/path?page=2&token_count=7"
+    assert out["not-a-url"] == "a?token=abc"
+    assert out["empty"] == "https://h.example/?token=&x=1"
+
+
+def test_show_hides_a_url_query_token(tmp_path, capsys) -> None:
+    path = _write(tmp_path, _nodes(1) + '\n[extra]\ndb = "postgres://u:p@db/x?token=abc"\n')
+    assert main(["config", "show", "--file", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "abc" not in out and "u:p" not in out
+    assert json.loads(out)["extra"]["db"] == "postgres://<redacted>@db/x?token=<redacted>"
+
+
+def test_a_device_is_refused_by_name(capsys) -> None:
+    for device in ("/dev/zero", "/dev/null"):
+        assert main(["config", "validate", "--file", device]) == 1
+        err = capsys.readouterr().err
+        assert f"error: {device}: not a regular file" in err
+        assert "Traceback" not in err
+
+
+def test_a_file_over_the_size_cap_is_refused_and_one_at_the_cap_is_read(tmp_path, capsys) -> None:
+    path = tmp_path / "big.toml"
+    path.write_text(_nodes(1) + "#" * (config.MAX_CONFIG_BYTES - len(_nodes(1)) + 1))
+    assert path.stat().st_size == config.MAX_CONFIG_BYTES + 1
+    assert main(["config", "validate", "--file", str(path)]) == 1
+    assert f"error: {path}: the file is larger than 1024 KiB" in capsys.readouterr().err
+    path.write_text(_nodes(1) + "#" * (config.MAX_CONFIG_BYTES - len(_nodes(1))))
+    assert path.stat().st_size == config.MAX_CONFIG_BYTES
+    assert main(["config", "validate", "--file", str(path)]) == 0
+
+
+def test_a_symlink_to_a_regular_file_still_loads_and_a_dangling_one_is_named(tmp_path, capsys) -> None:
+    real = _write(tmp_path, _nodes(2))
+    link = tmp_path / "link.toml"
+    link.symlink_to(real)
+    assert main(["config", "validate", "--file", str(link)]) == 0
+    capsys.readouterr()
+    dangling = tmp_path / "dangling.toml"
+    dangling.symlink_to(tmp_path / "nope.toml")
+    assert main(["config", "validate", "--file", str(dangling)]) == 1
+    assert "cannot read" in capsys.readouterr().err
+
+
+def test_import_with_a_device_as_the_config_does_not_crash_or_hang(tmp_path) -> None:
+    code = (
+        "import sparksi.cli\n"
+        "from sparksi.config import CFG_ERRORS\n"
+        "print('imported', CFG_ERRORS)\n"
+        "print('rc', sparksi.cli.main(['status']))\n"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "XDG_RUNTIME_DIR": str(tmp_path),
+        "SPARKSI_CONFIG": "/dev/zero",
+    }
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=60, check=False)
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert "imported ['/dev/zero: not a regular file" in proc.stdout
+    assert "rc 1" in proc.stdout
+    assert "Traceback" not in proc.stderr

@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -593,21 +594,45 @@ class Config:
 # them a string or list would fail later, far from the file, so it is refused at load.
 _TABLES = ("controller", "engines", "archive", "paths", "extra_machines", "compat", "protect", "services")
 
-_SECRET_KEY = re.compile(r"(token|secret|password|passwd|credentials?|api_?key|private_key)$", re.IGNORECASE)
+# A key is secret when, with "-" read as "_" and an optional plural "s", it ends in one of these.
+_SECRET_KEY = re.compile(r"(token|secret|password|passwd|credential|api_?key|private_?key)s?$", re.IGNORECASE)
 _URL_USER = re.compile(r"(?<=://)[^/@\s]+@")
+_URL_PARAM = re.compile(r"(?P<sep>[?&;#])(?P<name>[^=&;#\s]+)=(?P<value>[^&;#\s]+)")
 REDACTED = "<redacted>"
+# A site file larger than this is refused (a real one is a few KiB).
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
+def _is_secret_key(key: str) -> bool:
+    return bool(_SECRET_KEY.search(key.replace("-", "_")))
+
+
+def _redact_text(text: str) -> str:
+    """Drop URL user info, and the value of any secret-named query or fragment parameter."""
+    text = _URL_USER.sub(REDACTED + "@", text)
+    if "://" not in text:
+        return text
+
+    def param(match: re.Match[str]) -> str:
+        if _is_secret_key(match["name"]):
+            return f"{match['sep']}{match['name']}={REDACTED}"
+        return match[0]
+
+    return _URL_PARAM.sub(param, text)
 
 
 def redact(value: Any, key: str = "", secret: bool = False) -> Any:
     """A copy of a settings value with secrets hidden.
 
     Everything not empty and not a boolean is replaced when it sits under a key that
-    ends in token, secret, password, passwd, credential(s), api_key or private_key.
+    ends in token, secret, password, passwd, credential, api_key or private_key, with
+    ``-`` read as ``_`` and an optional plural ``s`` (``x-api-key``, ``tokens``).
     That covers text, numbers, list items, and every value inside a table with such
-    a name (``[credentials]``). User info in a URL is dropped from every string. No
+    a name (``[credentials]``). User info in a URL is dropped from every string, and
+    so is the value of a query or fragment parameter with such a name. No
     key in the shipped settings holds a secret; this covers a site that adds one.
     """
-    secret = secret or bool(_SECRET_KEY.search(key))
+    secret = secret or _is_secret_key(key)
     if isinstance(value, dict):
         return {k: redact(v, str(k), secret) for k, v in value.items()}
     if isinstance(value, list):
@@ -617,7 +642,7 @@ def redact(value: Any, key: str = "", secret: bool = False) -> Any:
     if secret:
         return REDACTED
     if isinstance(value, str):
-        return _URL_USER.sub(REDACTED + "@", value)
+        return _redact_text(value)
     return value
 
 
@@ -629,12 +654,34 @@ def _shape_problems(raw: dict[str, Any]) -> list[str]:
     ]
 
 
+class ConfigFileError(ValueError):
+    """The path is not a usable file; the message says why and carries no file name."""
+
+
+def _read_site_file(path: Path) -> dict[str, Any]:
+    """Parse one regular file of at most ``MAX_CONFIG_BYTES``; refuse anything else.
+
+    A device such as ``/dev/zero`` or a pipe is refused before it is opened. A
+    symlink to a regular file is followed.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        mode = stat.S_IFREG  # let open() report the real problem
+    if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+        raise ConfigFileError("not a regular file (a device, pipe or socket cannot be a config file)")
+    with open(path, "rb") as fh:
+        data = fh.read(MAX_CONFIG_BYTES + 1)
+    if len(data) > MAX_CONFIG_BYTES:
+        raise ConfigFileError(f"the file is larger than {MAX_CONFIG_BYTES // 1024} KiB, the most a config file may be")
+    return tomllib.loads(data.decode("utf-8"))
+
+
 def load(path: Path | None = None) -> Config:
     path = path or config_path()
     if path is None:
         return Config()
-    with open(path, "rb") as fh:
-        raw = tomllib.load(fh)
+    raw = _read_site_file(path)
     bad = _shape_problems(raw)
     if bad:
         raise ValueError("; ".join(bad))
@@ -666,6 +713,8 @@ def check(path: Path | None = None) -> tuple[Config | None, list[str]]:
         return None, [f"{target}: the file is nested too deeply to read"]
     except MemoryError:
         return None, [f"{target}: the file is too large to read"]
+    except ConfigFileError as exc:
+        return None, [f"{target}: {exc}"]
     except RuntimeError as exc:  # Path.expanduser: no such user or no home directory
         explicit = os.environ.get("SPARKSI_CONFIG")
         named = f" from {path}" if path else f" from SPARKSI_CONFIG={explicit!r}" if explicit else ""
