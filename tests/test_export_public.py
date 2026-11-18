@@ -159,6 +159,8 @@ def test_no_public_layer_file_duplicates_a_source_file() -> None:
     """The exporter refuses a public/ file that also exists in the source tree, so keep one copy."""
     root = Path(__file__).resolve().parents[1]
     layer = root / "public"
+    if not layer.is_dir():
+        pytest.skip("no public/ layer in this tree")
     dupes = sorted(
         path.relative_to(layer).as_posix()
         for path in layer.rglob("*")
