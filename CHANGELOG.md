@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Added `sparksi config validate` and `sparksi config show`. `validate` checks `sparksi.toml` and exits 1 with each problem; `show` prints the settings in force as JSON with secrets redacted.
-- An unusable `sparksi.toml` no longer raises a traceback when Sparksi is imported. The problem is logged once, and every command except `sparksi config` (and `sparksi-monitor`) exits 1 with the message instead of running on the built-in example. A top-level table written as a string, for example `controller = "x"`, is now refused at load instead of failing later.
+- An unusable `sparksi.toml` (not TOML, not readable, nested too deeply, a bad node, a table written as a string such as `controller = "x"`, or a config path that cannot be worked out) no longer raises a traceback when Sparksi is imported. The problem is logged once. Every `sparksi` command except `sparksi config ...`, and also `sparksi-monitor`, now prints the message and exits 1 instead of running on the built-in example. A top-level table written as a string is now refused at load instead of failing later.
 
 ## 0.6.0
 

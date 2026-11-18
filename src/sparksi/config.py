@@ -598,21 +598,23 @@ _URL_USER = re.compile(r"(?<=://)[^/@\s]+@")
 REDACTED = "<redacted>"
 
 
-def redact(value: Any, key: str = "") -> Any:
+def redact(value: Any, key: str = "", secret: bool = False) -> Any:
     """A copy of a settings value with secrets hidden.
 
-    A value under a key that ends in token, secret, password, passwd, credential(s),
-    api_key or private_key is replaced when it is not empty. User info in a URL is
-    dropped. No key in the shipped settings holds a secret; this covers a site that
-    adds one.
+    Everything not empty and not a boolean is replaced when it sits under a key that
+    ends in token, secret, password, passwd, credential(s), api_key or private_key.
+    That covers text, numbers, list items, and every value inside a table with such
+    a name (``[credentials]``). User info in a URL is dropped from every string. No
+    key in the shipped settings holds a secret; this covers a site that adds one.
     """
+    secret = secret or bool(_SECRET_KEY.search(key))
     if isinstance(value, dict):
-        return {k: redact(v, str(k)) for k, v in value.items()}
+        return {k: redact(v, str(k), secret) for k, v in value.items()}
     if isinstance(value, list):
-        return [redact(item, key) for item in value]
-    if value in ("", None, False) or isinstance(value, (int, float)):
+        return [redact(item, key, secret) for item in value]
+    if value is None or isinstance(value, bool) or value == "":
         return value
-    if _SECRET_KEY.search(key):
+    if secret:
         return REDACTED
     if isinstance(value, str):
         return _URL_USER.sub(REDACTED + "@", value)
@@ -639,22 +641,46 @@ def load(path: Path | None = None) -> Config:
     return Config(raw, source=path)
 
 
+def _starts_with_bom(path: Path | None) -> bool:
+    try:
+        with open(path, "rb") as fh:  # type: ignore[arg-type]
+            return fh.read(3) == b"\xef\xbb\xbf"
+    except (OSError, TypeError):
+        return False
+
+
 def check(path: Path | None = None) -> tuple[Config | None, list[str]]:
     """Load the site file without raising: ``(config, [])``, or ``(None, messages)``.
 
     Without a path the usual search order applies, and no file is not a problem.
-    Every way a file can be unusable (unreadable, not TOML, not UTF-8, a bad table
-    or node) comes back as a message that names the file.
+    Every way a file can be unusable (unreadable, not TOML, not UTF-8, nested too
+    deeply, a bad table or node) and every way the search can fail (a ``~user`` that
+    does not exist, a deleted working directory) comes back as a message that says
+    what failed.
     """
-    target = path or config_path()
+    target: Path | None = None
     try:
+        target = Path(path).expanduser() if path else config_path()
         return load(target), []
+    except RecursionError:
+        return None, [f"{target}: the file is nested too deeply to read"]
+    except MemoryError:
+        return None, [f"{target}: the file is too large to read"]
+    except RuntimeError as exc:  # Path.expanduser: no such user or no home directory
+        explicit = os.environ.get("SPARKSI_CONFIG")
+        named = f" from {path}" if path else f" from SPARKSI_CONFIG={explicit!r}" if explicit else ""
+        return None, [f"cannot work out the config path{named}: {exc}"]
     except OSError as exc:
+        if target is None:  # config_path() failed
+            why = "the working directory no longer exists" if isinstance(exc, FileNotFoundError) else (exc.strerror or str(exc))
+            return None, [f"cannot look for sparksi.toml: {why}"]
         return None, [f"cannot read {target}: {exc.strerror or exc}"]
     except KeyError as exc:
         return None, [f"{target}: missing key {exc.args[0]!r}"]
     except ValueError as exc:  # includes tomllib.TOMLDecodeError and UnicodeDecodeError
         text = str(exc)
+        if _starts_with_bom(target):
+            return None, [f"{target}: the file starts with a UTF-8 byte order mark (BOM); save it without one ({text})"]
         # Load messages open with the generic file name; say which file it is.
         text = f"{target}{text[len('sparksi.toml'):]}" if text.startswith("sparksi.toml ") else f"{target}: {text}"
         return None, [text]

@@ -17,7 +17,7 @@ from sparksi import protect
 from sparksi import __version__
 from sparksi.catalog import CatalogError, load_catalog
 from sparksi import compat
-from sparksi.config import CFG, CFG_ERRORS, check, config_path
+from sparksi.config import CFG, CFG_ERRORS, check
 from sparksi.lock import Lock, LockedError
 from sparksi.apply import (
     build_plan,
@@ -453,8 +453,8 @@ def cmd_install_unit(args: argparse.Namespace) -> int:
 
 
 def _config_target(args: argparse.Namespace) -> Path | None:
-    """The file ``--file`` names, else the one the usual search order finds."""
-    return Path(args.file).expanduser() if getattr(args, "file", "") else config_path()
+    """The file ``--file`` names; None means the one the usual search order finds."""
+    return Path(args.file) if getattr(args, "file", "") else None
 
 
 def _config_warnings(raw: dict[str, Any]) -> list[str]:
@@ -465,47 +465,59 @@ def _config_warnings(raw: dict[str, Any]) -> list[str]:
         if old in paths and new not in paths:
             out.append(f"[paths] {old} is deprecated; use [paths] {new}")
     section = raw.get("protect") if isinstance(raw.get("protect"), dict) else {}
-    names = section.get("presets") or []
-    for name in [names] if isinstance(names, str) else names:
-        if str(name).strip() not in protect.PRESETS:
-            out.append(f"[protect] presets names an unknown preset {str(name).strip()!r}")
+    names = section.get("presets")
+    if isinstance(names, str):
+        names = [names]
+    if names is None:
+        names = []
+    if not isinstance(names, list):
+        out.append(f"[protect] presets must be a list of names, not {type(names).__name__}")
+        names = []
+    for name in names:
+        if not isinstance(name, str):
+            out.append(f"[protect] presets has an item that is not a name: {name!r}")
+        elif name.strip() not in protect.PRESETS:
+            out.append(f"[protect] presets names an unknown preset {name.strip()!r}")
     return out
 
 
 def cmd_config_validate(args: argparse.Namespace) -> int:
     """Check a site file. Reads it and nothing else: no ssh, no controller, no write."""
-    path = _config_target(args)
-    if path is None:
+    cfg, errors = check(_config_target(args))
+    if cfg is None:
+        for line in errors:
+            print(f"error: {line}", file=sys.stderr)
+        return 1
+    if cfg.source is None:
         print(
             "no sparksi.toml found (looked at $SPARKSI_CONFIG, $XDG_CONFIG_HOME/sparksi/sparksi.toml "
             "and ./config/sparksi.toml); Sparksi would run on the built-in example",
             file=sys.stderr,
         )
         return 1
-    cfg, errors = check(path)
-    if cfg is None:
-        for line in errors:
-            print(f"error: {line}", file=sys.stderr)
-        return 1
     for line in _config_warnings(cfg.file_raw):
         print(f"warning: {line}", file=sys.stderr)
     sparks = ", ".join(f"{node.id} ({role})" for role, node in cfg.role_nodes())
     count = len(cfg.nodes)
-    print(f"ok: {path}: {count} Spark{'s' if count != 1 else ''}: {sparks}")
+    print(f"ok: {cfg.source}: {count} Spark{'s' if count != 1 else ''}: {sparks}")
     return 0
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
     """Print the settings in force as JSON. Secrets are redacted."""
-    path = _config_target(args)
-    cfg, errors = check(path)
+    cfg, errors = check(_config_target(args))
     if cfg is None:
         for line in errors:
             print(f"error: {line}", file=sys.stderr)
         return 1
-    if path is None:
+    try:
+        text = json.dumps(cfg.effective(), indent=2, sort_keys=True, default=str)
+    except RecursionError:
+        print(f"error: {cfg.source}: the settings are nested too deeply to print", file=sys.stderr)
+        return 1
+    if cfg.source is None:
         print("no sparksi.toml found; showing the built-in example", file=sys.stderr)
-    print(json.dumps(cfg.effective(), indent=2, sort_keys=True, default=str))
+    print(text)
     return 0
 
 

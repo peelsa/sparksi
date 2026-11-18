@@ -196,11 +196,60 @@ def test_show_redacts_secrets_and_url_passwords(tmp_path, capsys) -> None:
     assert data["controller"]["monitor_upstream"] == "http://100.64.0.9:7500"
 
 
-def test_redact_keeps_empty_and_non_text_values_and_does_not_edit_its_input() -> None:
-    value = {"token": "", "secret": None, "password": 0, "list": [{"api_key": "x"}, "http://a:b@h/"]}
+def test_redact_keeps_empty_and_boolean_values_and_does_not_edit_its_input() -> None:
+    value = {"token": "", "secret": None, "password_set": False, "list": [{"api_key": "x"}, "http://a:b@h/"]}
     out = redact(value)
-    assert out == {"token": "", "secret": None, "password": 0, "list": [{"api_key": "<redacted>"}, "http://<redacted>@h/"]}
+    assert out == {"token": "", "secret": None, "password_set": False, "list": [{"api_key": "<redacted>"}, "http://<redacted>@h/"]}
     assert value["list"][0]["api_key"] == "x"
+
+
+def test_redact_hides_numbers_and_everything_inside_a_secret_named_table() -> None:
+    value = {
+        "numeric_token": 123456,
+        "float_secret": 1.5,
+        "zero_password": 0,
+        "flag_token": True,
+        "secret": {"value": "s3cret", "port": 22, "deep": {"x": ["a", 7]}},
+        "credentials": {"user": "bob"},
+        "ports": [7500, 7501],
+        "api_key": ["k1", 2],
+        "api_token": "t",
+        "admin_password": "p",
+        "client_secret": "c",
+        "private_key": "pk",
+        "url": "http://user:pw@h:1/",
+    }
+    out = redact(value)
+    assert out["numeric_token"] == out["float_secret"] == out["zero_password"] == "<redacted>"
+    assert out["flag_token"] is True
+    assert out["secret"] == {"value": "<redacted>", "port": "<redacted>", "deep": {"x": ["<redacted>", "<redacted>"]}}
+    assert out["credentials"] == {"user": "<redacted>"}
+    assert out["api_key"] == ["<redacted>", "<redacted>"]
+    for key in ("api_token", "admin_password", "client_secret", "private_key"):
+        assert out[key] == "<redacted>"
+    assert out["ports"] == [7500, 7501]
+    assert out["url"] == "http://<redacted>@h:1/"
+
+
+def test_show_redacts_secret_tables_and_numbers(tmp_path, capsys) -> None:
+    text = _nodes(1) + (
+        '\n[secret]\nvalue = "s3cret"\nnested = { deep = "d" }\n'
+        '\n[credentials]\nuser = "bob"\nport = 22\n'
+        '\n[services.example]\nnumeric_token = 123456\napi_token = "t"\nadmin_password = "p"\n'
+        'client_secret = "c"\napi_key = ["k1", "k2"]\nflag_token = true\n'
+    )
+    path = _write(tmp_path, text)
+    assert main(["config", "show", "--file", str(path)]) == 0
+    out = capsys.readouterr().out
+    for clear in ("s3cret", '"d"', "bob", "123456", '"t"', '"p"', '"c"', "k1", "k2"):
+        assert clear not in out, clear
+    data = json.loads(out)
+    assert data["secret"] == {"nested": {"deep": "<redacted>"}, "value": "<redacted>"}
+    assert data["credentials"] == {"port": "<redacted>", "user": "<redacted>"}
+    example = data["services"]["example"]
+    assert example["numeric_token"] == "<redacted>"
+    assert example["api_key"] == ["<redacted>", "<redacted>"]
+    assert example["flag_token"] is True
 
 
 def test_the_shipped_defaults_hold_no_secret() -> None:
@@ -320,3 +369,148 @@ def test_a_missing_file_named_by_the_environment_does_not_crash_import(tmp_path)
     assert proc.returncode == 1
     assert "cannot read" in proc.stderr
     assert "Traceback" not in proc.stderr
+
+
+# --- nesting, config path failures, [protect] presets, BOM ---------------------------
+
+def _deep_inline_array() -> str:
+    return "a = " + "[" * 100000 + "]" * 100000 + "\n"
+
+
+def _deep_inline_table() -> str:
+    return "a = " + "{a=" * 20000 + "1" + "}" * 20000 + "\n"
+
+
+def _deep_table_header() -> str:
+    return "[" + ".".join(f"k{i}" for i in range(50000)) + "]\nx = 1\n"
+
+
+DEEP = {
+    "inline-array": _deep_inline_array,
+    "inline-table": _deep_inline_table,
+    "table-header": _deep_table_header,
+}
+
+
+@pytest.mark.parametrize("kind", list(DEEP))
+@pytest.mark.parametrize("command", ["validate", "show"])
+def test_deeply_nested_files_are_reported_not_raised(tmp_path, capsys, kind, command) -> None:
+    path = _write(tmp_path, DEEP[kind]())
+    assert main(["config", command, "--file", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert str(path) in captured.err
+    assert captured.err.count("\n") == 1  # one clear line, not a traceback
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("kind", list(DEEP))
+def test_check_catches_recursion_and_any_toml_error(tmp_path, kind) -> None:
+    cfg, errors = check(_write(tmp_path, DEEP[kind]()))
+    assert cfg is None
+    assert len(errors) == 1
+    assert str(tmp_path) in errors[0]
+
+
+@pytest.mark.parametrize("kind", list(DEEP))
+def test_import_survives_a_deeply_nested_file(tmp_path, kind) -> None:
+    path = _write(tmp_path, DEEP[kind]())
+    proc = _run(["-c", "import sparksi.cli, sparksi.monitor.__main__; print('imported')"], path, tmp_path)
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert proc.stdout.strip() == "imported"
+    assert "Traceback" not in proc.stderr
+    for argv in (["config", "validate"], ["status"]):
+        proc = _run(["-m", "sparksi.cli", *argv], path, tmp_path)
+        assert proc.returncode == 1, argv
+        assert str(path) in proc.stderr
+        assert "Traceback" not in proc.stderr
+
+
+def test_a_home_that_cannot_be_resolved_is_reported_by_import_and_commands(tmp_path) -> None:
+    bad = Path("~nosuchuser_zz/x.toml")
+    proc = _run(["-c", "import sparksi.cli; print('imported')"], bad, tmp_path)
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert proc.stdout.strip() == "imported"
+    for argv in (["status"], ["config", "validate"], ["config", "show"]):
+        proc = _run(["-m", "sparksi.cli", *argv], bad, tmp_path)
+        assert proc.returncode == 1, argv
+        assert "SPARKSI_CONFIG='~nosuchuser_zz/x.toml'" in proc.stderr
+        assert "Traceback" not in proc.stderr
+
+
+def test_a_file_option_with_an_unknown_user_is_reported(capsys) -> None:
+    assert main(["config", "validate", "--file", "~nosuchuser_zz/x.toml"]) == 1
+    err = capsys.readouterr().err
+    assert "cannot work out the config path from ~nosuchuser_zz/x.toml" in err
+    assert "Traceback" not in err
+
+
+def test_import_from_a_deleted_working_directory_is_reported(tmp_path) -> None:
+    code = (
+        "import os, sys\n"
+        "d = os.path.join(sys.argv[1], 'gone'); os.mkdir(d); os.chdir(d); os.rmdir(d)\n"
+        "import sparksi.cli\n"
+        "from sparksi.config import CFG_ERRORS\n"
+        "print('imported', CFG_ERRORS)\n"
+        "print('rc', sparksi.cli.main(['config', 'validate']))\n"
+        "print('rc', sparksi.cli.main(['status']))\n"
+    )
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path / "home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "nowhere"),  # no file there, so the search reaches the working directory
+        "XDG_RUNTIME_DIR": str(tmp_path / "run"),
+    }
+    proc = subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, env=env, timeout=60, check=False)
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert "imported ['cannot look for sparksi.toml: the working directory no longer exists']" in proc.stdout
+    assert proc.stdout.count("rc 1") == 2
+    assert "cannot look for sparksi.toml" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("presets", "expected"),
+    [
+        ("5", "[protect] presets must be a list of names, not int"),
+        ("true", "[protect] presets must be a list of names, not bool"),
+        ('{ a = 1 }', "[protect] presets must be a list of names, not dict"),
+        ("[2]", "[protect] presets has an item that is not a name: 2"),
+        ('[["video-service"]]', "[protect] presets has an item that is not a name: ['video-service']"),
+        ('["video-service", 1.5]', "[protect] presets has an item that is not a name: 1.5"),
+        ('"made-up"', "[protect] presets names an unknown preset 'made-up'"),
+    ],
+)
+def test_validate_reports_any_shape_of_presets_without_crashing(tmp_path, capsys, presets, expected) -> None:
+    path = _write(tmp_path, f"{_nodes(2)}\n[protect]\npresets = {presets}\n")
+    assert main(["config", "validate", "--file", str(path)]) == 0
+    captured = capsys.readouterr()
+    assert f"warning: {expected}" in captured.err
+    assert "unknown preset '[" not in captured.err
+    assert "Traceback" not in captured.err
+    assert "ok:" in captured.out
+
+
+def test_validate_accepts_a_known_preset_as_a_list_or_a_string(tmp_path, capsys) -> None:
+    for form in ('["video-service"]', '"video-service"', "[]"):
+        path = _write(tmp_path, f"{_nodes(1)}\n[protect]\npresets = {form}\n")
+        assert main(["config", "validate", "--file", str(path)]) == 0
+        assert capsys.readouterr().err == "", form
+
+
+def test_a_file_with_a_byte_order_mark_says_so(tmp_path, capsys) -> None:
+    path = tmp_path / "sparksi.toml"
+    path.write_bytes(b"\xef\xbb\xbf" + _nodes(1).encode())
+    assert main(["config", "validate", "--file", str(path)]) == 1
+    err = capsys.readouterr().err
+    assert "byte order mark (BOM)" in err
+    assert str(path) in err
+    path.write_bytes(_nodes(1).encode())  # the same text without it is fine
+    assert main(["config", "validate", "--file", str(path)]) == 0
+
+
+def test_a_directory_named_as_the_file_is_reported(tmp_path, capsys) -> None:
+    (tmp_path / "sparksi.toml").mkdir()
+    assert main(["config", "validate", "--file", str(tmp_path / "sparksi.toml")]) == 1
+    assert "cannot read" in capsys.readouterr().err

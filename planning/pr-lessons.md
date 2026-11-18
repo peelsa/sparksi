@@ -35,3 +35,4 @@ one line: what was missed, and the check that would have caught it.
 - Break equal-start ties on run id in the other newest-run pickers too (`library.newest_run`, page `newestRun` and `displayedRuns`), as `serving_state` does.
 - Cache `serving_state._recipe_served` by recipe file mtime instead of reading every saved recipe on each `/api/runs` that needs a container to decide.
 - `tests/test_refresh_after_write.py`: wait on the refresh thread's done event instead of the fixed 4 s `_wait_for` budget, which a scheduler stall can exhaust.
+- With a bad `sparksi.toml` the problem prints twice (the import-time WARNING and the exit message); keep one. Also `python -m sparksi.stage_feed` and `evict` do not go through `cli.main`, so a bad file is not refused there (untested).
