@@ -165,6 +165,8 @@ jobs:
           key: playwright-webkit-${{ env.PLAYWRIGHT_VERSION }}-ubuntu-24.04
       - name: Install WebKit
         # Each command is time-limited and retried with backoff in the script.
+        # Three full sets of retries could add up to about 55 minutes; this
+        # cap wins and fails the job first.
         timeout-minutes: 30
         run: scripts/ci-install-webkit.sh /tmp/webkit-test
       - name: WebKit regressions
