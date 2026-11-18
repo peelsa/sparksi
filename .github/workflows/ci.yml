@@ -11,6 +11,7 @@ permissions:
 jobs:
   identity-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -24,6 +25,7 @@ jobs:
 
   stdlib-guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -34,21 +36,25 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Install ruff (version pinned in pyproject dev extra)
+      - name: Install ruff (hashed CI requirements)
+        run: python -m pip install --require-hashes -r .github/requirements-ci.txt
+      - name: The ruff pin in the CI requirements matches the pyproject dev extra
         run: |
           pin=$(python -c "import tomllib; d = tomllib.load(open('pyproject.toml', 'rb')); print(next(r for r in d['project']['optional-dependencies']['dev'] if r.startswith('ruff')))")
-          echo "Installing $pin"
-          python -m pip install "$pin"
+          echo "pyproject: $pin"
+          grep -qxF "${pin} \\" .github/requirements-ci.txt
       - name: Ruff
         run: ruff check src tests scripts
 
   ui-colors:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -59,6 +65,7 @@ jobs:
 
   design-detect:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -80,6 +87,7 @@ jobs:
 
   gitleaks:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
@@ -94,6 +102,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -108,8 +117,10 @@ jobs:
           node-version: "20"
       - name: System tools used by tests
         run: sudo apt-get update && sudo apt-get install -y rsync
-      - name: Install
-        run: python -m pip install -e '.[dev]'
+      - name: Install (hashed requirements, then the package without dependencies)
+        run: |
+          python -m pip install --require-hashes -r .github/requirements-ci.txt
+          python -m pip install --no-deps --no-build-isolation -e .
       - name: Page logic tests (node required, no skips)
         run: node --version && python -m pytest tests/test_run_live_js.py -rA
       - name: Tests
@@ -117,6 +128,7 @@ jobs:
 
   wheel:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -128,6 +140,11 @@ jobs:
   webkit-scroll:
     # Playwright 1.55 ships WebKit for Ubuntu 24.04, not for 26.04.
     runs-on: ubuntu-24.04
+    # A normal run takes about 6 minutes; a stalled download must not hold the job for hours.
+    timeout-minutes: 30
+    env:
+      PLAYWRIGHT_VERSION: "1.55.0"
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/ms-playwright
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -136,20 +153,21 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "20"
-      - name: Install
-        run: python -m pip install -e '.[dev]'
-      - name: Install WebKit
+      - name: Install (hashed requirements, then the package without dependencies)
         run: |
-          mkdir -p /tmp/webkit-test
-          cd /tmp/webkit-test
-          npm init -y
-          npm install playwright@1.55.0
-          export PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright
-          npx playwright install webkit
-          sudo npx playwright install-deps webkit
+          python -m pip install --require-hashes -r .github/requirements-ci.txt
+          python -m pip install --no-deps --no-build-isolation -e .
+      - name: Cache the Playwright WebKit build
+        uses: actions/cache@v6
+        with:
+          path: /tmp/ms-playwright
+          key: playwright-webkit-${{ env.PLAYWRIGHT_VERSION }}-ubuntu-24.04
+      - name: Install WebKit
+        # Each command is time-limited and retried with backoff in the script.
+        timeout-minutes: 20
+        run: scripts/ci-install-webkit.sh /tmp/webkit-test
       - name: WebKit regressions
         env:
           SPARKSI_PLAYWRIGHT_NODE: /tmp/webkit-test/node_modules
-          PLAYWRIGHT_BROWSERS_PATH: /tmp/ms-playwright
           SPARKSI_WEBKIT_REQUIRED: "1"
         run: python -m pytest tests/test_scroll_refresh.py tests/test_load_default_recipe.py tests/test_serving_state_page.py tests/test_monitor_overlap.py tests/test_recipe_bar.py tests/test_sync_page.py tests/test_ui_posts_json.py tests/test_network_page.py tests/test_network_setup_page.py tests/test_options_page.py tests/test_monitored_hosts_page.py tests/test_unmanaged_page.py tests/test_route_reload.py tests/test_model_confirm.py tests/test_ribbon_layout.py tests/test_archive_gb.py tests/test_network_add_row.py tests/test_temps_section.py tests/test_site_menu.py tests/test_default_badge.py tests/test_ribbon_stale.py tests/test_header_follow_up.py tests/test_recipe_name_prefill.py tests/test_recipe_explorer.py tests/test_pinned_default_rename.py tests/test_n_sparks_page.py tests/test_chart_resize_observer.py tests/test_network_remove_spark.py -q -rA
