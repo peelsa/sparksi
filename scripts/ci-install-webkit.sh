@@ -31,6 +31,10 @@ attempt() {
   fi
   local limit=$1
   shift
+  local shown="$*"
+  if [ "${#prefix[@]}" -gt 0 ]; then
+    shown="${prefix[*]} $shown"
+  fi
   local try=1 wait=15 rc=0
   while true; do
     if "${prefix[@]}" timeout --kill-after=30 "$limit" "$@"; then
@@ -39,10 +43,10 @@ attempt() {
       rc=$?
     fi
     if [ "$try" -ge 3 ]; then
-      echo "::error::gave up after $try tries (exit $rc): $*" >&2
+      echo "::error::gave up after $try tries (exit $rc): $shown" >&2
       return "$rc"
     fi
-    echo "::warning::try $try failed (exit $rc, 124 means it hit the ${limit}s limit); retrying in ${wait}s: $*" >&2
+    echo "::warning::try $try failed (exit $rc, 124 means it hit the ${limit}s limit); retrying in ${wait}s: $shown" >&2
     sleep "$wait"
     try=$((try + 1))
     wait=$((wait * 2))
