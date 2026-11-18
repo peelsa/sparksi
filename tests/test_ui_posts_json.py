@@ -29,17 +29,22 @@ def test_every_write_fetch_in_the_page_sends_json() -> None:
     text = PAGE.read_text(encoding="utf-8")
     assert "XMLHttpRequest" not in text and "sendBeacon" not in text
     assert not re.search(r"<form[^>]*method\s*=\s*[\"']?post", text, re.I)
-    calls = [m.start() for m in re.finditer(r"\bfetch\(", text)]
+    calls = [m.start() for m in re.finditer(r"\b(?:fetch|pageFetch)\(", text)]
     assert calls, "no fetch calls found"
     writes = 0
+    forwards = 0
     for start in calls:
         chunk = text[start:start + 300]
+        if chunk.startswith("pageFetch(url, options);"):
+            forwards += 1  # the leaving-page wrapper: sends the caller's own options on
+            continue
         method = re.search(r"method:\s*\"([A-Z]+)\"", chunk)
         assert method, chunk
         if method.group(1) == "GET":
             continue
         writes += 1
         assert '"Content-Type": "application/json"' in chunk, chunk
+    assert forwards == 1  # one way out to the browser's fetch, and it adds no method of its own
     assert writes == 5  # jpost, jpostRead, jpostTimed, jput, jdel: every POST, PUT and DELETE goes through one of them
 
 
