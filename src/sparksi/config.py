@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -558,6 +559,13 @@ class Config:
             **protect.agent_values(),
         }
 
+    def effective(self) -> dict[str, Any]:
+        """The settings in force: built-in defaults merged with the file, secrets redacted.
+
+        Shown by ``sparksi config show``. A copy; the live settings are not shared.
+        """
+        return redact(copy.deepcopy(self.raw))
+
     def public(self) -> dict[str, Any]:
         """Display values for ``GET /api/config``.
 
@@ -581,16 +589,99 @@ class Config:
         return out
 
 
+# Top-level tables the rest of the code reads with ``.get``. A file that makes one of
+# them a string or list would fail later, far from the file, so it is refused at load.
+_TABLES = ("controller", "engines", "archive", "paths", "extra_machines", "compat", "protect", "services")
+
+_SECRET_KEY = re.compile(r"(token|secret|password|passwd|credentials?|api_?key|private_key)$", re.IGNORECASE)
+_URL_USER = re.compile(r"(?<=://)[^/@\s]+@")
+REDACTED = "<redacted>"
+
+
+def redact(value: Any, key: str = "") -> Any:
+    """A copy of a settings value with secrets hidden.
+
+    A value under a key that ends in token, secret, password, passwd, credential(s),
+    api_key or private_key is replaced when it is not empty. User info in a URL is
+    dropped. No key in the shipped settings holds a secret; this covers a site that
+    adds one.
+    """
+    if isinstance(value, dict):
+        return {k: redact(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(item, key) for item in value]
+    if value in ("", None, False) or isinstance(value, (int, float)):
+        return value
+    if _SECRET_KEY.search(key):
+        return REDACTED
+    if isinstance(value, str):
+        return _URL_USER.sub(REDACTED + "@", value)
+    return value
+
+
+def _shape_problems(raw: dict[str, Any]) -> list[str]:
+    return [
+        f"sparksi.toml [{name}] must be a table"
+        for name in _TABLES
+        if name in raw and not isinstance(raw[name], dict)
+    ]
+
+
 def load(path: Path | None = None) -> Config:
     path = path or config_path()
     if path is None:
         return Config()
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
+    bad = _shape_problems(raw)
+    if bad:
+        raise ValueError("; ".join(bad))
     return Config(raw, source=path)
 
 
-CFG = load()
+def check(path: Path | None = None) -> tuple[Config | None, list[str]]:
+    """Load the site file without raising: ``(config, [])``, or ``(None, messages)``.
+
+    Without a path the usual search order applies, and no file is not a problem.
+    Every way a file can be unusable (unreadable, not TOML, not UTF-8, a bad table
+    or node) comes back as a message that names the file.
+    """
+    target = path or config_path()
+    try:
+        return load(target), []
+    except OSError as exc:
+        return None, [f"cannot read {target}: {exc.strerror or exc}"]
+    except KeyError as exc:
+        return None, [f"{target}: missing key {exc.args[0]!r}"]
+    except ValueError as exc:  # includes tomllib.TOMLDecodeError and UnicodeDecodeError
+        text = str(exc)
+        # Load messages open with the generic file name; say which file it is.
+        text = f"{target}{text[len('sparksi.toml'):]}" if text.startswith("sparksi.toml ") else f"{target}: {text}"
+        return None, [text]
+    except (TypeError, AttributeError) as exc:
+        return None, [f"{target}: a value has the wrong type ({exc})"]
+
+
+def _bootstrap() -> tuple[Config, list[str]]:
+    """Load the site file at import. An invalid file must not raise here.
+
+    The built-in example config is kept so every import succeeds, and one warning
+    lists the problems. The CLI and the monitor read ``CFG_ERRORS`` and refuse to
+    run, so nothing acts on the placeholder nodes.
+    """
+    cfg, errors = check()
+    if cfg is not None:
+        return cfg, []
+    from sparksi.log import logger
+
+    logger().warning("ignoring invalid config: %s", "; ".join(errors))
+    return Config(), errors
+
+
+_boot, _boot_errors = _bootstrap()
+CFG = _boot
+# Problems found when the site file was loaded at import; empty when it is valid.
+CFG_ERRORS: list[str] = list(_boot_errors)
 
 
 def apply_agent(cfg: Config | None = None) -> None:
@@ -614,5 +705,6 @@ def reload(path: Path | None = None) -> Config:
     """
     fresh = load(path)
     CFG.__init__(fresh.raw, source=fresh.source)
+    CFG_ERRORS.clear()
     apply_agent(CFG)
     return CFG

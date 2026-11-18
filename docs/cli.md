@@ -16,6 +16,15 @@ These only read.
 - `sparksi tokens [--json]`: per-model lifetime prompt and generated token counts.
 - `sparksi library [--json]`: archive releases and the copies on each Spark.
 
+## Check the config
+
+These read `sparksi.toml` and nothing else. They never contact a machine and never write.
+
+- `sparksi config validate [--file PATH]`: check the file. It exits 0 and names the Sparks it found, or exits 1 and prints one `error:` line per problem (not TOML, not readable, more than four `[[nodes]]`, a repeated node id, a bad `ssh` value, a top-level table that is not a table). A deprecated `[paths]` key, or a `[protect]` preset name Sparksi does not know, prints a `warning:` line and still exits 0. With no `--file` it checks the file Sparksi would load; if there is none it exits 1.
+- `sparksi config show [--file PATH]`: print the settings in force (the built-in defaults merged with the file) as JSON. A value under a key that ends in `token`, `secret`, `password`, `passwd`, `credential`, `api_key` or `private_key` is printed as `<redacted>`, and the user part of a URL such as `http://user:pass@host` is dropped. No key Sparksi ships holds a secret; this covers keys a site adds. It exits 1 with the problem when the file is unusable.
+
+If `sparksi.toml` is unusable, every other command (`sparksi status`, `sparksi serve`, the `dgx-mem` alias, `sparksi-monitor`) prints the problem and exits 1 rather than run on the built-in example. `sparksi config validate` and `sparksi config show` still run, so the file can be checked and fixed.
+
 ## Lock
 
 - `sparksi lock [--reason TEXT] [--json]`: turn the lock on.

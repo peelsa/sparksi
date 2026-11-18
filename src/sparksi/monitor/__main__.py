@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 
 from sparksi import protect
-from sparksi.config import CFG
+from sparksi.config import CFG, CFG_ERRORS
 
 from .models import decode_rates, discover_loaded, sample_key
 from .peer import STALE_SECS, Peer
@@ -505,7 +505,11 @@ def _print_snapshot() -> None:
             peer.stop()
 
 
-def main() -> None:
+def main() -> int | None:
+    if CFG_ERRORS:
+        # The import kept the built-in example so it could finish. Do not poll it.
+        sys.stderr.write("\n".join(CFG_ERRORS) + "\n")
+        return 1
     if "--snapshot" in sys.argv:
         _print_snapshot()
         return
@@ -562,4 +566,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

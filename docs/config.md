@@ -16,6 +16,12 @@ If no file exists at all, Sparksi falls back to built-in defaults. Those default
 
 The real configuration file is never committed to version control.
 
+## Checking the file
+
+`sparksi config validate` checks the file Sparksi would load, or the one named by `--file`, and `sparksi config show` prints the settings in force. See [cli.md](cli.md#check-the-config).
+
+A file that cannot be used (not valid TOML, not readable, more than four `[[nodes]]`, a repeated node id, a bad `ssh` value, or a top-level table such as `[controller]` written as a string) does not stop Sparksi from being imported. It logs one warning that names the file and the problem, and every command other than `sparksi config ...` exits 1 with that message. Only a missing file is different: that falls back to the built-in defaults, as above.
+
 ## Sparks: one to four
 
 The `[[nodes]]` array lists the Sparks. It takes one to four tables.
