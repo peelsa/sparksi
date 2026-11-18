@@ -176,7 +176,124 @@ def _worker_ok(row: dict[str, Any], probe: dict[str, Any] | None) -> bool:
     return containers is None or want in containers
 
 
-def annotate(rows: list[dict[str, Any]], probes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def _serving(row: dict[str, Any], probes: dict[str, dict[str, Any]], head: str, head_ok: bool) -> bool | None:
+    """Is any side of this row up? True, False, or None when the container lists are unknown.
+
+    The head answering as this row counts. So does the row's own container running on the
+    head (loading or not answering yet) and, for a pair, its worker container on another
+    host: a half-up pair can still be unloaded. None lets a stop through rather than
+    refusing it on a guess.
+    """
+    if head_ok:
+        return True
+    ident = row.get("identity") or {}
+    sides = [(head, ident.get("container"))]
+    if row.get("placement") == "pair":
+        sides += [(host, ident.get("worker_container")) for host in probes if host != head]
+    unknown = False
+    for host, name in sides:
+        if not name:
+            continue
+        listed = (probes.get(host) or {}).get("containers")
+        if listed is None:
+            unknown = True
+        elif name in listed:
+            return True
+    return None if unknown else False
+
+
+def catalog_serving(row: dict[str, Any], probes: dict[str, dict[str, Any]]) -> bool | None:
+    """Is a side up under the row's catalog identity alone (a harness launch)? True, False or None.
+
+    It ignores Sparksi runs; ``annotate`` adds those as ``serving``. None means a container
+    list could not be read.
+    """
+    head = row.get("listen_host") or CFG.head.name
+    head_ok, _holder = identity_check(row, probes.get(head))
+    return _serving(row, probes, head, head_ok)
+
+
+_ENDED = ("stopped", "cancelled")
+_CLOSED = ("failed", "timed_out")
+
+
+def _superseded_by(run: dict[str, Any], host: str, container: str, runs: list[dict[str, Any]]) -> str:
+    """The id of a newer run that reuses this host and container name, or ""."""
+    started = float(run.get("started") or 0)
+    for other in runs:
+        if not isinstance(other, dict) or other.get("id") == run.get("id"):
+            continue
+        if float(other.get("started") or 0) <= started:
+            continue
+        for node in other.get("nodes") or []:
+            if isinstance(node, dict) and node.get("host") == host and node.get("container") == container:
+                return str(other.get("id") or "")
+    return ""
+
+
+def run_sides(run: dict[str, Any], probes: dict[str, dict[str, Any]], runs: list[dict[str, Any]]) -> dict[str, str]:
+    """Each side of a run against the real container lists.
+
+    "stopped" (its stop answered ok), "superseded" (a newer run reuses the name on that
+    host, so this run neither claims nor stops it), "up", "gone", or "unknown" (no name
+    recorded, or the machine's container list could not be read).
+    """
+    stopped_sides = run.get("stopped_sides") or []
+    out: dict[str, str] = {}
+    for node in run.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        role = str(node.get("role") or "")
+        host = str(node.get("host") or "")
+        name = str(node.get("container") or "")
+        if str(node.get("phase") or "") == "stopped" or role in stopped_sides:
+            out[role] = "stopped"
+        elif name and _superseded_by(run, host, name, runs):
+            out[role] = "superseded"
+        else:
+            listed = (probes.get(host) or {}).get("containers")
+            if not name or listed is None:
+                out[role] = "unknown"
+            else:
+                out[role] = "up" if name in listed else "gone"
+    return out
+
+
+def run_liveness(run: dict[str, Any], probes: dict[str, dict[str, Any]], runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Is this run live? A failed or timed_out run is live while any side is up or unknown.
+
+    A stopped or cancelled run is not. A run still starting, loading, ready or stopping is
+    live whatever the lists say: its container may not exist yet.
+    """
+    sides = run_sides(run, probes, runs)
+    phase = str(run.get("phase") or "")
+    if phase in _ENDED:
+        return {"id": run.get("id"), "live": False, "up": False, "sides": sides}
+    up = any(state == "up" for state in sides.values())
+    live = any(state in ("up", "unknown") for state in sides.values()) if phase in _CLOSED else True
+    return {"id": run.get("id"), "live": live, "up": up, "sides": sides}
+
+
+def newest_run(runs: list[dict[str, Any]], row_id: str) -> dict[str, Any] | None:
+    """The newest run of this model (the one its card shows), or None."""
+    found = None
+    for run in runs:
+        if isinstance(run, dict) and run.get("model_id") == row_id:
+            if found is None or float(run.get("started") or 0) >= float(found.get("started") or 0):
+                found = run
+    return found
+
+
+def annotate(
+    rows: list[dict[str, Any]], probes: dict[str, dict[str, Any]], runs: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Presence, ``serving`` and, when ``runs`` is given, ``run_live`` for the newest run of each row.
+
+    ``serving`` is True when the catalog identity answers or when a side of the newest run is
+    up in the container lists: a Sparksi-launched run uses its own container names, which the
+    catalog identity of a harness launch does not know.
+    """
+    runs = list(runs or [])
     out = []
     for row in rows:
         item = dict(row)
@@ -186,6 +303,13 @@ def annotate(rows: list[dict[str, Any]], probes: dict[str, dict[str, Any]]) -> l
         head_ok, head_holder = identity_check(row, probes.get(head))
         if head_holder:
             holders[head] = head_holder
+        # ``live`` also needs local weights, so Unload reads ``serving`` instead.
+        item["serving"] = _serving(row, probes, head, head_ok)
+        run = newest_run(runs, str(row.get("id") or "")) if runs else None
+        if run is not None:
+            item["run_live"] = run_liveness(run, probes, runs)
+            if item["run_live"]["up"]:
+                item["serving"] = True
         for host, probe in probes.items():
             path = local_path(row, host)
             stat = ((probe or {}).get("paths") or {}).get(path or "", {})
@@ -233,7 +357,9 @@ def fleet(catalog: dict[str, Any], runner: Any | None = None) -> dict[str, Any]:
                 probes[host]["paths"] = paths
         else:
             probes[host] = runner.invoke(host, _probe_request(catalog, host, rows), timeout=30)
-    rows = annotate(rows, probes)
+    from sparksi.recipes.runs import list_runs  # late: library stays importable without the run store
+
+    rows = annotate(rows, probes, list_runs())
     cards = []
     for host in hosts:
         probe = probes.get(host) or {}

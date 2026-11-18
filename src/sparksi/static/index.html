@@ -298,6 +298,7 @@
   }
   button:hover:not(:disabled) { background: var(--surface-hover); }
   button:disabled { color: var(--muted); border-color: var(--border); cursor: not-allowed; }
+  .recipe-save-why { color: var(--muted); font-size: 14px; align-self: center; }
   button[hidden] { display: none; }
   button.primary {
     background: var(--accent);
@@ -1161,6 +1162,7 @@
         <div class="recipe-head" role="toolbar" aria-label="Recipe">
           <button type="button" id="recipe-cmd-new">New</button>
           <button type="button" id="recipe-cmd-save">Save</button>
+          <span class="recipe-save-why" id="recipe-save-why" aria-live="polite" hidden>Pinned recipe: use Save As</span>
           <button type="button" id="recipe-cmd-save-as">Save as…</button>
           <span class="recipe-current"><span class="recipe-current-label">Open:</span> <span id="recipe-current-name">No recipe</span><span class="recipe-dirty" id="recipe-dirty" hidden> • unsaved changes</span></span>
           <button type="button" id="model-dry">Dry run</button>
@@ -2020,7 +2022,7 @@
     }
     return null;
   }
-  function stopLoaded(id, label, both, asked) {
+  function stopLoaded(id, label, both, asked, noteId) {
     if (lockOn()) {
       setText("lock-msg", "Unlock first, then Stop.");
       return;
@@ -2029,7 +2031,7 @@
       var ask = both ? ("Stop " + label + " on both Sparks?") : ("Stop " + label + "?");
       if (!window.confirm(ask)) return;
     }
-    libPost("/api/library/stop", { id: id });
+    libPost("/api/library/stop", { id: id }, noteId);
   }
 
   function portLiveRows(hostShort) {
@@ -2906,6 +2908,7 @@
       if (!r.ok || !r.body || !Array.isArray(r.body.library)) throw new Error("fleet");
       libraryRows = r.body.library;
       fleetState = "ok";
+      paintModelActions();
       fleetDisk = {};
       fleetStorage = r.body.storage || [];
       fleetMachines = r.body.machines || [];
@@ -5598,6 +5601,7 @@
   var fleetResizeBound = false;
   var fleetAriaAt = 0;
   var fleetPaintLock = false;
+  var fleetResizeFrame = 0;
 
   /* chart-math-start */
   var CHART_BUCKETS = [1, 2, 3, 5, 10, 15, 30];
@@ -6265,7 +6269,17 @@
     /* One observer and one resize listener, even when the chart is rebuilt for another Spark count. */
     if (typeof ResizeObserver === "function") {
       if (fleetObserver) fleetObserver.disconnect();
-      fleetObserver = new ResizeObserver(function () { paintFleetChart(); });
+      /* Repainting here writes the legend readouts, and the legend sets the width and height of this
+         box. Doing that inside the callback makes the box change again in the same frame, which the
+         browser reports as "ResizeObserver loop completed with undelivered notifications". Repaint
+         once on the next frame instead. */
+      fleetObserver = new ResizeObserver(function () {
+        if (fleetResizeFrame) return;
+        fleetResizeFrame = window.requestAnimationFrame(function () {
+          fleetResizeFrame = 0;
+          paintFleetChart();
+        });
+      });
       fleetObserver.observe(box);
     }
     if (!fleetResizeBound) {
@@ -7347,6 +7361,67 @@
   function runFor(id) {
     return newestRun(modelRuns, id);
   }
+  /* Unload and Restart act on a live container only. A run counts while any side may be up;
+     otherwise the library row must say a side of the model is up. */
+  /* run-live-start */
+  /* stopped and cancelled are ended. failed and timed_out can leave a side up (another
+     port, health refused, a refused second side, a stop error), so they count until every
+     node is known stopped: node.phase "stopped" or its role in stopped_sides. */
+  function runHasLiveSide(run) {
+    if (!run) return false;
+    var phase = run.phase;
+    if (phase === "stopped" || phase === "cancelled") return false;
+    if (phase !== "failed" && phase !== "timed_out") return true;
+    var nodes = run.nodes || [];
+    var stopped = run.stopped_sides || [];
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i] || {};
+      if (node.phase !== "stopped" && stopped.indexOf(node.role) === -1) return true;
+    }
+    return false;
+  }
+  /* The record alone can be stale: a failed run from long ago may never have marked a side
+     whose container is gone. The library row reconciles the newest run of each model against
+     the real container lists (run_live); when it covers this run and says nothing is left,
+     the run is not live. Without that answer (no row yet, another run, unknown) trust the record. */
+  function runIsLive(run) {
+    if (!runHasLiveSide(run)) return false;
+    var rows = (typeof libraryRows !== "undefined" && libraryRows) || [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row || row.id !== run.model_id || !row.run_live || row.run_live.id !== run.id) continue;
+      if (row.run_live.live === false) return false;
+    }
+    return true;
+  }
+  /* run-live-end */
+  function modelServing(card) {
+    if (!card) return false;
+    var run = runFor(card.id);
+    if (runIsLive(run)) return true;
+    var rows = libraryRows || [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row || row.id !== card.id) continue;
+      if (row.serving === true) return true;
+      /* null: the server could not list containers, so it may be up; keep Unload enabled. */
+      if (row.serving === null) return true;
+      /* undefined: an older server with no serving key. Use live. */
+      if (typeof row.serving === "undefined") return row.live === true;
+    }
+    return false;
+  }
+  function paintModelActions() {
+    var card = selectedCard();
+    var off = !!card && !modelServing(card);
+    ["model-unload", "model-restart"].forEach(function (id) {
+      var btn = el(id);
+      if (!btn) return;
+      btn.disabled = off;
+      btn.setAttribute("aria-disabled", off ? "true" : "false");
+      btn.title = off ? "Not running" : "";
+    });
+  }
   /* overview-status-start */
   function servingPlace(run) {
     var place = run && run.placement === "pair" ? "both" : ((run && run.placement) || "head");
@@ -7690,6 +7765,7 @@
       });
       box.appendChild(btn);
     });
+    paintModelActions();
   }
   function paintFiles(card) {
     var box = el("model-files");
@@ -7835,6 +7911,16 @@
     setText("recipe-current-name", name);
     var dirty = el("recipe-dirty");
     if (dirty) dirty.hidden = !(recipeEdited || recipeNew);
+    /* Save is greyed out on an original pinned recipe and says why; Save as stays open. */
+    var locked = openPinned();
+    var save = el("recipe-cmd-save");
+    if (save) {
+      save.disabled = locked;
+      save.setAttribute("aria-disabled", locked ? "true" : "false");
+      save.title = locked ? "Pinned recipe: use Save As" : "";
+    }
+    var why = el("recipe-save-why");
+    if (why) why.hidden = !locked;
     paintRecipeFiles();
   }
   function fileTime(iso) {
@@ -7859,14 +7945,19 @@
     for (var i = 0; i < recipeList.length; i++) if (recipeList[i].name === name) return recipeList[i];
     return null;
   }
-  /* A pinned recipe runs a fixed launch command. Save never rewrites it; changes go to Save as. */
+  /* An original pinned launch command: Save never rewrites it; changes go to Save as.
+     A Save as copy is the user's own recipe (locked false) and saves in place.
+     An older server sends no locked key: every pinned recipe is locked then. */
   function pinnedRecipe(name) {
     var item = recipeItem(name);
-    return !!item && item.kind === "pinned";
+    if (!item) return false;
+    if (typeof item.locked === "boolean") return item.locked;
+    return item.kind === "pinned";
   }
   /* The model's last pinned launch command is kept: it cannot be deleted. */
   function onlyPinned(name) {
-    if (!pinnedRecipe(name)) return false;
+    var item = recipeItem(name);
+    if (!item || item.kind !== "pinned") return false;
     return !recipeList.some(function (x) { return x.name !== name && x.kind === "pinned"; });
   }
   function recipeCell(row, className, text) {
@@ -8193,7 +8284,7 @@
     return name + " runs a pinned launch command, so it is not replaced. Pick another name.";
   }
   function keepPinnedNote(name) {
-    return name + " runs a pinned launch command, so it is kept as it is. Type a name to save your changes as a new recipe.";
+    return "Pinned recipe: use Save As. " + name + " runs a pinned launch command, so Save keeps it as it is.";
   }
   function pickFirst() {
     setText("recipe-note", "Pick a model first.");
@@ -8271,8 +8362,7 @@
       return;
     }
     if (openPinned()) {
-      /* A pinned launch command stays as it was; changes go to a new named recipe. */
-      openNameRow("save-as");
+      /* Save is greyed out here; a shortcut still never turns into Save as. */
       setText("recipe-note", keepPinnedNote(recipePick));
       return;
     }
@@ -8282,9 +8372,9 @@
     jput("/api/models/" + encodeURIComponent(card.id) + "/recipes/" + encodeURIComponent(name), body).then(function (r) {
       if (r.ok) recipeSaved(card, name, "Saved " + name + " at " + recipeClock() + "." + notLoadable(r));
       else if (r.status === 409 && r.body && r.body.save_as) {
-        /* The server keeps pinned launch commands too; ask for a name. */
-        openNameRow("save-as");
+        /* The server keeps pinned launch commands too. Say so; Save as is the user's choice. */
         setText("recipe-note", keepPinnedNote(name));
+        refreshRecipes(card, true);
       }
       else setText("recipe-note", recipeError(r, "Not saved."));
     }).catch(function () { recipeOffline("Not saved."); });
@@ -9544,8 +9634,9 @@
   }
   function unloadModel() {
     var card = selectedCard();
+    if (card && !modelServing(card)) { setText("model-load-note", "Not running. Nothing to unload."); return; }
     var run = card && runFor(card.id);
-    if (run && (run.phase === "stopped" || run.phase === "cancelled")) run = null;
+    if (!runIsLive(run)) run = null;
     if (lockOn()) { setText("model-load-note", "Unlock first."); return; }
     if (run && (globalThis.sparksiOffLimits || []).indexOf(Number(run.port)) >= 0) { setText("model-load-note", "Port " + Number(run.port) + " is off limits."); return; }
     if (!card) return;
@@ -9563,7 +9654,7 @@
     }
     var both = placementValue() === "both" || placementValue().indexOf("+") !== -1;
     confirmModelAction({ verb: "Unload", stop: true, model: label, machines: placementMachines(), port: el("model-port") ? el("model-port").value : "",
-      note: "Started outside a Sparksi run." }, function () { stopLoaded(card.id, label, both, true); });
+      note: "Started outside a Sparksi run." }, function () { stopLoaded(card.id, label, both, true, "model-load-note"); });
   }
   function waitUntilStopped(runId, tries, done) {
     if (tries <= 0) {
@@ -9583,8 +9674,9 @@
   }
   function restartModel() {
     var card = selectedCard();
+    if (card && !modelServing(card)) { setText("model-load-note", "Not running. Use Load."); return; }
     var run = card && runFor(card.id);
-    if (run && (run.phase === "stopped" || run.phase === "cancelled" || run.phase === "failed" || run.phase === "timed_out")) run = null;
+    if (!runIsLive(run)) run = null;
     if (!run) { loadModel(); return; }
     if ((globalThis.sparksiOffLimits || []).indexOf(Number(run.port)) >= 0) { setText("model-load-note", "Port " + Number(run.port) + " is off limits."); return; }
     if (lockOn()) { setText("model-load-note", "Unlock first."); return; }

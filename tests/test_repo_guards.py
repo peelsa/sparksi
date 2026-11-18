@@ -50,3 +50,14 @@ def test_catalog_falls_back_to_packaged_example() -> None:
 
     assert catalog.PACKAGED_EXAMPLE_CATALOG.is_file()
     assert catalog.load_catalog(catalog.PACKAGED_EXAMPLE_CATALOG)["host"]
+
+
+def test_identity_guard_checks_the_shared_lessons_file_but_not_other_planning_notes(tmp_path) -> None:
+    (tmp_path / "planning").mkdir()
+    (tmp_path / "planning" / "notes.md").write_text("see /" + "home/someone/x\n")
+    script = [sys.executable, str(ROOT / "scripts" / "check_identifiers.py"), str(tmp_path)]
+    assert subprocess.run(script, capture_output=True, text=True, check=False).returncode == 0
+    (tmp_path / "planning" / "pr-lessons.md").write_text("see /" + "home/someone/x\n")
+    proc = subprocess.run(script, capture_output=True, text=True, check=False)
+    assert proc.returncode != 0
+    assert "planning/pr-lessons.md" in proc.stdout

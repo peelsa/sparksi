@@ -118,14 +118,16 @@ five-file or public-API limits, or a change of plan.
 ### 9. Open it ready
 
 Finish steps 1-8 and run the local acceptance commands first. Then push
-the branch and open the PR as ready for review with the PR template
-filled in: contract, root cause, sweep results, edge cases and tests,
-and raw check output. One topic per PR.
+the branch. Where the `push` filter in `.github/workflows/ci.yml` lists
+branch patterns, name the branch to match one, so CI runs before the PR
+exists, and wait for it to go green. Where the filter lists only `main`,
+CI runs on the pull request (and again on main after merge): open it
+and wait for those checks. If a check fails, fix the cause; a rerun is
+not a pass.
 
-CI on this repo runs on pull requests to the branches listed in
-`.github/workflows/ci.yml` (feature-branch pushes are not in the `push`
-filter). Wait for those checks to go green after the PR opens. If a
-check fails, fix the cause; a rerun is not a pass. Do not merge.
+Open the PR as ready for review with the PR template filled in:
+contract, root cause, sweep results, edge cases and tests, and raw
+check output. One topic per PR. Do not merge.
 
 ### After the PR is open
 

@@ -108,8 +108,9 @@ const { webkit } = require("playwright");
   await page.click("#recipe-files tr[data-name='default'] .recipe-row-more");
   out.disabled = await page.evaluate((list) => list.filter((id) => document.getElementById(id).disabled), ids);
   await page.keyboard.press("Escape");
-  /* Save on a pinned recipe asks for a name, prefilled from the launch command. */
-  await page.click("#recipe-cmd-save");
+  /* Save is greyed out on a pinned recipe; Save as asks for a name, prefilled from the launch command. */
+  out.saveLocked = await page.evaluate(() => ({ disabled: document.getElementById("recipe-cmd-save").disabled, why: document.getElementById("recipe-save-why").hidden ? "" : document.getElementById("recipe-save-why").textContent }));
+  await page.click("#recipe-cmd-save-as");
   await page.waitForFunction(() => !document.getElementById("recipe-name-row").hidden);
   out.saveAsk = await page.evaluate(() => ({ note: document.getElementById("recipe-note").textContent, value: document.getElementById("recipe-name").value }));
   await page.click("#recipe-name-cancel");
@@ -194,7 +195,7 @@ def test_pinned_default_rename_and_save(pinned_server) -> None:
     # Concurrency, Context / KV, Nodes and Spec come from the start.sh environment.
     assert got["cells"][2:6] == ["4", "850k \u00b7 fp8", "2 (pair)", "dflash"], got["cells"]
     assert got["disabled"] == ["recipe-cmd-open", "recipe-cmd-default", "recipe-cmd-delete"], got
-    assert got["saveAsk"]["note"].startswith("default runs a pinned launch command"), got
+    assert got["saveLocked"] == {"disabled": True, "why": "Pinned recipe: use Save As"}, got
     assert got["saveAsk"]["value"] == NEW_NAME, got
     assert got["afterRename"] == [NEW_NAME, "plain"], got
     assert got["current"] == NEW_NAME and got["checked"] == [NEW_NAME], got

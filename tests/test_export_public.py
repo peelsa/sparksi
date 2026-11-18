@@ -3,6 +3,7 @@
 """Tests for scripts/export_public.py."""
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -152,3 +153,26 @@ def test_public_layer_moves_and_collides(tmp_path):
     _write(tmp_path / "public" / "README", "other\n")
     with pytest.raises(module.ExportError):
         module.public_layer(tmp_path)
+
+
+def test_no_public_layer_file_duplicates_a_source_file() -> None:
+    """The exporter refuses a public/ file that also exists in the source tree, so keep one copy."""
+    root = Path(__file__).resolve().parents[1]
+    layer = root / "public"
+    if not layer.is_dir():
+        pytest.skip("no public/ layer in this tree")
+    dupes = sorted(
+        path.relative_to(layer).as_posix()
+        for path in layer.rglob("*")
+        if path.is_file() and (root / path.relative_to(layer)).exists()
+    )
+    assert dupes == []
+
+
+def test_the_only_tracked_planning_file_is_the_shared_lessons_file() -> None:
+    """The export keeps planning/ because git archive only sees tracked files; keep it to the lessons file."""
+    root = Path(__file__).resolve().parents[1]
+    if not (root / ".git").exists():
+        pytest.skip("not a git checkout")
+    out = subprocess.run(["git", "-C", str(root), "ls-files", "planning"], capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["planning/pr-lessons.md"]

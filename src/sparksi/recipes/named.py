@@ -24,7 +24,8 @@ from sparksi.recipes.store import (
 )
 from sparksi.recipes.validate import normalize_speculative
 
-_FORM_ONLY = ("name", "overwrite", "recipe_name", "recipe_new", "new_name")
+# copied_from is set by the server only: a client cannot unlock a pinned command by sending it.
+_FORM_ONLY = ("name", "overwrite", "recipe_name", "recipe_new", "new_name", "copied_from")
 NAME_RULE = "Recipe names use letters, digits, ., - and _ (up to 80), starting with a letter or digit."
 BLANK = "_blank"
 
@@ -47,12 +48,16 @@ def _summary(model_id: str, name: str, default: str) -> dict[str, Any]:
     except OSError:
         modified = ""
     kind = str(recipe.get("kind") or "generated")
+    copied_from = str(recipe.get("copied_from") or "")
     # A pinned recipe keeps its settings in the launch command; read them from there.
     found = pinned_settings(recipe) if kind == "pinned" else {}
     return {
         "name": name,
         "default": name == default,
         "kind": kind,
+        # Save is refused only on an original pinned command; a Save as copy saves in place.
+        "locked": kind == "pinned" and not copied_from,
+        "copied_from": copied_from,
         "engine": str(recipe.get("engine") or ""),
         "placement": str(recipe.get("placement") or ""),
         "modified": modified,
@@ -88,6 +93,16 @@ def _kind(model_id: str, name: str) -> str:
         return str(load_recipe(model_id).get("kind") or "")
 
 
+def _locked(model_id: str, name: str) -> bool:
+    """An original pinned launch command: Save keeps it as it is.
+
+    A Save as copy of one carries ``copied_from``; it is an ordinary recipe that Save updates in place.
+    """
+    with using_recipe(model_id, name):
+        recipe = load_recipe(model_id)
+    return str(recipe.get("kind") or "") == "pinned" and not recipe.get("copied_from")
+
+
 def _keep_pinned(name: str) -> dict[str, Any]:
     """Save never rewrites a pinned launch command; the page answers with Save as."""
     return {
@@ -102,7 +117,7 @@ def pinned_default_refusal(model_id: str) -> tuple[int, dict[str, Any]] | None:
     if not valid_id(model_id) or not recipe_names(model_id):
         return None
     name = default_recipe_name(model_id)
-    if _kind(model_id, name) != "pinned":
+    if not _locked(model_id, name):
         return None
     return 409, _keep_pinned(name)
 
@@ -137,7 +152,7 @@ def save_named(model_id: str, name: str, body: dict[str, Any], runner: Any = Non
         return bad
     if name not in recipe_names(model_id):
         return 404, {"error": f"no recipe named {name}; use Save as"}
-    if _kind(model_id, name) == "pinned":
+    if _locked(model_id, name):
         return 409, _keep_pinned(name)
     with using_recipe(model_id, name):
         code, out = write_recipe(model_id, _form(body), runner)
@@ -156,7 +171,7 @@ def save_as(model_id: str, body: dict[str, Any], runner: Any = None) -> tuple[in
     overwrite = body.get("overwrite") is True
     if exists and not overwrite:
         return 409, {"error": f"a recipe named {name} already exists", "exists": True}
-    if exists and _kind(model_id, name) == "pinned":
+    if exists and _locked(model_id, name):
         return 409, _keep_pinned(name)
     if not exists and name == DEFAULT_NAME and names:
         return 400, {"error": "default is reserved for the original recipe"}
@@ -175,8 +190,13 @@ def save_as(model_id: str, body: dict[str, Any], runner: Any = None) -> tuple[in
         tmp = target.parent / (target.name + ".tmp")
         tmp.write_bytes(source_path.read_bytes())
         os.replace(tmp, target)
+    form = _form(body)
+    copied_from = ""
+    if source and source != name and (_kind(model_id, source) == "pinned" or form.get("kind") == "pinned"):
+        # The copy of a pinned command is the user's own recipe: Save updates it in place.
+        copied_from = source
     with using_recipe(model_id, name):
-        code, out = write_recipe(model_id, _form(body), runner)
+        code, out = write_recipe(model_id, form, runner, copied_from=copied_from)
     if code != 200:
         if previous is None:
             target.unlink(missing_ok=True)
@@ -236,7 +256,7 @@ def rename_named(model_id: str, name: str, body: dict[str, Any]) -> tuple[int, d
             return 409, {"error": f"a recipe named {new} already exists", "exists": True}
         if new == current:
             return 409, {"error": "the default recipe cannot be replaced by a rename"}
-        if _kind(model_id, new) == "pinned":
+        if _locked(model_id, new):
             return 409, _keep_pinned(new)
         (named_dir(model_id) / f"{new}.toml").unlink(missing_ok=True)
     if name == current:

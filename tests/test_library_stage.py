@@ -913,3 +913,99 @@ def test_fleet_reports_machine_ips():
     assert "controller" in by
     card = [h for h in data["hosts"] if h["id"] == "spark-a"][0]
     assert card["ips"]["tailscale"] == "100.64.0.11"
+
+
+def test_unload_of_a_model_that_is_not_running_runs_no_stop(monkeypatch):
+    """Unload on a card with nothing running is a 409 no-op: the stop command never runs."""
+    from sparksi import jobs
+
+    calls = []
+    row = {"id": "m", "title": "M", "serving": False, "launch": {"host": "spark-a", "stop": ["stop-m"]}}
+    monkeypatch.setattr("sparksi.jobs.fleet", lambda *a, **k: {"library": [row], "probes": {}})
+    monkeypatch.setattr("sparksi.jobs.load_in_progress", lambda: False)
+
+    class Runner:
+        def run_argv(self, *a, **k):
+            calls.append(a)
+            return {"ok": True}
+
+    out = jobs.start_stop({}, "m", lock_on=False, runner=Runner())
+    assert out["verdict"] == "REFUSE"
+    assert out["not_running"] is True and out["stopped"] is False
+    assert "not running" in out["reasons"][0]
+    assert calls == []
+
+
+def test_serving_needs_the_rows_own_container():
+    """Another harness serving the same id on the same port does not make this row running."""
+    from sparksi.library import annotate
+
+    row = {"id": "m", "placement": "single", "port": 8014, "listen_host": "spark-a",
+           "identity": {"served": ["M"], "container": "m-head"}}
+    probe = {"listening": {"8014": True}, "http": {"8014": {"status": 200, "models": ["M"]}},
+             "containers": ["m-head"], "paths": {}}
+    assert annotate([row], {"spark-a": probe})[0]["serving"] is True
+    other = dict(probe, containers=["other-head"])
+    assert annotate([row], {"spark-a": other})[0]["serving"] is False
+
+
+def _pair_row():
+    return {"id": "p", "placement": "pair", "port": 8014, "listen_host": "spark-a",
+            "identity": {"served": ["P"], "container": "p-head", "worker_container": "p-worker"}}
+
+
+def _down(containers):
+    return {"listening": {"8014": False}, "http": {}, "paths": {}, "containers": containers}
+
+
+def test_a_half_up_pair_counts_as_running_so_its_stop_is_allowed(monkeypatch):
+    """Head down, worker still up: Unload must still be able to stop the worker."""
+    from sparksi import jobs
+    from sparksi.library import annotate
+
+    row = _pair_row()
+    half = annotate([row], {"spark-a": _down([]), "spark-b": _down(["p-worker"])})[0]
+    assert half["serving"] is True
+    loading = annotate([row], {"spark-a": _down(["p-head"]), "spark-b": _down([])})[0]
+    assert loading["serving"] is True
+    gone = annotate([row], {"spark-a": _down([]), "spark-b": _down([])})[0]
+    assert gone["serving"] is False
+    # The worker's name on the head host is not the worker.
+    wrong_host = annotate([row], {"spark-a": _down(["p-worker"]), "spark-b": _down([])})[0]
+    assert wrong_host["serving"] is False
+
+    launch = dict(half, title="P", launch={"host": "spark-a", "stop": ["stop-p"]})
+    monkeypatch.setattr("sparksi.jobs.fleet", lambda *a, **k: {"library": [launch], "probes": {}})
+    monkeypatch.setattr("sparksi.jobs.load_in_progress", lambda: False)
+    started = []
+    monkeypatch.setattr("sparksi.jobs._start_argv",
+                        lambda catalog, kind, plan, runner: started.append((kind, plan)) or {"started": True})
+    out = jobs.start_stop({}, "p", lock_on=False, runner=None)
+    assert not out.get("not_running"), out
+    assert [kind for kind, _plan in started] == ["stop"]
+
+
+def test_an_unlisted_container_is_not_running_and_unknown_lists_do_not_block_a_stop(monkeypatch):
+    """A container missing from the running list is down; no list at all is unknown (None)."""
+    from sparksi import jobs
+    from sparksi.library import annotate
+
+    row = {"id": "m", "placement": "single", "port": 8014, "listen_host": "spark-a",
+           "identity": {"served": ["M"], "container": "m-head"}}
+    answering = {"listening": {"8014": True}, "http": {"8014": {"status": 200, "models": ["M"]}}, "paths": {}}
+    assert annotate([row], {"spark-a": dict(answering, containers=["m-other"])})[0]["serving"] is False
+    assert annotate([row], {"spark-a": _down(["m-other"])})[0]["serving"] is False
+    # Docker unreadable: the served-name match still counts, and a silent port is unknown.
+    assert annotate([row], {"spark-a": dict(answering, containers=None)})[0]["serving"] is True
+    unknown = annotate([row], {"spark-a": _down(None)})[0]
+    assert unknown["serving"] is None
+
+    launch = dict(unknown, title="M", launch={"host": "spark-a", "stop": ["stop-m"]})
+    monkeypatch.setattr("sparksi.jobs.fleet", lambda *a, **k: {"library": [launch], "probes": {}})
+    monkeypatch.setattr("sparksi.jobs.load_in_progress", lambda: False)
+    started = []
+    monkeypatch.setattr("sparksi.jobs._start_argv",
+                        lambda catalog, kind, plan, runner: started.append((kind, plan)) or {"started": True})
+    out = jobs.start_stop({}, "m", lock_on=False, runner=None)
+    assert not out.get("not_running"), out
+    assert [kind for kind, _plan in started] == ["stop"]

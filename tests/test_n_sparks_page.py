@@ -25,7 +25,7 @@ class _Quiet:
         return {"ok": True, "paths": {}, "listening": {}, "http": {}, "containers": []}
 
 
-@pytest.fixture(params=[1, 3, 4])
+@pytest.fixture(params=[1, 2, 3, 4])
 def site(request, monkeypatch):
     """A site with ``n`` Sparks named spark-a, spark-b, ... in node order."""
     monkeypatch.setenv("SPARKSI_CATALOG", str(ROOT / "config" / "catalog.example.yaml"))
