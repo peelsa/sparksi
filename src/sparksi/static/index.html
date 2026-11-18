@@ -1357,8 +1357,8 @@
     copy.keepalive = true;
     keepaliveBytes += bytes;
     /* The browser counts the bytes until the whole response has loaded, not only
-       until fetch() resolves, so give them back once a copy of the body is read
-       (or at once if the request fails). */
+       until the request's promise resolves, so give them back once a copy of the
+       body is read (or at once if the request fails). */
     var settle = function () { keepaliveBytes -= bytes; };
     var sent = pageFetch(url, copy);
     sent.then(function (response) { return response.clone().arrayBuffer().then(settle, settle); }, settle);
