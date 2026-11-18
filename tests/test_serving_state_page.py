@@ -134,7 +134,7 @@ SHARED_LIBRARY = [
 
 @pytest.fixture()
 def shared_page(monkeypatch, tmp_path):
-    from tests.test_serving_state import _alpha_failed, _beta_run, _shared_pair
+    from tests.test_serving_state import BETA_SERVES, _alpha_failed, _beta_run, _shared_pair
 
     monkeypatch.setenv("SPARKSI_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("SPARKSI_LOCK", str(tmp_path / "lock"))
@@ -147,7 +147,7 @@ def shared_page(monkeypatch, tmp_path):
     live = _shared_pair()
     hosts = [{"id": CFG.head.id, "fresh": True, "age": 0.2}, {"id": CFG.worker.id, "fresh": True, "age": 0.2}]
     runs = [_alpha_failed(), _beta_run()]
-    rows = reconcile([live], runs, hosts=hosts, head_id=CFG.head.id, worker_id=CFG.worker.id)
+    rows = reconcile([live], runs, hosts=hosts, head_id=CFG.head.id, worker_id=CFG.worker.id, served_names=BETA_SERVES)
     STATE.runs_fn = lambda: {"runs": runs, "serving": rows}
     STATE.monitor_fn = lambda: {"hosts": hosts, "loaded": [live]}
     httpd = DualServer(("127.0.0.1", 0), Handler)

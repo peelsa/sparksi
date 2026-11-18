@@ -326,6 +326,8 @@ def test_page_renders_split_rows_instead_of_an_empty_state() -> None:
 # A Sparksi run names its own containers. Two catalog rows (or a recipe copy) can serve
 # one id, so the served name alone cannot say which run owns the live process.
 SHARED = "shared-served"
+# What served_names_for returns when beta's catalog row (or one of its recipes) declares SHARED.
+BETA_SERVES = {"beta": ({SHARED}, [])}
 
 
 def _shared_pair(head: str = "run-beta-head", worker: str = "run-beta-worker") -> dict:
@@ -379,8 +381,9 @@ def _alpha_failed() -> dict:
     }
 
 
-def _pair_rows(loaded: list, runs: list) -> list:
-    return reconcile(loaded, runs, hosts=_hosts(), head_id=CFG.head.id, worker_id=CFG.worker.id)
+def _pair_rows(loaded: list, runs: list, served_names: dict | None = None) -> list:
+    names = BETA_SERVES if served_names is None else served_names
+    return reconcile(loaded, runs, hosts=_hosts(), head_id=CFG.head.id, worker_id=CFG.worker.id, served_names=names)
 
 
 def test_run_whose_containers_answer_owns_a_shared_served_name() -> None:
@@ -470,14 +473,22 @@ def test_container_owner_on_one_to_four_sparks() -> None:
         }
 
     hosts = [{"id": name, "fresh": True} for name in ("n1", "n2", "n3", "n4")]
-    one = reconcile([single("n1", "run-beta-head", 8030)], [run("head", "run-beta-head", 8030)],
-                    hosts=hosts, head_id="n1", worker_id="")
+    one = reconcile(
+        [single("n1", "run-beta-head", 8030)],
+        [run("head", "run-beta-head", 8030)],
+        hosts=hosts,
+        head_id="n1",
+        worker_id="",
+        served_names=BETA_SERVES,
+    )
     assert [(row["role"], row["run_id"]) for row in one] == [("head", "beta-head")]
     extra = {"node3": "n3", "node4": "n4"}
     loaded = [single("n3", "run-beta-node3", 8031), single("n4", "run-beta-node4", 8032)]
     runs = [run("node3", "run-beta-node3", 8031), run("node4", "run-beta-node4", 8032)]
     for count, ids in ((3, {"node3": "n3"}), (4, extra)):
-        rows = reconcile(loaded, runs, hosts=hosts, head_id="n1", worker_id="n2", extra_ids=ids)
+        rows = reconcile(
+            loaded, runs, hosts=hosts, head_id="n1", worker_id="n2", extra_ids=ids, served_names=BETA_SERVES
+        )
         by_role = {row["role"]: row for row in rows}
         assert len(rows) == count
         assert by_role["head"]["state"] == "idle" and by_role["worker"]["state"] == "idle"
@@ -485,8 +496,15 @@ def test_container_owner_on_one_to_four_sparks() -> None:
             assert by_role[role]["state"] == "ready", (count, role)
             assert by_role[role]["run_id"] == f"beta-{role}"
     # A single-host container on node3 is compared with that host's own container name.
-    swapped = reconcile([single("n3", "run-beta-node4", 8031)], [run("node3", "run-beta-node3", 8031)],
-                        hosts=hosts, head_id="n1", worker_id="n2", extra_ids={"node3": "n3"})
+    swapped = reconcile(
+        [single("n3", "run-beta-node4", 8031)],
+        [run("node3", "run-beta-node3", 8031)],
+        hosts=hosts,
+        head_id="n1",
+        worker_id="n2",
+        extra_ids={"node3": "n3"},
+        served_names=BETA_SERVES,
+    )
     assert {row["role"]: row["run_id"] for row in swapped}["node3"] == ""
 
 
@@ -517,8 +535,10 @@ def test_shared_served_id_follows_run_containers_before_catalog_prefix() -> None
         };
         modelRuns[1].phase = "failed";
         result.failed = roleStanding(modelRuns[1], "head");
+        result.failedId = libraryIdFor(hit);
         modelRuns[1].phase = "timed_out";
         result.timed = roleStanding(modelRuns[1], "head");
+        result.timedId = libraryIdFor(hit);
         modelRuns[1].phase = "stopped";
         modelRuns[1].nodes.forEach(function (n) { n.phase = "stopped"; });
         result.stopped = libraryIdFor(hit);
@@ -542,7 +562,8 @@ def test_shared_served_id_follows_run_containers_before_catalog_prefix() -> None
         single.host = HEAD_ID;
         result.singleWrongHost = libraryIdFor(single);
         process.stdout.write(JSON.stringify(result));
-        """ % (json.dumps(runs), _accept({"loaded": [row], "hosts": _hosts()}))
+        """
+        % (json.dumps(runs), _accept({"loaded": [row], "hosts": _hosts()}))
     )
     assert got["id"] == "beta"
     assert got["head"] == ["beta-run"] and got["worker"] == ["beta-run"]
@@ -550,7 +571,9 @@ def test_shared_served_id_follows_run_containers_before_catalog_prefix() -> None
     assert got["alpha"] == "" and got["beta"] == "confirmed"
     assert "failed" in got["alphaLabel"].lower()
     assert got["betaLabel"] == "Ready · port 8014"
-    assert got["failed"] == "survivor" and got["timed"] == "survivor"
+    # A closed run never claims the row (the server's active gate), so the catalog decides.
+    assert got["failed"] == "" and got["timed"] == ""
+    assert got["failedId"] == got["timedId"] == "alpha"
     # Without an owning run the catalog rules still decide (here the prefix), but a run
     # whose recorded containers are not the live ones never labels them as a survivor.
     assert got["stopped"] == "alpha" and got["stoppedAlpha"] == ""
@@ -559,3 +582,156 @@ def test_shared_served_id_follows_run_containers_before_catalog_prefix() -> None
     # One host, no span: only the node on that host's role is compared.
     assert got["single"] == "beta"
     assert got["singleWrongHost"] == "alpha"
+
+
+def test_served_name_the_model_never_declares_vetoes_a_container_match() -> None:
+    """Audit repro: an active run with matching names does not own a process serving another model."""
+    other = dict(_shared_pair())
+    other.update(served="totally-other-model", name="totally-other-model")
+    rows = _pair_rows([other], [_beta_run()])
+    assert [row["state"] for row in rows] == ["answering", "answering"]
+    assert all(row["run_id"] == "" for row in rows)
+    assert all(row["title"] == "totally-other-model" for row in rows)
+    # Without any declared names the run may serve only its model id or title.
+    unknown = _pair_rows([_shared_pair()], [_beta_run()], served_names={})
+    assert all(row["run_id"] == "" for row in unknown)
+    # A declared prefix counts, compared without case.
+    prefixed = _pair_rows([_shared_pair()], [_beta_run()], served_names={"beta": (set(), ["SHARED-"])})
+    assert {row["run_id"] for row in prefixed} == {"beta-run"}
+
+
+def test_a_newer_run_that_reuses_the_names_supersedes_the_older_owner() -> None:
+    """Serving agrees with run_live: a newer record on the same host and name wins it."""
+    from sparksi.library import run_sides
+
+    def with_hosts(run: dict) -> dict:
+        for node in run["nodes"]:
+            node["host"] = "host-" + node["role"]
+        return run
+
+    older = with_hosts(_beta_run(run_id="beta-older", started=5))
+    newer = with_hosts(_beta_run(run_id="beta-newer", phase="stopped", started=9))
+    for node in newer["nodes"]:
+        node["phase"] = "stopped"
+    rows = _pair_rows([_shared_pair()], [older, newer])
+    assert all(row["run_id"] == "" for row in rows)
+    probes = {"host-head": {"containers": ["run-beta-head"]}, "host-worker": {"containers": ["run-beta-worker"]}}
+    assert set(run_sides(older, probes, [older, newer]).values()) == {"superseded"}
+
+
+def test_equal_start_times_break_ties_by_id_in_any_order() -> None:
+    first = _beta_run(run_id="beta-a", started=7)
+    second = _beta_run(run_id="beta-b", started=7)
+    forward = _pair_rows([_shared_pair()], [first, second])
+    backward = _pair_rows([_shared_pair()], [second, first])
+    assert {row["run_id"] for row in forward} == {row["run_id"] for row in backward} == {"beta-b"}
+
+
+def test_served_names_come_from_the_catalog_row_and_every_recipe(monkeypatch, tmp_path) -> None:
+    from sparksi.serving_state import served_names_for
+
+    monkeypatch.setenv("SPARKSI_RECIPES_DIR", str(tmp_path))
+    (tmp_path / "beta.toml").write_text('alias = "beta-alias"\n')
+    named = tmp_path / "named" / "beta"
+    named.mkdir(parents=True)
+    (named / "beta-pinned-copy.toml").write_text(
+        'kind = "pinned"\n[roles.head]\nargs = ["serve", "--served-model-name", "Pinned-Name"]\n'
+        '[roles.worker]\nargs = ["--alias=worker-alias"]\nenv = { SERVED_MODEL_NAME = "Env-Name" }\n'
+    )
+    catalog = {
+        "library": [
+            {"id": "beta", "title": "Beta title", "identity": {"served": ["Catalog-Name"], "served_prefix": "Cat-"}}
+        ]
+    }
+    names, prefixes = served_names_for(["beta"], catalog)["beta"]
+    assert names == {"beta", "beta title", "catalog-name", "beta-alias", "pinned-name", "worker-alias", "env-name"}
+    assert prefixes == ["Cat-"]
+    assert served_names_for([], catalog) == {}
+    # A model with no row and no recipe may serve only its id.
+    assert served_names_for(["gamma"], catalog)["gamma"] == ({"gamma"}, [])
+
+
+def test_attach_reads_declared_names_from_the_catalog(monkeypatch, tmp_path) -> None:
+    """Two example rows serve one id; attach finds the owning run without a test-only map."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("SPARKSI_CATALOG", str(root / "config" / "catalog.example.yaml"))
+    monkeypatch.setenv("SPARKSI_RECIPES_DIR", str(tmp_path))
+    live = _shared_pair(head="sparksi-pair-tf-head", worker="sparksi-pair-tf-worker")
+    live.update(served="Pair-EXL3", name="Pair-EXL3")
+    run = _beta_run(
+        model_id="pair-tf",
+        run_id="tf-run",
+        nodes=[
+            {"role": "head", "phase": "started", "container": "sparksi-pair-tf-head"},
+            {"role": "worker", "phase": "started", "container": "sparksi-pair-tf-worker"},
+        ],
+    )
+    old = dict(_alpha_failed(), model_id="pair-exl3")
+    body = attach({"runs": [old, run]}, [live], _hosts(), head_id=CFG.head.id, worker_id=CFG.worker.id)
+    assert [row["run_id"] for row in body["serving"]] == ["tf-run", "tf-run"]
+    other = dict(live, served="Not-Declared", name="Not-Declared")
+    vetoed = attach({"runs": [run]}, [other], _hosts(), head_id=CFG.head.id, worker_id=CFG.worker.id)
+    assert all(row["run_id"] == "" for row in vetoed["serving"])
+
+
+def test_page_owner_needs_an_active_run_and_a_name_its_model_declares() -> None:
+    """Audit repro: a failed run, or a run of a model that never serves this name, cannot claim the row."""
+    from tests.test_serving_reconcile import _accept, _js
+
+    row = _shared_pair(head="run-gamma-head", worker="run-gamma-worker")
+    gamma = _beta_run(
+        model_id="gamma",
+        run_id="gamma-run",
+        phase="failed",
+        nodes=[
+            {"role": "head", "phase": "started", "container": "run-gamma-head"},
+            {"role": "worker", "phase": "started", "container": "run-gamma-worker"},
+        ],
+    )
+    got = _js(
+        """
+        libraryRows = [
+          { id: "alpha", title: "Alpha", identity: { served: ["shared-served"], served_prefix: "shared" } },
+          { id: "beta", title: "Beta", identity: { served: ["shared-served"] } },
+          { id: "gamma", title: "Gamma", identity: { served: ["gamma-served"] } }
+        ];
+        modelCards = libraryRows;
+        modelRuns = [%s];
+        %s
+        var hit = lastMonitor.loaded[0];
+        var result = { failed: libraryIdFor(hit), failedStanding: roleStanding(modelRuns[0], "head") };
+        modelRuns[0].phase = "timed_out";
+        result.timed = libraryIdFor(hit);
+        modelRuns[0].phase = "ready";
+        result.undeclared = libraryIdFor(hit);
+        result.undeclaredStanding = roleStanding(modelRuns[0], "head");
+        hit.served = "gamma-served";
+        result.declared = libraryIdFor(hit);
+        hit.served = "shared-served";
+        servingRows = [{ role: "head", state: "ready", run_id: "gamma-run" }];
+        result.serverNamed = libraryIdFor(hit);
+        servingRows = null;
+        modelRuns = [
+          JSON.parse(JSON.stringify(modelRuns[0])),
+          JSON.parse(JSON.stringify(modelRuns[0]))
+        ];
+        modelRuns.forEach(function (r) { r.model_id = "beta"; });
+        modelRuns[0].id = "beta-b"; modelRuns[1].id = "beta-a";
+        modelRuns[1].model_id = "alpha";
+        result.tieForward = libraryIdFor(hit);
+        modelRuns.reverse();
+        result.tieBackward = libraryIdFor(hit);
+        process.stdout.write(JSON.stringify(result));
+        """
+        % (json.dumps(gamma), _accept({"loaded": [row], "hosts": _hosts()}))
+    )
+    assert got["failed"] == got["timed"] == "alpha"
+    assert got["failedStanding"] == ""
+    assert got["undeclared"] == "alpha" and got["undeclaredStanding"] == ""
+    assert got["declared"] == "gamma"
+    # A recipe name the page cannot see counts once the server names this run on a serving row.
+    assert got["serverNamed"] == "gamma"
+    # Equal starts: the larger id wins in either order.
+    assert got["tieForward"] == got["tieBackward"] == "beta"

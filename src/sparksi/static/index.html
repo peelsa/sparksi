@@ -1984,12 +1984,15 @@
       var vid = videoRow();
       return vid ? vid.id : null;
     }
+    /* The run whose own containers answer owns the row, as on the server: only an active
+       parent phase, only for a served name that model declares, newest start then id wins. */
     var owner = null;
     var recorded = typeof modelRuns === "undefined" ? [] : modelRuns;
     (recorded || []).forEach(function (run) {
-      if (!run || !run.model_id || run.phase === "stopped" || run.phase === "cancelled") return;
+      if (!run || !run.model_id || SERVING_ACTIVE.indexOf(String(run.phase || "")) < 0) return;
       if (!Number(mod.port || 0) || runContainerEvidence(run, mod) <= 0) return;
-      if (!owner || Number(run.started || 0) > Number(owner.started || 0)) owner = run;
+      if (!runMayServe(run, String(mod.served || "").trim())) return;
+      if (!owner || runAfter(run, owner)) owner = run;
     });
     if (owner) return String(owner.model_id);
     var served = String(mod.served || "").trim();
@@ -2051,6 +2054,38 @@
       agreed++;
     });
     return differs ? -1 : agreed;
+  }
+  var SERVING_ACTIVE = ["starting", "waiting_health", "copying", "ready", "stopping"];
+  function runAfter(run, other) {
+    var a = Number(run.started || 0), b = Number(other.started || 0);
+    if (a !== b) return a > b;
+    return String(run.id || "") > String(other.id || "");
+  }
+  function runMayServe(run, served) {
+    /* A served name the run's model never declares vetoes a container-name match. The model's
+       catalog row gives its names here; a recipe's names come from the server, which names
+       this run on a serving row only after the same check. */
+    if (!served) return false;
+    var folded = served.toLowerCase();
+    var ok = false;
+    [run.model_id, run.title].forEach(function (name) {
+      if (name && String(name).toLowerCase() === folded) ok = true;
+    });
+    (typeof libraryRows === "undefined" ? [] : libraryRows || []).forEach(function (row) {
+      if (!row || row.id !== run.model_id) return;
+      var ident = row.identity || {};
+      var names = ident.served || [];
+      if (typeof names === "string") names = [names];
+      names.concat(row.title ? [row.title] : []).forEach(function (name) {
+        if (String(name).toLowerCase() === folded) ok = true;
+      });
+      if (ident.served_prefix && folded.indexOf(String(ident.served_prefix).toLowerCase()) === 0) ok = true;
+    });
+    var rows = typeof servingRows === "undefined" ? null : servingRows;
+    (Array.isArray(rows) ? rows : []).forEach(function (row) {
+      if (row && run.id && row.run_id === run.id) ok = true;
+    });
+    return ok;
   }
   function stopLoaded(id, label, both, asked, noteId) {
     if (lockOn()) {
