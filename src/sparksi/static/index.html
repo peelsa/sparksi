@@ -1308,6 +1308,177 @@
 <script>
 (function () {
   "use strict";
+  /* leaving-fetch-start */
+  /* Requests while the page is leaving. Once a navigation away starts
+     (beforeunload), WebKit keeps this page's timers running until the next page
+     arrives, but refuses every ordinary request started in that window and logs
+     each as "Fetch API cannot load ... due to access control checks." Keepalive
+     requests are not refused. While the page shows nothing else, it looks the same
+     whether it is still leaving or has stayed (a download link, a 204, a stopped
+     navigation): visible, complete and focused, and no event fires. So:
+     - GETs started while leaving are held. If the page goes, they never leave.
+       pageshow (the page came back) sends them as ordinary requests.
+     - If no pageshow comes within LEAVING_HOLD_MS, the held GETs, and every
+       request after them, go out as keepalive. That is safe whether the page is
+       still leaving or has stayed, so the hold can end on a timer without
+       guessing. Only pageshow or the next page ends it, so after a stopped
+       navigation, a 204 or a download it lasts for the rest of the page's life.
+     - Writes are never held: they go out at once, as keepalive while leaving,
+       so a write is not refused or dropped.
+     Browsers share one keepalive budget of 64 KiB of body bytes across every
+     keepalive request in flight, and refuse one that would go over. So the
+     bytes in flight are counted here until each response has fully loaded, and
+     a request whose body would take the total past KEEPALIVE_BUDGET goes as an
+     ordinary request instead.
+     Every fetch in this script comes through here. */
+  var LEAVING_HOLD_MS = window.SPARKSI_LEAVING_HOLD_MS || 5000;
+  var KEEPALIVE_BUDGET = 60000;
+  var pageFetch = window.fetch.bind(window);
+  var leaving = false;
+  var holdEnded = false;
+  var holdTimer = null;
+  var heldGets = [];
+  var keepaliveBytes = 0;
+  /* Body size in bytes as the browser sends it; Infinity when it cannot be known
+     up front (FormData, a stream), so such a body never goes as keepalive. */
+  function bodyBytes(body) {
+    if (body === undefined || body === null) return 0;
+    if (typeof body === "string") return new TextEncoder().encode(body).length;
+    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return new TextEncoder().encode(body.toString()).length;
+    if (typeof Blob !== "undefined" && body instanceof Blob) return body.size;
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return body.byteLength;
+    return Infinity;
+  }
+  function abortError() {
+    return new DOMException("The request was aborted.", "AbortError");
+  }
+  /* The caller's view of a keepalive request sent without its signal: the promise
+     rejects on abort, and so does a body still loading when the abort comes. The
+     request itself runs on, so its bytes stay counted until it really ends.
+     The body is handed on through a new Response, which keeps status, statusText
+     and headers but not url, redirected or type; no caller in this page reads
+     those. A null-body status (101, 103, 204, 205, 304) cannot be rebuilt with a
+     body, and has nothing to read, so the original response is handed on. */
+  var NULL_BODY_STATUS = [101, 103, 204, 205, 304];
+  function abortable(sent, signal) {
+    return new Promise(function (resolve, reject) {
+      if (signal.aborted) { reject(abortError()); return; }
+      var early = function () { reject(abortError()); };
+      signal.addEventListener("abort", early, { once: true });
+      sent.then(function (response) {
+        signal.removeEventListener("abort", early);
+        if (signal.aborted) { reject(abortError()); return; }
+        try {
+          handOn(response);
+        } catch (err) {
+          reject(err);
+        }
+      }, function (err) {
+        signal.removeEventListener("abort", early);
+        reject(signal.aborted ? abortError() : err);
+      });
+      function handOn(response) {
+        if (!response.body || NULL_BODY_STATUS.indexOf(response.status) >= 0) { resolve(response); return; }
+        var reader = response.body.getReader();
+        var body = new ReadableStream({
+          start: function (controller) {
+            var late = function () {
+              controller.error(abortError());
+              reader.cancel().catch(function () {});
+            };
+            signal.addEventListener("abort", late, { once: true });
+            var pump = function () {
+              reader.read().then(function (chunk) {
+                if (signal.aborted) return;
+                if (chunk.done) {
+                  signal.removeEventListener("abort", late);
+                  controller.close();
+                  return;
+                }
+                controller.enqueue(chunk.value);
+                pump();
+              }, function (err) {
+                signal.removeEventListener("abort", late);
+                if (!signal.aborted) controller.error(err);
+              });
+            };
+            pump();
+          }
+        });
+        resolve(new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }));
+      }
+    });
+  }
+  function sendRequest(url, options, keep) {
+    /* An already-aborted signal sends nothing, as the browser's fetch does; the
+       keepalive path below drops the signal, so it must not get that far. */
+    if (options && options.signal && options.signal.aborted) return Promise.reject(abortError());
+    var bytes = keep ? bodyBytes(options && options.body) : Infinity;
+    if (keepaliveBytes + bytes > KEEPALIVE_BUDGET) return pageFetch(url, options);
+    var signal = options && options.signal;
+    var copy = {};
+    Object.keys(options || {}).forEach(function (key) {
+      /* An aborted keepalive request still holds its bytes in the browser until
+         the server answers, so a request with a body is sent without its signal
+         and the abort is handled for the caller (abortable). */
+      if (!(key === "signal" && bytes > 0)) copy[key] = options[key];
+    });
+    copy.keepalive = true;
+    var sent = pageFetch(url, copy);
+    if (bytes === 0) return sent;
+    keepaliveBytes += bytes;
+    /* The browser counts the bytes until the whole response has loaded, not only
+       until the request's promise resolves, so give them back once a copy of the
+       body has been read, or when the request itself fails (a network error; an
+       abort no longer ends it). */
+    var settle = function () { keepaliveBytes -= bytes; };
+    sent.then(function (response) { return response.clone().arrayBuffer().then(settle, settle); }, settle);
+    return signal ? abortable(sent, signal) : sent;
+  }
+  function sendHeld(keep) {
+    var held = heldGets;
+    heldGets = [];
+    held.forEach(function (req) { sendRequest(req.url, req.options, keep).then(req.resolve, req.reject); });
+  }
+  window.addEventListener("beforeunload", function () {
+    clearTimeout(holdTimer);
+    leaving = true;
+    holdEnded = false;
+    holdTimer = setTimeout(function () {
+      holdTimer = null;
+      holdEnded = true;
+      sendHeld(true);
+    }, LEAVING_HOLD_MS);
+  });
+  window.addEventListener("pageshow", function () {
+    clearTimeout(holdTimer);
+    holdTimer = null;
+    leaving = false;
+    holdEnded = false;
+    sendHeld(false);
+  });
+  var fetch = function (url, options) {
+    var method = String((options && options.method) || "GET").toUpperCase();
+    if (leaving && !holdEnded && method === "GET") {
+      return new Promise(function (resolve, reject) {
+        var signal = options && options.signal;
+        if (signal && signal.aborted) {
+          reject(abortError());
+          return;
+        }
+        var req = { url: url, options: options, resolve: resolve, reject: reject };
+        if (signal) signal.addEventListener("abort", function () {
+          var at = heldGets.indexOf(req);
+          if (at >= 0) heldGets.splice(at, 1);
+          reject(abortError());
+        }, { once: true });
+        heldGets.push(req);
+      });
+    }
+    return sendRequest(url, options, leaving);
+  };
+  /* leaving-fetch-end */
+
   var HEAD_ID = "head", WORKER_ID = "worker";
   var HEAD_NAME = "", WORKER_NAME = "";
   var ARCHIVE_LABEL = "Archive";
