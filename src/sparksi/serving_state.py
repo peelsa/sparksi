@@ -242,7 +242,7 @@ def _same_instance(run: dict[str, Any], row: dict[str, Any], role: str, head_id:
         return False
     if _port(run) != _port(row) or _port(row) == 0:
         return False
-    return _containers_agree(run, row, role)
+    return _containers_agree(run, row, role, head_id, worker_id)
 
 
 def _run_uses_role(run: dict[str, Any], role: str) -> bool:
@@ -259,9 +259,37 @@ def _same_identity(run: dict[str, Any], row: dict[str, Any], role: str, head_id:
     served = _observed_identity(row, role, head_id, worker_id)
     if not served:
         return False
+    # The run's own container answering on this role names the run, whatever id it serves:
+    # two catalog rows or a recipe copy can serve one id under different model ids.
+    if _container_owner(run, row, role, head_id, worker_id):
+        return True
     names = {str(run.get("model_id") or ""), str(run.get("title") or "")}
     names.discard("")
     return served in names
+
+
+def _live_container(row: dict[str, Any], role: str, head_id: str, worker_id: str) -> str:
+    """The engine-reported container for this role, or "" when it is not from the engine."""
+    if str(row.get("container_source") or "") != "engine":
+        return ""
+    if _is_pair(row, head_id, worker_id) and role == "worker":
+        return str(row.get("worker_name") or "")
+    return str(row.get("container") or "")
+
+
+def _container_owner(run: dict[str, Any], row: dict[str, Any], role: str, head_id: str, worker_id: str) -> bool:
+    live = _live_container(row, role, head_id, worker_id)
+    if not live:
+        return False
+    if role in (run.get("stopped_sides") or []):
+        return False
+    return any(
+        isinstance(node, dict)
+        and node.get("role") == role
+        and str(node.get("phase") or "") not in ("stopped", "cancelled")
+        and str(node.get("container") or "") == live
+        for node in run.get("nodes") or []
+    )
 
 
 def _observed_identity(row: dict[str, Any], role: str, head_id: str, worker_id: str) -> str:
@@ -273,10 +301,8 @@ def _observed_identity(row: dict[str, Any], role: str, head_id: str, worker_id: 
     return _identity(row)
 
 
-def _containers_agree(run: dict[str, Any], row: dict[str, Any], role: str) -> bool:
-    if str(row.get("container_source") or "") != "engine":
-        return True
-    live = str(row.get("container") or "") if role == "head" else str(row.get("worker_name") or "")
+def _containers_agree(run: dict[str, Any], row: dict[str, Any], role: str, head_id: str, worker_id: str) -> bool:
+    live = _live_container(row, role, head_id, worker_id)
     if not live:
         return True
     for node in run.get("nodes") or []:

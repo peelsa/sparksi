@@ -1984,6 +1984,14 @@
       var vid = videoRow();
       return vid ? vid.id : null;
     }
+    var owner = null;
+    var recorded = typeof modelRuns === "undefined" ? [] : modelRuns;
+    (recorded || []).forEach(function (run) {
+      if (!run || !run.model_id || run.phase === "stopped" || run.phase === "cancelled") return;
+      if (!Number(mod.port || 0) || runContainerEvidence(run, mod) <= 0) return;
+      if (!owner || Number(run.started || 0) > Number(owner.started || 0)) owner = run;
+    });
+    if (owner) return String(owner.model_id);
     var served = String(mod.served || "").trim();
     var hits = [];
     var j, row, ident, names, n, matched;
@@ -2021,6 +2029,28 @@
       if (prefixed.length === 1) return prefixed[0].id;
     }
     return null;
+  }
+  function runContainerEvidence(run, mod) {
+    /* Compare the run's own names, not the harness names in the catalog. A recipe copy
+       may serve the same id on the same port. A static truth hint is not evidence. */
+    if (!run || !mod || mod.container_source !== "engine") return 0;
+    if (mod.port != null && String(mod.port) !== "" && Number(run.port || 0) !== Number(mod.port)) return -1;
+    var pair = (mod.span || []).length > 1;
+    var agreed = 0, differs = false;
+    (run.nodes || []).forEach(function (node) {
+      if (!node || !node.container) return;
+      var name = pair && node.role === "worker" ? mod.worker_name : mod.container;
+      if (pair && node.role !== "head" && node.role !== "worker") return;
+      if (!pair) {
+        var role = typeof roleOfHost === "function" ? roleOfHost(mod.host) : "";
+        if (role && node.role !== role) return;
+      }
+      if (!name) return;
+      if (String(node.container) !== String(name)) { differs = true; return; }
+      if (node.phase === "stopped" || node.phase === "cancelled" || (run.stopped_sides || []).indexOf(node.role) >= 0) return;
+      agreed++;
+    });
+    return differs ? -1 : agreed;
   }
   function stopLoaded(id, label, both, asked, noteId) {
     if (lockOn()) {
@@ -7564,6 +7594,7 @@
     if (mod.port != null && String(mod.port) !== "") {
       if (run.port == null || String(run.port) === "" || Number(run.port) !== Number(mod.port)) return false;
     }
+    if (runContainerEvidence(run, mod) < 0) return false;
     var id = observationId(mod);
     if (!id || !run.model_id || id !== String(run.model_id)) return false;
     if (String(mod.state || "") === "DOWN") return false;

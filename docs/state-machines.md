@@ -19,12 +19,12 @@ Transitions, in order:
 - No live row for the role → `idle`.
 - The announcing host is missing, or its `fresh` flag is not exactly true → `stale`. An empty host list is stale.
 - A span has one side up and the other not confirmed → `split` on both roles, with an empty `run_id`. This is decided before any run is considered. The down side says it is not confirmed. The up side says it is up.
-- A role is confirmed up, the served name was observed, the port matches, and the parent phase is `starting`, `waiting_health`, `copying`, `ready`, or `stopping` → `ready` or `loading`, and `run_id` is that run.
+- A role is confirmed up, the served name was observed, the port matches, the run owns the role, and the parent phase is `starting`, `waiting_health`, `copying`, `ready`, or `stopping` → `ready` or `loading`, and `run_id` is that run (the newest one when several qualify). The run owns the role when the served name is its model id or title, or when the engine reports that role's container under the name the run recorded for that role, on a side that is not stopped. Two catalog rows or a recipe copy can serve one id, so the served name alone cannot tell their runs apart.
 - A role is still up and no active run owns it → `answering` when the served name was observed, otherwise `observed`. `run_id` stays empty. A failed, timed-out, cancelled, or stopped parent, including one whose nodes are only partly stopped, is not an owner.
 
 On a span, a side is up only when its own flag is exactly true (`head_up` for the head, `worker_up` for the worker). A single-host row has no span. That role is up when the row's host is the role's node, the state is not `DOWN`, and the row's own `head_up` flag is true. On a worker row that flag means the worker answered, not that the head role is up.
 
-A served name is observed only for a role that is up, and not when it is a static catalog hint. The production model file copies `served_name` onto a span whose head did not answer HTTP (`head_up` false, `container_source` `truth`). That string is not an identity. Container names are reused, so they do not prove the instance either.
+A served name is observed only for a role that is up, and not when it is a static catalog hint. The production model file copies `served_name` onto a span whose head did not answer HTTP (`head_up` false, `container_source` `truth`). That string is not an identity. Container names are reused, so a name alone does not prove the instance either: it counts only when the engine reported it (not a static hint), for an active run on the same port, and a stopped or replaced run never takes it.
 
 Invariants:
 

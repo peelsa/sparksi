@@ -13,7 +13,7 @@ from sparksi.monitor.models import discover_loaded
 from sparksi.serve import INDEX_HTML
 from sparksi.serving_state import _reject, attach, reconcile
 
-STOPPED_ID = "8618b9772c00"
+STOPPED_ID = "0a0a0a0a0a0a"
 
 
 def _split_pair() -> dict:
@@ -321,3 +321,241 @@ def test_page_renders_split_rows_instead_of_an_empty_state() -> None:
     assert painted["head"][0]["title"] == "example-engine"
     assert "Nothing running" not in json.dumps(painted)
     assert "retired" not in json.dumps(painted).lower()
+
+
+# A Sparksi run names its own containers. Two catalog rows (or a recipe copy) can serve
+# one id, so the served name alone cannot say which run owns the live process.
+SHARED = "shared-served"
+
+
+def _shared_pair(head: str = "run-beta-head", worker: str = "run-beta-worker") -> dict:
+    row = _row_from_producer(
+        {
+            "fresh": True,
+            "http": {8014: {"served": SHARED, "metrics": {"num_requests_running": 0}}},
+            "engines": [{"name": head, "port": 8014}],
+            "truth": "",
+        },
+        {"fresh": True, "http": {}, "containers": [{"name": worker, "status": "Up 2 hours"}]},
+    )
+    assert row["served"] == SHARED
+    assert row["container_source"] == "engine"
+    assert row["container"] == head
+    assert row["worker_name"] == worker
+    return row
+
+
+def _beta_run(phase: str = "ready", run_id: str = "beta-run", **over) -> dict:
+    run = {
+        "id": run_id,
+        "model_id": "beta",
+        "phase": phase,
+        "port": 8014,
+        "placement": "both",
+        "started": 20,
+        "nodes": [
+            {"role": "worker", "phase": "started", "container": "run-beta-worker"},
+            {"role": "head", "phase": "started", "container": "run-beta-head"},
+        ],
+    }
+    run.update(over)
+    return run
+
+
+def _alpha_failed() -> dict:
+    """An older run of another row that serves the same id. It failed with its sides still named."""
+    return {
+        "id": "alpha-old",
+        "model_id": "alpha",
+        "phase": "failed",
+        "port": 8014,
+        "placement": "both",
+        "started": 10,
+        "stopped_sides": ["worker"],
+        "nodes": [
+            {"role": "worker", "phase": "started", "container": "run-alpha-worker"},
+            {"role": "head", "phase": "started", "container": "run-alpha-head"},
+        ],
+    }
+
+
+def _pair_rows(loaded: list, runs: list) -> list:
+    return reconcile(loaded, runs, hosts=_hosts(), head_id=CFG.head.id, worker_id=CFG.worker.id)
+
+
+def test_run_whose_containers_answer_owns_a_shared_served_name() -> None:
+    rows = _pair_rows([_shared_pair()], [_alpha_failed(), _beta_run(), _stopped()])
+    assert [row["state"] for row in rows] == ["ready", "ready"]
+    assert [row["run_id"] for row in rows] == ["beta-run", "beta-run"]
+    assert all(row["title"] == "beta" for row in rows)
+    assert all(row["text"] == "Ready · port 8014" for row in rows)
+    titled = _pair_rows([_shared_pair()], [_beta_run(title="Beta title")])
+    assert [row["title"] for row in titled] == ["Beta title", "Beta title"]
+
+
+def test_container_owner_needs_an_active_run_and_the_live_names() -> None:
+    for phase in ("failed", "timed_out", "stopped", "cancelled"):
+        rows = _pair_rows([_shared_pair()], [_beta_run(phase=phase)])
+        assert [row["state"] for row in rows] == ["answering", "answering"], phase
+        assert all(row["run_id"] == "" for row in rows), phase
+        assert all(row["title"] == SHARED for row in rows), phase
+    # A replaced container is a different instance, even with the same served name and port.
+    different = dict(_shared_pair())
+    different.update(container="someone-else-head", worker_name="someone-else-worker")
+    replaced = _pair_rows([different], [_beta_run()])
+    assert all(row["run_id"] == "" for row in replaced)
+    # Another port is another process.
+    other_port = _pair_rows([_shared_pair()], [_beta_run(port=8015)])
+    assert all(row["run_id"] == "" for row in other_port)
+    # Loading phases still own their process and say so.
+    loading = _pair_rows([_shared_pair()], [_beta_run(phase="waiting_health")])
+    assert [row["state"] for row in loading] == ["loading", "loading"]
+    assert {row["run_id"] for row in loading} == {"beta-run"}
+    # A side whose stop answered no longer owns the name it recorded.
+    half = _pair_rows([_shared_pair()], [_beta_run(stopped_sides=["worker"])])
+    assert [(row["role"], row["run_id"]) for row in half] == [("head", "beta-run"), ("worker", "")]
+    # The newest active owner wins when an older record names the same containers.
+    older = _beta_run(run_id="beta-older", started=5)
+    newest = _pair_rows([_shared_pair()], [older, _beta_run()])
+    assert {row["run_id"] for row in newest} == {"beta-run"}
+
+
+def test_static_or_unmanaged_container_names_do_not_prove_ownership() -> None:
+    truth = dict(_shared_pair())
+    truth["container_source"] = "truth"
+    rows = _pair_rows([truth], [_beta_run()])
+    assert all(row["run_id"] == "" for row in rows)
+    hand = dict(_shared_pair())
+    hand.update(container="hand-started", worker_name="hand-started-too")
+    unmanaged = _pair_rows([hand], [_beta_run()])
+    assert [row["state"] for row in unmanaged] == ["answering", "answering"]
+    assert all(row["run_id"] == "" for row in unmanaged)
+
+
+def test_half_up_pair_stays_split_with_a_container_owner() -> None:
+    row = _split_pair()
+    run = _beta_run(
+        nodes=[
+            {"role": "head", "phase": "started", "container": "example-engine-head"},
+            {"role": "worker", "phase": "started", "container": "example-engine-worker"},
+        ]
+    )
+    rows = _pair_rows([row], [run])
+    assert [item["state"] for item in rows] == ["split", "split"]
+    assert all(item["run_id"] == "" for item in rows)
+
+
+def test_container_owner_on_one_to_four_sparks() -> None:
+    def single(host: str, container: str, port: int) -> dict:
+        return {
+            "name": SHARED,
+            "served": SHARED,
+            "host": host,
+            "port": port,
+            "head_up": True,
+            "container": container,
+            "container_source": "engine",
+            "state": "UP",
+        }
+
+    def run(role: str, container: str, port: int) -> dict:
+        return {
+            "id": f"beta-{role}",
+            "model_id": "beta",
+            "phase": "ready",
+            "port": port,
+            "placement": role,
+            "started": 3,
+            "nodes": [{"role": role, "phase": "started", "container": container}],
+        }
+
+    hosts = [{"id": name, "fresh": True} for name in ("n1", "n2", "n3", "n4")]
+    one = reconcile([single("n1", "run-beta-head", 8030)], [run("head", "run-beta-head", 8030)],
+                    hosts=hosts, head_id="n1", worker_id="")
+    assert [(row["role"], row["run_id"]) for row in one] == [("head", "beta-head")]
+    extra = {"node3": "n3", "node4": "n4"}
+    loaded = [single("n3", "run-beta-node3", 8031), single("n4", "run-beta-node4", 8032)]
+    runs = [run("node3", "run-beta-node3", 8031), run("node4", "run-beta-node4", 8032)]
+    for count, ids in ((3, {"node3": "n3"}), (4, extra)):
+        rows = reconcile(loaded, runs, hosts=hosts, head_id="n1", worker_id="n2", extra_ids=ids)
+        by_role = {row["role"]: row for row in rows}
+        assert len(rows) == count
+        assert by_role["head"]["state"] == "idle" and by_role["worker"]["state"] == "idle"
+        for role in ids:
+            assert by_role[role]["state"] == "ready", (count, role)
+            assert by_role[role]["run_id"] == f"beta-{role}"
+    # A single-host container on node3 is compared with that host's own container name.
+    swapped = reconcile([single("n3", "run-beta-node4", 8031)], [run("node3", "run-beta-node3", 8031)],
+                        hosts=hosts, head_id="n1", worker_id="n2", extra_ids={"node3": "n3"})
+    assert {row["role"]: row["run_id"] for row in swapped}["node3"] == ""
+
+
+def test_shared_served_id_follows_run_containers_before_catalog_prefix() -> None:
+    from tests.test_serving_reconcile import _accept, _js
+
+    row = _shared_pair()
+    runs = [_alpha_failed(), _beta_run()]
+    got = _js(
+        """
+        libraryRows = [
+          { id: "alpha", title: "Alpha", identity: { served: ["shared-served"], served_prefix: "shared", container: "alpha-harness" } },
+          { id: "beta", title: "Beta recipe", identity: { served: ["shared-served"], container: "beta-harness" } }
+        ];
+        modelCards = libraryRows;
+        modelRuns = %s;
+        %s
+        var hit = lastMonitor.loaded[0];
+        var result = {
+          id: libraryIdFor(hit),
+          head: serveEntries("head").map(function (r) { return r.id; }),
+          worker: serveEntries("worker").map(function (r) { return r.id; }),
+          shared: sharedRun(modelRuns) && sharedRun(modelRuns).id,
+          alpha: roleStanding(modelRuns[0], "head"),
+          beta: roleStanding(modelRuns[1], "head"),
+          alphaLabel: liveLabel(modelCards[0]).text,
+          betaLabel: liveLabel(modelCards[1]).text
+        };
+        modelRuns[1].phase = "failed";
+        result.failed = roleStanding(modelRuns[1], "head");
+        modelRuns[1].phase = "timed_out";
+        result.timed = roleStanding(modelRuns[1], "head");
+        modelRuns[1].phase = "stopped";
+        modelRuns[1].nodes.forEach(function (n) { n.phase = "stopped"; });
+        result.stopped = libraryIdFor(hit);
+        result.stoppedAlpha = roleStanding(modelRuns[0], "head");
+        modelRuns[1].phase = "ready";
+        modelRuns[1].nodes.forEach(function (n) { n.phase = "started"; });
+        hit.container = "unmanaged-head";
+        hit.worker_name = "unmanaged-worker";
+        result.unmanaged = libraryIdFor(hit);
+        result.unmanagedAlpha = roleStanding(modelRuns[0], "head");
+        result.unmanagedBeta = roleStanding(modelRuns[1], "head");
+        var single = {
+          name: "shared-served", served: "shared-served", host: WORKER_ID, port: 8020,
+          head_up: true, container: "run-beta-worker", container_source: "engine", state: "UP"
+        };
+        modelRuns = [{
+          id: "beta-one", model_id: "beta", phase: "ready", placement: "worker", port: 8020, started: 30,
+          nodes: [{ role: "worker", phase: "started", container: "run-beta-worker" }]
+        }];
+        result.single = libraryIdFor(single);
+        single.host = HEAD_ID;
+        result.singleWrongHost = libraryIdFor(single);
+        process.stdout.write(JSON.stringify(result));
+        """ % (json.dumps(runs), _accept({"loaded": [row], "hosts": _hosts()}))
+    )
+    assert got["id"] == "beta"
+    assert got["head"] == ["beta-run"] and got["worker"] == ["beta-run"]
+    assert got["shared"] == "beta-run"
+    assert got["alpha"] == "" and got["beta"] == "confirmed"
+    assert "failed" in got["alphaLabel"].lower()
+    assert got["betaLabel"] == "Ready · port 8014"
+    assert got["failed"] == "survivor" and got["timed"] == "survivor"
+    # Without an owning run the catalog rules still decide (here the prefix), but a run
+    # whose recorded containers are not the live ones never labels them as a survivor.
+    assert got["stopped"] == "alpha" and got["stoppedAlpha"] == ""
+    assert got["unmanaged"] == "alpha"
+    assert got["unmanagedAlpha"] == got["unmanagedBeta"] == ""
+    # One host, no span: only the node on that host's role is compared.
+    assert got["single"] == "beta"
+    assert got["singleWrongHost"] == "alpha"
