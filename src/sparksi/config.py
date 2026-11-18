@@ -26,6 +26,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from sparksi import compat, protect
 
@@ -596,29 +597,87 @@ _TABLES = ("controller", "engines", "archive", "paths", "extra_machines", "compa
 
 # A key is secret when, with "-" read as "_" and an optional plural "s", it ends in one of these.
 _SECRET_KEY = re.compile(r"(token|secret|password|passwd|credential|api_?key|private_?key)s?$", re.IGNORECASE)
-_URL_USER = re.compile(r"(?<=://)[^/@\s]+@")
-_URL_PARAM = re.compile(r"(?P<sep>[?&;#])(?P<name>[^=&;#\s]+)=(?P<value>[^&;#\s]+)")
+# User info is whatever sits between two slashes (or backslashes) and the last "@" of the
+# authority, so "http://u:p@h", "http:\\\\u:p@h", "//u:p@h" and "http:///u:p@h" all match.
+_URL_USER = re.compile(r"(?<=[/\\][/\\])[^/\\?#]+@")
+_URLISH = re.compile(r"[/\\]{2}|%2f%2f|%5c", re.IGNORECASE)
+_ENCODED_EQ = r"%(?:25)*3d"
+_URL_PARAM = re.compile(
+    rf"(?P<sep>[?&;#])\s*(?P<name>(?:(?!=|{_ENCODED_EQ})[^&;#?\s])+)(?P<eq>\s*(?:=|{_ENCODED_EQ}))(?P<value>[^&;#?]*)",
+    re.IGNORECASE,
+)
 REDACTED = "<redacted>"
 # A site file larger than this is refused (a real one is a few KiB).
 MAX_CONFIG_BYTES = 1024 * 1024
+_SIGNED_URL = re.compile(r"(signature|^sig)$", re.IGNORECASE)
 
 
 def _is_secret_key(key: str) -> bool:
     return bool(_SECRET_KEY.search(key.replace("-", "_")))
 
 
-def _redact_text(text: str) -> str:
-    """Drop URL user info, and the value of any secret-named query or fragment parameter."""
+def _unquote_all(text: str) -> str:
+    """Percent-decode until nothing changes (at most a few rounds), so %2574oken reads as token."""
+    for _ in range(5):
+        decoded = unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
+def _is_secret_param(name: str) -> bool:
+    """A URL parameter name is secret when a key of that name would be, or it is a signature."""
+    name = re.sub(r"\[[^\]]*\]$", "", _unquote_all(name).strip())
+    return _is_secret_key(name) or bool(_SIGNED_URL.search(name.replace("-", "_")))
+
+
+def _scrub(text: str, *, url: bool) -> str:
+    """Hide URL user info and the value of every secret-named parameter in ``text``.
+
+    ``url`` says the text is a URL (or sits inside one); parameters are only looked for then.
+    A secret value runs to the next ``&``, ``;`` or ``#``, whatever it contains. A value
+    that, once percent-decoded, itself holds a secret (a ``next=`` redirect) is hidden whole.
+    """
     text = _URL_USER.sub(REDACTED + "@", text)
-    if "://" not in text:
+    if not url:
         return text
+    out: list[str] = []
+    pos = 0
+    while True:
+        match = _URL_PARAM.search(text, pos)
+        if match is None:
+            out.append(text[pos:])
+            return "".join(out)
+        start, end = match.start("value"), match.end("value")
+        if _is_secret_param(match["name"]):
+            end = len(text)
+            for stop in "&;#":
+                at = text.find(stop, start)
+                if at != -1:
+                    end = min(end, at)
+        elif start != end:
+            value = match["value"]
+            decoded = _unquote_all(value)
+            if decoded != value and _scrub("?" + decoded, url=True) != "?" + decoded:
+                end = match.end("value")
+            else:
+                start = end  # leave the value alone
+        out.append(text[pos:start])
+        if start != end:
+            out.append(REDACTED)
+        pos = max(end, match.end())
 
-    def param(match: re.Match[str]) -> str:
-        if _is_secret_key(match["name"]):
-            return f"{match['sep']}{match['name']}={REDACTED}"
-        return match[0]
 
-    return _URL_PARAM.sub(param, text)
+def _redact_text(text: str) -> str:
+    """Hide secrets in a string that may be a URL (user info, secret parameters, encoded forms)."""
+    urlish = bool(_URLISH.search(text))
+    out = _scrub(text, url=urlish)
+    if out == text:  # nothing found in the plain text; look through percent-encoding
+        decoded = _unquote_all(text)
+        if decoded != text and _URLISH.search(decoded) and _scrub(decoded, url=True) != decoded:
+            return REDACTED
+    return out
 
 
 def redact(value: Any, key: str = "", secret: bool = False) -> Any:
@@ -673,7 +732,7 @@ def _read_site_file(path: Path) -> dict[str, Any]:
     with open(path, "rb") as fh:
         data = fh.read(MAX_CONFIG_BYTES + 1)
     if len(data) > MAX_CONFIG_BYTES:
-        raise ConfigFileError(f"the file is larger than {MAX_CONFIG_BYTES // 1024} KiB, the most a config file may be")
+        raise ConfigFileError(f"the file is larger than {MAX_CONFIG_BYTES / (1024 * 1024):g} MiB, the most a config file may be")
     return tomllib.loads(data.decode("utf-8"))
 
 

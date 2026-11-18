@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ import pytest
 from sparksi import compat, config
 from sparksi.cli import main
 from sparksi.config import CFG_ERRORS, check, redact
+
+REPO = Path(__file__).resolve().parent.parent
 
 
 def _nodes(count: int) -> str:
@@ -627,7 +630,7 @@ def test_a_file_over_the_size_cap_is_refused_and_one_at_the_cap_is_read(tmp_path
     path.write_text(_nodes(1) + "#" * (config.MAX_CONFIG_BYTES - len(_nodes(1)) + 1))
     assert path.stat().st_size == config.MAX_CONFIG_BYTES + 1
     assert main(["config", "validate", "--file", str(path)]) == 1
-    assert f"error: {path}: the file is larger than 1024 KiB" in capsys.readouterr().err
+    assert f"error: {path}: the file is larger than 1 MiB" in capsys.readouterr().err
     path.write_text(_nodes(1) + "#" * (config.MAX_CONFIG_BYTES - len(_nodes(1))))
     assert path.stat().st_size == config.MAX_CONFIG_BYTES
     assert main(["config", "validate", "--file", str(path)]) == 0
@@ -663,3 +666,81 @@ def test_import_with_a_device_as_the_config_does_not_crash_or_hang(tmp_path) -> 
     assert "imported ['/dev/zero: not a regular file" in proc.stdout
     assert "rc 1" in proc.stdout
     assert "Traceback" not in proc.stderr
+
+
+# --- third audit: URL redaction edge cases ---
+
+_URL_LEAKS = {
+    "second ? hides the secret": ("http://h/x?q=1?token=AAA-LEAK", "http://h/x?q=1?token=<redacted>"),
+    "after ? in a fragment": ("http://h/#/r?x=1?token=AAA-LEAK", "http://h/#/r?x=1?token=<redacted>"),
+    "nested next": ("http://h/x?next=/a?token=AAA-LEAK", "http://h/x?next=/a?token=<redacted>"),
+    "both tokens": ("http://h/x?token=AAA?token=BBB-LEAK", "http://h/x?token=<redacted>"),
+    "encoded name": ("http://h/x?tok%65n=BBB-LEAK", "http://h/x?tok%65n=<redacted>"),
+    "encoded equals": ("http://h/x?token%3DCCC-LEAK", "http://h/x?token%3D<redacted>"),
+    "double-encoded equals": ("http://h/x?token%253DCCC-LEAK", "http://h/x?token%253D<redacted>"),
+    "double-encoded name": ("http://h/x?%2574oken=DDD-LEAK", "http://h/x?%2574oken=<redacted>"),
+    "signed url": (
+        "https://b.example/o?X-Amz-Algorithm=A&X-Amz-Signature=EEE-LEAK&X-Amz-Expires=60",
+        "https://b.example/o?X-Amz-Algorithm=A&X-Amz-Signature=<redacted>&X-Amz-Expires=60",
+    ),
+    "sig": ("https://b.example/o?sig=FFF-LEAK&se=1", "https://b.example/o?sig=<redacted>&se=1"),
+    "encoded ampersand": ("http://h/x?x=1%26token=GGG-LEAK", "http://h/x?x=<redacted>"),
+    "encoded redirect": ("http://h/x?next=%2Fa%3Ftoken%3DHHH-LEAK", "http://h/x?next=<redacted>"),
+    "encoded redirect with user info": ("http://h/x?next=http%3A%2F%2Fu%3AIII-LEAK%40e%2F", "http://h/x?next=<redacted>"),
+    "whitespace in the value": ("http://h/x?token=AAA\tIII-LEAK\nJJJ-LEAK&ok=1", "http://h/x?token=<redacted>&ok=1"),
+    "space before equals": ("http://h/x?token =AAA-LEAK&a=1", "http://h/x?token =<redacted>&a=1"),
+    "array name": ("http://h/x?token[]=QQQ-LEAK&a=1", "http://h/x?token[]=<redacted>&a=1"),
+    "html ampersand": ("http://h/x?a=1&amp;token=RRR-LEAK", "http://h/x?a=1&amp;token=<redacted>"),
+    "backslashes": ("http:\\\\u:KKK-LEAK@h/x", "http:\\\\<redacted>@h/x"),
+    "three slashes": ("http:///u:LLL-LEAK@h/x", "http:///<redacted>@h/x"),
+    "scheme relative": ("//u:MMM-LEAK@h/x", "//<redacted>@h/x"),
+    "two at signs": ("http://a:b@NNN-LEAK@h/x", "http://<redacted>@h/x"),
+    "user info in a redirect": ("http://h/x?next=http://u:OOO-LEAK@evil/", "http://h/x?next=http://<redacted>@evil/"),
+    "wholly encoded": ("http%3A%2F%2Fh%2Fx%3Ftoken%3DPPP-LEAK", "<redacted>"),
+    "upper case name": ("http://h/x?TOKEN=AAA-LEAK", "http://h/x?TOKEN=<redacted>"),
+}
+
+
+@pytest.mark.parametrize(("raw", "expected"), list(_URL_LEAKS.values()), ids=list(_URL_LEAKS))
+def test_redact_url_edge_cases(raw, expected) -> None:
+    out = redact({"u": raw})["u"]
+    assert out == expected
+    assert "LEAK" not in out
+
+
+def test_redact_leaves_ordinary_urls_and_text_alone() -> None:
+    plain = [
+        "http://100.64.0.9:7500/path?page=2&token_count=7&sort=name#top",
+        "http://h/x?tokenizer=bert&monkey=1&sign=up&design=2",
+        "https://h/?token=&x=1",
+        "a?token=abc",
+        "token=abc",
+        "100% sure",
+        "http://h/a%20b?name=caf%C3%A9",
+        "ssh://git@h/repo.git",
+    ]
+    out = redact({"u": plain})["u"]
+    assert out[:-1] == plain[:-1]
+    assert out[-1] == "ssh://<redacted>@h/repo.git"  # user info is always dropped, as documented
+
+
+def test_url_redaction_in_a_fresh_process(tmp_path) -> None:
+    lines = "".join(f"c{i} = {json.dumps(raw)}\n" for i, (raw, _) in enumerate(_URL_LEAKS.values()))
+    path = _write(tmp_path, _nodes(1) + "\n[urls]\n" + lines)
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "XDG_RUNTIME_DIR": str(tmp_path)}
+    proc = subprocess.run(
+        [sys.executable, "-m", "sparksi.cli", "config", "show", "--file", str(path)],
+        capture_output=True, text=True, env=env, timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert "LEAK" not in proc.stdout
+    assert "Traceback" not in proc.stderr
+    shown = json.loads(proc.stdout)["urls"]
+    assert shown == {f"c{i}": expected for i, (_, expected) in enumerate(_URL_LEAKS.values())}
+
+
+def test_the_shipped_defaults_and_examples_are_unchanged_by_redaction() -> None:
+    assert redact(config.Config().raw) == config.Config().raw
+    for example in (REPO / "config" / "sparksi.example.toml", REPO / "src" / "sparksi" / "examples" / "sparksi.example.toml"):
+        raw = tomllib.loads(example.read_text(encoding="utf-8"))
+        assert redact(raw) == raw, example
