@@ -14,6 +14,8 @@ import json
 import os
 import subprocess
 import threading
+import time
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,7 @@ from sparksi.serve import STATE, DualServer, Handler
 ROOT = Path(__file__).resolve().parents[1]
 PAGE = ROOT / "src" / "sparksi" / "static" / "index.html"
 SINK: list[int] = []
+SLOW: list[int] = []
 
 
 class _SinkHandler(Handler):
@@ -45,6 +48,24 @@ class _SinkHandler(Handler):
         super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.startswith("/__slow"):
+            # Answers late (``delay`` ms before the headers), then sends the body slowly (``ms``).
+            query = parse_qs(urlsplit(self.path).query)
+            SLOW.append(len(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            time.sleep(int(query.get("delay", ["0"])[0]) / 1000)
+            steps = max(1, int(query.get("ms", ["0"])[0]) // 100)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(steps * 1024))
+            self.end_headers()
+            try:
+                for _ in range(steps):
+                    self.wfile.write(b"x" * 1024)
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+            return
         if self.path == "/__sink":
             SINK.append(len(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
             body = b"{}"
@@ -78,6 +99,7 @@ def port(monkeypatch, tmp_path):
     STATE.lock = lock
     STATE.runner = _Quiet()
     SINK.clear()
+    SLOW.clear()
     httpd = DualServer(("127.0.0.1", 0), _SinkHandler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
@@ -267,6 +289,12 @@ def test_writes_still_go_after_a_stopped_navigation(port) -> None:
     assert STATE.lock.read().locked, "the write never reached the server"
 
 
+def test_the_one_write_with_a_signal_reads_an_abort_from_the_signal() -> None:
+    text = PAGE.read_text(encoding="utf-8")
+    timed = text.split("function jpostTimed", 1)[1].split("function jput", 1)[0]
+    assert "ctrl.signal.aborted ||" in timed
+
+
 def _wrapper() -> str:
     """The page's own leaving-page fetch wrapper, exactly as shipped."""
     text = PAGE.read_text(encoding="utf-8")
@@ -308,6 +336,28 @@ const base = 'http://127.0.0.1:' + process.env.SPARKSI_PORT;
     result.small = await Promise.all([post(ascii(10)), post(ascii(10))]);
     await new Promise((r) => setTimeout(r, 300));
     result.bytesAfter = made.bytes();
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const slow = (query, signal) => send('/__slow?' + query, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: ascii(30000), signal });
+    // Aborted before the answer: the browser keeps the request and its bytes until the server answers.
+    let ac = new AbortController();
+    const early = slow('delay=1500', ac.signal).then(() => 'resolved', (e) => e.name);
+    await sleep(100);
+    ac.abort();
+    result.abortBefore = await early;
+    result.bytesAfterAbort = made.bytes();
+    result.afterAbort = await post(ascii(56000));
+    await sleep(2500);
+    result.bytesAfterAnswer = made.bytes();
+    // Aborted while the body loads: the caller's read fails at once; the bytes go back when the body ends.
+    ac = new AbortController();
+    const mid = await slow('ms=1500', ac.signal);
+    setTimeout(() => ac.abort(), 200);
+    const t = Date.now();
+    result.abortMidBody = await mid.text().then(() => 'read', (e) => e.name);
+    result.abortMidBodyMs = Date.now() - t;
+    result.bytesMidBody = made.bytes();
+    await sleep(2000);
+    result.bytesEnd = made.bytes();
     return result;
   }, process.env.WRAPPER);
   console.log('__RESULT__' + JSON.stringify(Object.assign({ errors }, out)));
@@ -329,4 +379,15 @@ def test_keepalive_writes_stay_inside_the_shared_byte_budget(port, engine) -> No
     assert data["inflight"] == [40010, 40010], data  # only the first 40 kB write counts against the budget
     assert data["bytesAfter"] == 0, data  # every keepalive byte is given back once its response has loaded
     assert sorted(SINK)[-1] >= 90000  # the multi-byte body arrived whole
-    assert len(SINK) == 12, SINK  # 1 + 1 + 3 + 5 + 2 writes, none lost
+    assert len(SINK) == 13, SINK  # 1 + 1 + 3 + 5 + 2 writes and the one after the abort, none lost
+    assert data["abortBefore"] == "AbortError", data
+    assert data["bytesAfterAbort"] == 30010, data  # still held: the request runs on without its signal
+    assert data["afterAbort"] == "ok 200", data  # 30 kB + 56 kB is over the budget: sent as an ordinary request
+    assert data["bytesAfterAnswer"] == 0, data
+    # The read fails at once. A body stream the page errors reads back as TypeError in both
+    # browsers; jpostTimed, the one write that passes a signal, checks signal.aborted first.
+    assert data["abortMidBody"] in ("AbortError", "TypeError"), data
+    assert data["abortMidBodyMs"] < 1000, data
+    assert data["bytesMidBody"] == 30010, data
+    assert data["bytesEnd"] == 0, data
+    assert SLOW == [30010, 30010], SLOW

@@ -1349,20 +1349,76 @@
     if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return body.byteLength;
     return Infinity;
   }
+  function abortError() {
+    return new DOMException("The request was aborted.", "AbortError");
+  }
+  /* The caller's view of a keepalive request sent without its signal: the promise
+     rejects on abort, and so does a body still loading when the abort comes. The
+     request itself runs on, so its bytes stay counted until it really ends. */
+  function abortable(sent, signal) {
+    return new Promise(function (resolve, reject) {
+      if (signal.aborted) { reject(abortError()); return; }
+      var early = function () { reject(abortError()); };
+      signal.addEventListener("abort", early, { once: true });
+      sent.then(function (response) {
+        signal.removeEventListener("abort", early);
+        if (signal.aborted) { reject(abortError()); return; }
+        if (!response.body) { resolve(response); return; }
+        var reader = response.body.getReader();
+        var body = new ReadableStream({
+          start: function (controller) {
+            var late = function () {
+              controller.error(abortError());
+              reader.cancel().catch(function () {});
+            };
+            signal.addEventListener("abort", late, { once: true });
+            var pump = function () {
+              reader.read().then(function (chunk) {
+                if (signal.aborted) return;
+                if (chunk.done) {
+                  signal.removeEventListener("abort", late);
+                  controller.close();
+                  return;
+                }
+                controller.enqueue(chunk.value);
+                pump();
+              }, function (err) {
+                signal.removeEventListener("abort", late);
+                if (!signal.aborted) controller.error(err);
+              });
+            };
+            pump();
+          }
+        });
+        resolve(new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }));
+      }, function (err) {
+        signal.removeEventListener("abort", early);
+        reject(signal.aborted ? abortError() : err);
+      });
+    });
+  }
   function sendRequest(url, options, keep) {
     var bytes = keep ? bodyBytes(options && options.body) : Infinity;
     if (keepaliveBytes + bytes > KEEPALIVE_BUDGET) return pageFetch(url, options);
+    var signal = options && options.signal;
     var copy = {};
-    Object.keys(options || {}).forEach(function (key) { copy[key] = options[key]; });
+    Object.keys(options || {}).forEach(function (key) {
+      /* An aborted keepalive request still holds its bytes in the browser until
+         the server answers, so a request with a body is sent without its signal
+         and the abort is handled for the caller (abortable). */
+      if (!(key === "signal" && bytes > 0)) copy[key] = options[key];
+    });
     copy.keepalive = true;
+    var sent = pageFetch(url, copy);
+    if (bytes === 0) return sent;
     keepaliveBytes += bytes;
     /* The browser counts the bytes until the whole response has loaded, not only
        until the request's promise resolves, so give them back once a copy of the
-       body is read (or at once if the request fails). */
+       body has been read, or when the request itself fails (a network error; an
+       abort no longer ends it). */
     var settle = function () { keepaliveBytes -= bytes; };
-    var sent = pageFetch(url, copy);
     sent.then(function (response) { return response.clone().arrayBuffer().then(settle, settle); }, settle);
-    return sent;
+    return signal ? abortable(sent, signal) : sent;
   }
   function sendHeld(keep) {
     var held = heldGets;
@@ -1392,14 +1448,14 @@
       return new Promise(function (resolve, reject) {
         var signal = options && options.signal;
         if (signal && signal.aborted) {
-          reject(new DOMException("The request was aborted.", "AbortError"));
+          reject(abortError());
           return;
         }
         var req = { url: url, options: options, resolve: resolve, reject: reject };
         if (signal) signal.addEventListener("abort", function () {
           var at = heldGets.indexOf(req);
           if (at >= 0) heldGets.splice(at, 1);
-          reject(new DOMException("The request was aborted.", "AbortError"));
+          reject(abortError());
         }, { once: true });
         heldGets.push(req);
       });
