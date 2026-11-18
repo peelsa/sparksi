@@ -378,7 +378,12 @@ const base = 'http://127.0.0.1:' + process.env.SPARKSI_PORT;
         .then((r) => r.text().then((t) => 'ok ' + r.status + ' [' + t + ']'), (e) => 'rejected ' + e.name);
       result.nullBody[code] = await Promise.race([answer, sleep(3000).then(() => 'no answer in 3 s')]);
     }
-    // A signal aborted before the call: nothing is sent.
+    // Their bytes go back once the wrapper's own read of the answer ends, which under load
+    // can come just after the caller's; wait for that, within 2 s.
+    const wait = Date.now();
+    while (made.bytes() !== 0 && Date.now() - wait < 2000) await sleep(20);
+    result.bytesAfterNullBody = made.bytes();
+    // A signal aborted before the call: nothing is sent and nothing is counted.
     ac = new AbortController();
     ac.abort();
     result.preAborted = await send('/__sink', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: ascii(100), signal: ac.signal })
@@ -420,4 +425,5 @@ def test_keepalive_writes_stay_inside_the_shared_byte_budget(port, engine) -> No
     assert data["nullBody"] == {"204": "ok 204 []", "205": "ok 205 []"}, data
     assert STATUS == [204, 205], STATUS
     assert data["preAborted"] == "rejected AbortError", data
+    assert data["bytesAfterNullBody"] == 0, data
     assert data["bytesAfterPreAborted"] == 0, data  # and the sink count above shows nothing was sent
