@@ -29,3 +29,11 @@ one line: what was missed, and the check that would have caught it.
   Ask the owner only for spending money, model or live-runtime
   operations beyond the brief, the five-file or public-API limits, or
   a change of plan.
+
+## Backlog
+
+- `tests/test_ui.py`: `httpd.shutdown()` can hang while the server thread is blocked in `accept()`; fix the race, no retry.
+- Under systemd every log line reaches the journal twice (stderr and `SysLogHandler`); use one sink when `JOURNAL_STREAM` is set, with a test.
+- Hash-pin the Playwright npm install: `package.json`, `package-lock.json` and `npm ci`.
+- Add job timeouts to `release.yml`, `codeql.yml` and `scorecard.yml`, and hash-pin the `pip install build` in `release.yml`.
+- Add a Dependabot entry for the `/.github` pip requirements.
