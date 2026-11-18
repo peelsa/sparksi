@@ -1,5 +1,5 @@
 # Hashed CI tooling and runtime dependencies. Installed with --require-hashes.
-# Regenerate: printf "pyyaml\npytest\nruff==0.17.5\nsetuptools>=68\n" > /tmp/ci.in
+# Regenerate: printf "pyyaml\npytest\nruff==0.17.5\nsetuptools>=77\n" > /tmp/ci.in
 #   pip-compile --generate-hashes --allow-unsafe --strip-extras --no-header --annotation-style=line -o .github/requirements-ci.txt /tmp/ci.in
 # Keep the ruff pin equal to the dev extra in pyproject.toml (the lint job checks it).
 iniconfig==2.3.1 \
