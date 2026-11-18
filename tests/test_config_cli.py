@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -744,3 +746,119 @@ def test_the_shipped_defaults_and_examples_are_unchanged_by_redaction() -> None:
     for example in (REPO / "config" / "sparksi.example.toml", REPO / "src" / "sparksi" / "examples" / "sparksi.example.toml"):
         raw = tomllib.loads(example.read_text(encoding="utf-8"))
         assert redact(raw) == raw, example
+
+
+# --- fourth audit: redaction must take linear time on hostile strings ---
+
+# A 200,000-"[" name took 21 s before the bracket strip was made linear. The bounds below are
+# a hundred times what the fixed code needs, so only a super-linear step can fail them.
+_TIME_BOUND = 5.0
+_P = "http://h/?"
+
+
+def _timed(value) -> float:
+    start = time.perf_counter()
+    redact(value)
+    return time.perf_counter() - start
+
+
+def test_redact_a_name_of_200000_open_brackets_is_fast() -> None:
+    assert _timed({"u": _P + "[" * 200_000 + "=1"}) < _TIME_BOUND
+    assert _timed({"u": _P + "[" * 100_000 + "]" * 100_000 + "x=1"}) < _TIME_BOUND
+
+
+_ADVERSARIAL = {
+    "closing brackets": _P + "]" * 262_144,
+    "bracket pairs": _P + "[]" * 131_072 + "=1",
+    "percent 25 run": _P + "%25" * 87_000 + "=1",
+    "percent run": _P + "%" * 262_144,
+    "encoded equals": "?a%3d" * 52_000,
+    "ampersands": _P + "&" * 262_144,
+    "question marks": "http://h/" + "?" * 262_144,
+    "at signs": "http://" + "@" * 262_144,
+    "slashes": "//" * 131_072,
+    "backslashes": "\\" * 262_144,
+    "spaces after a name": _P + "a" + " " * 262_000 + "x",
+    "tabs": _P + "\t" * 262_144,
+    "many secret parameters": _P + "token=1&" * 32_000,
+    "many short parameters": _P + "a=1&" * 65_000,
+    "many encoded values": _P + "a=%2f&" * 43_000,
+    "many nested redirects": _P + "a=%253Ftoken%253D&" * 14_000,
+    "user info repeated": "//a@" * 65_000,
+    "long names": _P + ("x" * 300 + "=1&") * 800,
+    "mixed": _P + "".join(random.Random(7).choice("[]%25&?;@:/\\ \t=#token") for _ in range(262_144)),
+}
+
+
+@pytest.mark.parametrize("text", list(_ADVERSARIAL.values()), ids=list(_ADVERSARIAL))
+def test_redact_adversarial_strings_take_linear_time(text) -> None:
+    assert _timed({"u": text}) < _TIME_BOUND
+
+
+def test_show_on_a_crafted_one_mebibyte_file_finishes(tmp_path) -> None:
+    pieces = {
+        "brackets": _P + "[" * 300_000 + "=1",
+        "secrets": _P + "token=1&" * 40_000,
+        "percent": _P + "%25" * 80_000 + "=1",
+        "long_names": _P + ("x" * 300 + "=1&") * 500,
+        "tail": _P + "a=1&token=LEAKMARK",
+    }
+    body = "\n[urls]\n" + "".join(f'{k} = "{v}"\n' for k, v in pieces.items())
+    path = _write(tmp_path, _nodes(1) + body)
+    assert 950_000 < path.stat().st_size <= config.MAX_CONFIG_BYTES
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "XDG_RUNTIME_DIR": str(tmp_path)}
+    start = time.perf_counter()
+    proc = subprocess.run(
+        [sys.executable, "-m", "sparksi.cli", "config", "show", "--file", str(path)],
+        capture_output=True, text=True, env=env, timeout=60, check=False,
+    )
+    assert time.perf_counter() - start < 30
+    assert proc.returncode == 0, proc.stderr[-400:]
+    assert "LEAKMARK" not in proc.stdout
+    assert json.loads(proc.stdout)["urls"]["tail"] == _P + "a=1&token=<redacted>"
+
+
+def test_a_parameter_name_over_the_cap_is_treated_as_secret() -> None:
+    long_name = "x" * (config.MAX_PARAM_NAME + 1)
+    ok_name = "x" * config.MAX_PARAM_NAME
+    out = redact({"u": [f"{_P}{long_name}=LEAK&a=1", f"{_P}{ok_name}=keep", f"{_P}{long_name}=&a=1"]})["u"]
+    assert out[0] == f"{_P}{long_name}=<redacted>&a=1"  # fail closed: cannot tell, so hide it
+    assert out[1] == f"{_P}{ok_name}=keep"
+    assert out[2] == f"{_P}{long_name}=&a=1"  # nothing to hide
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("http://h/?token[]=LEAK&a=1", "http://h/?token[]=<redacted>&a=1"),
+        ("http://h/?token[0]=LEAK", "http://h/?token[0]=<redacted>"),
+        ("http://h/?auth[token]=LEAK", "http://h/?auth[token]=<redacted>"),
+        ("http://h/?a[b][secret]=LEAK", "http://h/?a[b][secret]=<redacted>"),
+        ("http://h/?items[]=keep&n[0]=keep", "http://h/?items[]=keep&n[0]=keep"),
+        ("http://h/?[[[=keep", "http://h/?[[[=keep"),
+    ],
+)
+def test_bracketed_parameter_names(raw, expected) -> None:
+    assert redact({"u": raw})["u"] == expected
+
+
+@pytest.mark.parametrize("layers", range(1, 16))
+def test_a_secret_wrapped_in_many_layers_of_encoding_is_hidden(layers) -> None:
+    from urllib.parse import quote
+
+    value = "?token=LEAKMARK"
+    for _ in range(layers):
+        value = quote(value, safe="")
+    out = redact({"u": f"{_P}next={value}&a=1"})["u"]
+    assert "LEAKMARK" not in out
+    assert out.endswith("&a=1") or out == "<redacted>"
+
+
+@pytest.mark.parametrize("layers", [1, 3, 5, 6, 7, 10, 20, 50])
+def test_a_whole_url_wrapped_in_many_layers_of_encoding_is_hidden(layers) -> None:
+    from urllib.parse import quote
+
+    value = "http://h/x?token=LEAKMARK"
+    for _ in range(layers):
+        value = quote(value, safe="")
+    assert "LEAKMARK" not in redact({"u": value})["u"]
