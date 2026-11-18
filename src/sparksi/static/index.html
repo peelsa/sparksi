@@ -8039,7 +8039,6 @@
     var active = document.activeElement;
     var hadFocus = !!active && box.contains(active);
     var renameFocus = !!active && active.id === "recipe-rename";
-    clear(box);
     var card = selectedCard();
     var listed = !!card && recipeListed === card.id;
     var table = el("recipe-table");
@@ -8073,6 +8072,18 @@
       if (listed) bits.push("recipe edits work while locked");
       summary.textContent = bits.join(" \u00b7 ");
     }
+    /* A poll or preview repaint with nothing new keeps the rows. Rebuilding them swaps the
+       button under the pointer, so a click whose press and release straddle the repaint is
+       lost (the row menu never opens). A changed row, or a checkbox a write left disabled
+       or moved, still rebuilds. */
+    var sig = JSON.stringify([card ? card.id : "", listed, openName, recipeFocus, recipeRenaming, recipeEdited,
+      rows.map(function (item) { return [item.name, !!item.default, recipeRowLine(item, fileTime(item.modified)), recipeRowCells(item), fileTime(item.modified)]; })]);
+    if (sig === recipeRowsSig && recipeRowsIntact(box, rows)) {
+      paintRenameHint();
+      return;
+    }
+    recipeRowsSig = sig;
+    clear(box);
     var renameNode = null;
     rows.forEach(function (item) {
       var cells = recipeRowCells(item);
@@ -8181,6 +8192,11 @@
       });
       box.appendChild(row);
     });
+    var openMenu = el("recipe-menu");
+    if (openMenu && !openMenu.hidden && recipeMenuFor) {
+      var held = box.querySelector('.recipe-file-row[data-name="' + cssName(recipeMenuFor) + '"] .recipe-row-more');
+      if (held) held.setAttribute("aria-expanded", "true");
+    }
     if (renameNode && (renameFocus || recipeRenameFresh)) {
       recipeRenameFresh = false;
       renameNode.focus();
@@ -8191,6 +8207,20 @@
     paintRenameHint();
   }
   var recipeRenameFresh = false;
+  var recipeRowsSig = "";
+  function cssName(name) {
+    return String(name).replace(/["\\]/g, "\\$&");
+  }
+  function recipeRowsIntact(box, rows) {
+    var shown = box.querySelectorAll(".recipe-file-row");
+    if (shown.length !== rows.length) return false;
+    for (var i = 0; i < shown.length; i++) {
+      var tick = shown[i].querySelector(".recipe-default-box");
+      if (shown[i].getAttribute("data-name") !== rows[i].name) return false;
+      if (!tick || tick.disabled || tick.checked !== !!rows[i].default) return false;
+    }
+    return true;
+  }
   function focusRecipeRow() {
     var rows = document.querySelectorAll("#recipe-files .recipe-file-row");
     for (var i = 0; i < rows.length; i++) {
