@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import copy
 import os
+import re
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from sparksi import compat, protect
 
@@ -558,6 +561,13 @@ class Config:
             **protect.agent_values(),
         }
 
+    def effective(self) -> dict[str, Any]:
+        """The settings in force: built-in defaults merged with the file, secrets redacted.
+
+        Shown by ``sparksi config show``. A copy; the live settings are not shared.
+        """
+        return redact(copy.deepcopy(self.raw))
+
     def public(self) -> dict[str, Any]:
         """Display values for ``GET /api/config``.
 
@@ -581,16 +591,254 @@ class Config:
         return out
 
 
+# Top-level tables the rest of the code reads with ``.get``. A file that makes one of
+# them a string or list would fail later, far from the file, so it is refused at load.
+_TABLES = ("controller", "engines", "archive", "paths", "extra_machines", "compat", "protect", "services")
+
+# A key is secret when, with "-" read as "_" and an optional plural "s", it ends in one of these.
+_SECRET_KEY = re.compile(r"(token|secret|password|passwd|credential|api_?key|private_?key)s?$", re.IGNORECASE)
+# User info is whatever sits between two slashes (or backslashes) and the last "@" of the
+# authority, so "http://u:p@h", "http:\\\\u:p@h", "//u:p@h" and "http:///u:p@h" all match.
+_URL_USER = re.compile(r"(?<=[/\\][/\\])[^/\\?#]+@")
+_URLISH = re.compile(r"[/\\]{2}|%2f%2f|%5c", re.IGNORECASE)
+# "=" percent-encoded up to five times (%3D, %253D, ...). The repeat is bounded on purpose:
+# an open-ended "(?:25)*" is rescanned from every "%" and goes quadratic on "%25%25%25...".
+_ENCODED_EQ = r"%(?:25){0,4}3d"
+_URL_PARAM = re.compile(
+    rf"(?P<sep>[?&;#])\s*(?P<name>(?:(?!=|{_ENCODED_EQ})[^&;#?\s])+)(?P<eq>\s*(?:=|{_ENCODED_EQ}))(?P<value>[^&;#?]*)",
+    re.IGNORECASE,
+)
+REDACTED = "<redacted>"
+# A site file larger than this is refused (a real one is a few KiB).
+MAX_CONFIG_BYTES = 1024 * 1024
+_SIGNED_URL = re.compile(r"(signature|^sig)$", re.IGNORECASE)
+_VALUE_END = re.compile(r"[&;#]")
+# No real parameter name is this long. Anything longer is treated as a secret name (see
+# _is_secret_param), so a crafted name can neither cost time nor hide a value.
+MAX_PARAM_NAME = 256
+# A value that still needs decoding after this many levels of nesting is hidden whole.
+_MAX_NESTING = 2
+
+
+def _is_secret_key(key: str) -> bool:
+    return bool(_SECRET_KEY.search(key.replace("-", "_")))
+
+
+def _unquote_all(text: str) -> str:
+    """Percent-decode until nothing changes (at most a few rounds), so %2574oken reads as token."""
+    for _ in range(5):
+        decoded = unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
+def _over_encoded(decoded: str) -> bool:
+    """True when five rounds of decoding were not enough: nobody encodes a value that deep for a good reason."""
+    return unquote(decoded) != decoded
+
+
+def _is_secret_param(name: str) -> bool:
+    """A URL parameter name is secret when a key of that name would be, or it is a signature."""
+    if len(name) > MAX_PARAM_NAME:
+        return True  # fail closed: not a real name, so hide its value rather than guess
+    name = _unquote_all(name).strip()
+    # token[], token[0], auth[token]: the base and every bracketed part are names too. The
+    # name is at most MAX_PARAM_NAME long here (before decoding), so this is a short split.
+    parts = [name, *name.replace("]", "").split("[")]
+    return any(_is_secret_key(part) for part in parts) or bool(_SIGNED_URL.search(name.replace("-", "_")))
+
+
+def _scrub(text: str, *, url: bool, depth: int = 0) -> str:
+    """Hide URL user info and the value of every secret-named parameter in ``text``.
+
+    ``url`` says the text is a URL (or sits inside one); parameters are only looked for then.
+    A secret value runs to the next ``&``, ``;`` or ``#``, whatever it contains. A value
+    that, once percent-decoded, itself holds a secret (a ``next=`` redirect) is hidden whole;
+    one that still needs decoding after ``_MAX_NESTING`` levels is hidden whole too. Every
+    step reads each character a bounded number of times, so the time is linear in the text.
+    """
+    text = _URL_USER.sub(REDACTED + "@", text)
+    if not url:
+        return text
+    out: list[str] = []
+    pos = 0
+    while True:
+        match = _URL_PARAM.search(text, pos)
+        if match is None:
+            out.append(text[pos:])
+            return "".join(out)
+        start, end = match.start("value"), match.end("value")
+        if _is_secret_param(match["name"]):
+            stop = _VALUE_END.search(text, start)
+            end = stop.start() if stop else len(text)
+        elif start != end:
+            value = match["value"]
+            decoded = _unquote_all(value)
+            if decoded != value and (
+                depth >= _MAX_NESTING
+                or _over_encoded(decoded)
+                or _scrub("?" + decoded, url=True, depth=depth + 1) != "?" + decoded
+            ):
+                end = match.end("value")
+            else:
+                start = end  # leave the value alone
+        out.append(text[pos:start])
+        if start != end:
+            out.append(REDACTED)
+        pos = max(end, match.end())
+
+
+def _redact_text(text: str) -> str:
+    """Hide secrets in a string that may be a URL (user info, secret parameters, encoded forms)."""
+    urlish = bool(_URLISH.search(text))
+    out = _scrub(text, url=urlish)
+    if out == text:  # nothing found in the plain text; look through percent-encoding
+        decoded = _unquote_all(text)
+        if decoded != text and (
+            _over_encoded(decoded) or (_URLISH.search(decoded) and _scrub(decoded, url=True) != decoded)
+        ):
+            return REDACTED
+    return out
+
+
+def redact(value: Any, key: str = "", secret: bool = False) -> Any:
+    """A copy of a settings value with secrets hidden.
+
+    Everything not empty and not a boolean is replaced when it sits under a key that
+    ends in token, secret, password, passwd, credential, api_key or private_key, with
+    ``-`` read as ``_`` and an optional plural ``s`` (``x-api-key``, ``tokens``).
+    That covers text, numbers, list items, and every value inside a table with such
+    a name (``[credentials]``). User info in a URL is dropped from every string, and
+    so is the value of a query or fragment parameter with such a name. No
+    key in the shipped settings holds a secret; this covers a site that adds one.
+    """
+    secret = secret or _is_secret_key(key)
+    if isinstance(value, dict):
+        return {k: redact(v, str(k), secret) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(item, key, secret) for item in value]
+    if value is None or isinstance(value, bool) or value == "":
+        return value
+    if secret:
+        return REDACTED
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _shape_problems(raw: dict[str, Any]) -> list[str]:
+    return [
+        f"sparksi.toml [{name}] must be a table"
+        for name in _TABLES
+        if name in raw and not isinstance(raw[name], dict)
+    ]
+
+
+class ConfigFileError(ValueError):
+    """The path is not a usable file; the message says why and carries no file name."""
+
+
+def _read_site_file(path: Path) -> dict[str, Any]:
+    """Parse one regular file of at most ``MAX_CONFIG_BYTES``; refuse anything else.
+
+    A device such as ``/dev/zero`` or a pipe is refused before it is opened. A
+    symlink to a regular file is followed.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        mode = stat.S_IFREG  # let open() report the real problem
+    if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+        raise ConfigFileError("not a regular file (a device, pipe or socket cannot be a config file)")
+    with open(path, "rb") as fh:
+        data = fh.read(MAX_CONFIG_BYTES + 1)
+    if len(data) > MAX_CONFIG_BYTES:
+        raise ConfigFileError(f"the file is larger than {MAX_CONFIG_BYTES / (1024 * 1024):g} MiB, the most a config file may be")
+    return tomllib.loads(data.decode("utf-8"))
+
+
 def load(path: Path | None = None) -> Config:
     path = path or config_path()
     if path is None:
         return Config()
-    with open(path, "rb") as fh:
-        raw = tomllib.load(fh)
+    raw = _read_site_file(path)
+    bad = _shape_problems(raw)
+    if bad:
+        raise ValueError("; ".join(bad))
     return Config(raw, source=path)
 
 
-CFG = load()
+def _starts_with_bom(path: Path | None) -> bool:
+    try:
+        with open(path, "rb") as fh:  # type: ignore[arg-type]
+            return fh.read(3) == b"\xef\xbb\xbf"
+    except (OSError, TypeError):
+        return False
+
+
+def check(path: Path | None = None) -> tuple[Config | None, list[str]]:
+    """Load the site file without raising: ``(config, [])``, or ``(None, messages)``.
+
+    Without a path the usual search order applies, and no file is not a problem.
+    Every way a file can be unusable (unreadable, not TOML, not UTF-8, nested too
+    deeply, a bad table or node) and every way the search can fail (a ``~user`` that
+    does not exist, a deleted working directory) comes back as a message that says
+    what failed.
+    """
+    target: Path | None = None
+    try:
+        target = Path(path).expanduser() if path else config_path()
+        return load(target), []
+    except RecursionError:
+        return None, [f"{target}: the file is nested too deeply to read"]
+    except MemoryError:
+        return None, [f"{target}: the file is too large to read"]
+    except ConfigFileError as exc:
+        return None, [f"{target}: {exc}"]
+    except RuntimeError as exc:  # Path.expanduser: no such user or no home directory
+        explicit = os.environ.get("SPARKSI_CONFIG")
+        named = f" from {path}" if path else f" from SPARKSI_CONFIG={explicit!r}" if explicit else ""
+        return None, [f"cannot work out the config path{named}: {exc}"]
+    except OSError as exc:
+        if target is None:  # config_path() failed
+            why = "the working directory no longer exists" if isinstance(exc, FileNotFoundError) else (exc.strerror or str(exc))
+            return None, [f"cannot look for sparksi.toml: {why}"]
+        return None, [f"cannot read {target}: {exc.strerror or exc}"]
+    except KeyError as exc:
+        return None, [f"{target}: missing key {exc.args[0]!r}"]
+    except ValueError as exc:  # includes tomllib.TOMLDecodeError and UnicodeDecodeError
+        text = str(exc)
+        if _starts_with_bom(target):
+            return None, [f"{target}: the file starts with a UTF-8 byte order mark (BOM); save it without one ({text})"]
+        # Load messages open with the generic file name; say which file it is.
+        text = f"{target}{text[len('sparksi.toml'):]}" if text.startswith("sparksi.toml ") else f"{target}: {text}"
+        return None, [text]
+    except (TypeError, AttributeError) as exc:
+        return None, [f"{target}: a value has the wrong type ({exc})"]
+
+
+def _bootstrap() -> tuple[Config, list[str]]:
+    """Load the site file at import. An invalid file must not raise here.
+
+    The built-in example config is kept so every import succeeds, and one warning
+    lists the problems. The CLI and the monitor read ``CFG_ERRORS`` and refuse to
+    run, so nothing acts on the placeholder nodes.
+    """
+    cfg, errors = check()
+    if cfg is not None:
+        return cfg, []
+    from sparksi.log import logger
+
+    logger().warning("ignoring invalid config: %s", "; ".join(errors))
+    return Config(), errors
+
+
+_boot, _boot_errors = _bootstrap()
+CFG = _boot
+# Problems found when the site file was loaded at import; empty when it is valid.
+CFG_ERRORS: list[str] = list(_boot_errors)
 
 
 def apply_agent(cfg: Config | None = None) -> None:
@@ -614,5 +862,6 @@ def reload(path: Path | None = None) -> Config:
     """
     fresh = load(path)
     CFG.__init__(fresh.raw, source=fresh.source)
+    CFG_ERRORS.clear()
     apply_agent(CFG)
     return CFG

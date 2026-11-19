@@ -16,7 +16,8 @@ from typing import Any
 from sparksi import protect
 from sparksi import __version__
 from sparksi.catalog import CatalogError, load_catalog
-from sparksi.config import CFG
+from sparksi import compat
+from sparksi.config import CFG, CFG_ERRORS, check
 from sparksi.lock import Lock, LockedError
 from sparksi.apply import (
     build_plan,
@@ -451,6 +452,80 @@ def cmd_install_unit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _config_target(args: argparse.Namespace) -> Path | None:
+    """The file ``--file`` names; None means the one the usual search order finds."""
+    return Path(args.file) if getattr(args, "file", "") else None
+
+
+def _config_warnings(raw: dict[str, Any]) -> list[str]:
+    """Things in a valid file that still work but should change."""
+    out: list[str] = []
+    paths = raw.get("paths") if isinstance(raw.get("paths"), dict) else {}
+    for new, old in compat.LEGACY_PATH_KEYS.items():
+        if old in paths and new not in paths:
+            out.append(f"[paths] {old} is deprecated; use [paths] {new}")
+    section = raw.get("protect") if isinstance(raw.get("protect"), dict) else {}
+    names = section.get("presets")
+    if isinstance(names, str):
+        names = [names]
+    if names is None:
+        names = []
+    if not isinstance(names, list):
+        out.append(f"[protect] presets must be a list of names, not {type(names).__name__}")
+        names = []
+    for name in names:
+        if not isinstance(name, str):
+            out.append(f"[protect] presets has an item that is not a name: {name!r}")
+        elif name.strip() not in protect.PRESETS:
+            out.append(f"[protect] presets names an unknown preset {name.strip()!r}")
+    return out
+
+
+def cmd_config_validate(args: argparse.Namespace) -> int:
+    """Check a site file. Reads it and nothing else: no ssh, no controller, no write."""
+    cfg, errors = check(_config_target(args))
+    if cfg is None:
+        for line in errors:
+            print(f"error: {line}", file=sys.stderr)
+        return 1
+    if cfg.source is None:
+        print(
+            "no sparksi.toml found (looked at $SPARKSI_CONFIG, $XDG_CONFIG_HOME/sparksi/sparksi.toml "
+            "and ./config/sparksi.toml); Sparksi would run on the built-in example",
+            file=sys.stderr,
+        )
+        return 1
+    for line in _config_warnings(cfg.file_raw):
+        print(f"warning: {line}", file=sys.stderr)
+    sparks = ", ".join(f"{node.id} ({role})" for role, node in cfg.role_nodes())
+    count = len(cfg.nodes)
+    print(f"ok: {cfg.source}: {count} Spark{'s' if count != 1 else ''}: {sparks}")
+    return 0
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """Print the settings in force as JSON. Secrets are redacted."""
+    cfg, errors = check(_config_target(args))
+    if cfg is None:
+        for line in errors:
+            print(f"error: {line}", file=sys.stderr)
+        return 1
+    try:
+        text = json.dumps(cfg.effective(), indent=2, sort_keys=True, default=str)
+    except RecursionError:
+        print(f"error: {cfg.source}: the settings are nested too deeply to print", file=sys.stderr)
+        return 1
+    if cfg.source is None:
+        print("no sparksi.toml found; showing the built-in example", file=sys.stderr)
+    print(text)
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    print("usage: sparksi config {validate,show} [--file PATH]", file=sys.stderr)
+    return 2
+
+
 def cmd_refuse(verb: str) -> int:
     print(refuse_mutator(verb), file=sys.stderr)
     try:
@@ -615,6 +690,16 @@ def build_parser() -> argparse.ArgumentParser:
     iu.add_argument("--controller", default="100.64.0.1:7501", help="announcer SPARKSI_CONTROLLER=host:port")
     iu.set_defaults(func=cmd_install_unit)
 
+    cf = sub.add_parser("config", help="check or show sparksi.toml (reads only)")
+    cf.set_defaults(func=cmd_config)
+    cf_sub = cf.add_subparsers(dest="config_op")
+    cv = cf_sub.add_parser("validate", help="check the file; exit 1 and name each problem when it is unusable")
+    cv.add_argument("--file", default="", help="file to check (default: the one Sparksi would load)")
+    cv.set_defaults(func=cmd_config_validate)
+    cs = cf_sub.add_parser("show", help="print the settings in force as JSON, secrets redacted")
+    cs.add_argument("--file", default="", help="file to read (default: the one Sparksi would load)")
+    cs.set_defaults(func=cmd_config_show)
+
     for verb in MUTATOR_VERBS:
         m = sub.add_parser(verb, help="not implemented")
         m.set_defaults(func=lambda args, v=verb: cmd_refuse(v))
@@ -628,6 +713,10 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "cmd", None):
         parser.print_help()
         return 2
+    if args.cmd != "config" and CFG_ERRORS:
+        # The import kept the built-in example so it could finish. Do not act on it.
+        print("\n".join(CFG_ERRORS), file=sys.stderr)
+        return 1
     try:
         return int(args.func(args))
     except CatalogError as e:
