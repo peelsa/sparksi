@@ -36,3 +36,7 @@ one line: what was missed, and the check that would have caught it.
 - Cache `serving_state._recipe_served` by recipe file mtime instead of reading every saved recipe on each `/api/runs` that needs a container to decide.
 - `tests/test_refresh_after_write.py`: wait on the refresh thread's done event instead of the fixed 4 s `_wait_for` budget, which a scheduler stall can exhaust.
 - With a bad `sparksi.toml` the problem prints twice (the import-time WARNING and the exit message); keep one. Also `python -m sparksi.stage_feed` and `evict` do not go through `cli.main`, so a bad file is not refused there (untested).
+- A run record can stay `ready` after both of its containers exit outside Sparksi; mark it gone (or stale) when every side's container has left the fresh container lists.
+- `heartbeat.answer_probe` answers a loopback probe from loopback and wildcard listeners only; give it the agent's own-tailnet fallback so a beat and an SSH probe agree on a server bound to the tailnet address.
+- A library row whose served name answers but whose pinned container is not running (an outside launch) still shows not serving; showing it needs a display-only flag kept out of the `serving`/`live` keys that drive library Stop and switch eviction, so Sparksi never runs a catalog stop command against a container it did not start.
+- `monitor.models._engine_port_tp` and the `monitor/peer.py` shell collector still read TP only from `TP=` / `TENSOR_PARALLEL_SIZE=`; give them the announcer's `--tp`, `--tensor-parallel-size` and `WORLD_SIZE` forms.

@@ -152,7 +152,20 @@ def _probe(req: dict) -> dict:
     disk = shutil.disk_usage("/")
     ports = [int(p) for p in (req.get("ports") or [])]
     address = _probe_address(str(req.get("listen_host") or ""))
-    listening = {str(p): _port_open(p, address) for p in ports}
+    ips = _ips()
+    # A server bound only to this Spark's own tailnet address is closed on
+    # loopback. Try that one address too; never another host, never an
+    # off-limits port.
+    own = _own_tailnet(ips) if address == "127.0.0.1" else ""
+    listening: dict[str, bool] = {}
+    dial: dict[str, str] = {}
+    for p in ports:
+        if _port_open(p, address):
+            listening[str(p)], dial[str(p)] = True, address
+        elif own and not _off_limits(p) and _port_open(p, own):
+            listening[str(p)], dial[str(p)] = True, own
+        else:
+            listening[str(p)] = False
     paths = {}
     for raw in req.get("paths") or []:
         paths[str(raw)] = _path_stat(str(raw))
@@ -162,9 +175,10 @@ def _probe(req: dict) -> dict:
     for port, up in listening.items():
         if up:
             path = http_paths.get(port) or "/health"
-            identity = _http_identity(int(port), path, address)
+            via = dial.get(port, address)
+            identity = _http_identity(int(port), path, via)
             if identity.get("status") != 200 and path != "/v1/models" and port not in http_paths:
-                identity = _http_identity(int(port), "/v1/models", address)
+                identity = _http_identity(int(port), "/v1/models", via)
             http[port] = identity
     out: dict = {
         "ok": True,
@@ -180,7 +194,7 @@ def _probe(req: dict) -> dict:
         "listening": listening,
         "http": http,
         "containers": _running_containers(),
-        "ips": _ips(),
+        "ips": ips,
         "paths": paths,
         "gpu": _gpu(),
     }
@@ -615,6 +629,12 @@ def _ips() -> dict:
         elif any(ip.startswith(p) for p in _CFG["direct_prefixes"]):
             out["direct"].append(ip)
     return out
+
+
+def _own_tailnet(ips: dict | None) -> str:
+    """This Spark's own tailnet IPv4 from ``_ips()``, or "" when it has none."""
+    text = str((ips or {}).get("tailscale") or "").strip()
+    return text if text and _probe_address(text) == text else ""
 
 
 def _port_open(port: int, host: str = "127.0.0.1") -> bool:
