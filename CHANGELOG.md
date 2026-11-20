@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A Spark card for a process no Sparksi run owns, such as an engine started outside Sparksi, shows its client URL with Copy again, as a run does. The worker of a pair shows "Head endpoint" and the head's URL. Loopback and wildcard addresses are never shown.
 - A two-Spark engine started outside Sparksi, with the same container name and port on both Sparks and no TP setting or -head/-worker suffix, now shows on both Spark cards instead of the worker reading "Nothing running".
 - The node probe also checks the Spark's own tailnet address when a model port is closed on loopback, so a server bound only to that address is seen. Off-limits ports are never tried there. A port where a catalog row declares served names is asked `/v1/models`, so the served name can be matched.
 - A library model served by an engine Sparksi did not start (its weights mounted by a running container, its served name answering, its catalog containers not running) now shows as serving with "Started outside a Sparksi run". Sparksi never stops, restarts or replaces it: Unload and Restart with changes are greyed, and library Stop, switch, run and stopping an unmanaged container are refused with a clear message.
