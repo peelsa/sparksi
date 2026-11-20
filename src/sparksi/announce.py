@@ -357,8 +357,17 @@ def _budget() -> dict:
     }
 
 
+_TP_FLAGS = ("--tp", "--tensor-parallel-size")
+
+
 def _port_from_blob(blob: str) -> tuple[int, int]:
-    port = tp = 0
+    """Declared port and tensor-parallel size from a container's Env and Cmd.
+
+    TP comes from ``TP=``, ``TENSOR_PARALLEL_SIZE=``, ``--tp`` or
+    ``--tensor-parallel-size`` (spaced or ``=``). ``WORLD_SIZE=`` counts only
+    when none of those is set.
+    """
+    port = tp = world = 0
     cmd = False
     prev = ""
     for line in blob.splitlines():
@@ -373,17 +382,20 @@ def _port_from_blob(blob: str) -> tuple[int, int]:
                 tp = int(line[3:])
             elif line.startswith("TENSOR_PARALLEL_SIZE=") and line.split("=", 1)[1].isdigit():
                 tp = int(line.split("=", 1)[1])
+            elif line.startswith("WORLD_SIZE=") and line.split("=", 1)[1].isdigit():
+                world = int(line.split("=", 1)[1])
         else:
+            flag, eq, value = line.partition("=")
             if line.startswith("--port=") and line[7:].isdigit():
                 port = int(line[7:])
             elif prev == "--port" and line.isdigit():
                 port = int(line)
-            elif line.startswith("--tp=") and line[5:].isdigit():
-                tp = int(line[5:])
-            elif prev == "--tp" and line.isdigit():
+            elif eq and flag in _TP_FLAGS and value.isdigit():
+                tp = int(value)
+            elif prev in _TP_FLAGS and line.isdigit():
                 tp = int(line)
         prev = line
-    return port, tp
+    return port, tp or world
 
 
 # Container ID -> its inspect blob (Env and Cmd). A container's ID is new each

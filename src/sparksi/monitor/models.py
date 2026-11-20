@@ -295,16 +295,40 @@ def read_local_engines():
     return rows
 
 
-def _apply_engine_span(rec, engines, containers, fresh, worker_answers):
+def _peer_twin(eng, peer_engines):
+    """The peer engine with this engine's exact name and declared port, or None.
+
+    An engine started outside Sparksi may carry no TP and no -head / -worker
+    suffix: the same container name declaring the same port on both Sparks is
+    then the only sign it is one job. A peer engine on another port is not it.
+    """
+    port = eng.get("port")
+    name = eng.get("name") or ""
+    # Sparksi names its own pairs -head / -worker; the same sparksi- name on two
+    # Sparks is two single-Spark runs (one may still be loading), never a pair.
+    if not port or not name or name.startswith("sparksi-"):
+        return None
+    for peer in peer_engines or []:
+        if peer.get("name") == name and peer.get("port") == port:
+            return peer
+    return None
+
+
+def _apply_engine_span(rec, engines, containers, fresh, worker_answers, peer_engines=None):
     """Pair a live head container with its worker by PORT and name stem.
 
     `pair-exl3-head` + `pair-exl3-worker`, or the same name on both hosts
-    (`vllm-fn`). A stale peer poll leaves worker_up unknown.
+    (`vllm-fn`). The same name on both hosts pairs when the head says TP>=2
+    or when the peer reports that name declaring the same port. Only a head
+    that answers HTTP pairs this way, and only when the peer does not answer
+    on that port itself. A stale peer poll leaves worker_up unknown.
     """
     if worker_answers or rec.get("port") == 8001 or not PEER_HOST:
         return rec
     for eng in engines or []:
-        if eng.get("port") != rec.get("port") or not _is_multi(eng):
+        if eng.get("port") != rec.get("port"):
+            continue
+        if not _is_multi(eng) and _peer_twin(eng, peer_engines) is None:
             continue
         partner = _partner(eng["name"], containers) if fresh else None
         rec["span"] = [HEAD_HOST, PEER_HOST]
@@ -429,6 +453,17 @@ def discover_loaded(head=None, worker=None, extras=None):
     containers = worker.get("containers") or [] if worker_fresh else []
     worker_http = worker.get("http") or {} if worker_fresh else {}
     engines = head.get("engines") or []
+    # The peer's last engine list, fresh or not: it only names a same-name twin.
+    # Freshness still decides worker_up (unknown while the peer is stale). A
+    # port the peer last answered HTTP on is its own model, never a twin.
+    peer_answered = {
+        int(port) for port, info in (worker.get("http") or {}).items()
+        if str(port).isdigit() and isinstance(info, dict) and (info.get("served") or info.get("metrics"))
+    }
+    peer_engines = [
+        eng for eng in worker.get("engines") or []
+        if isinstance(eng, dict) and eng.get("port") not in peer_answered
+    ]
 
     known, _ports = models_from_text(head.get("truth") or "")
     by_port = {m["port"]: m for m in known}
@@ -449,7 +484,7 @@ def discover_loaded(head=None, worker=None, extras=None):
         )
         rec = _apply_span(rec, meta, containers, worker_fresh, bool(worker_answers))
         rec = _apply_engine_span(
-            rec, engines, containers, worker_fresh, bool(worker_answers)
+            rec, engines, containers, worker_fresh, bool(worker_answers), peer_engines
         )
         loaded.append(rec)
         seen.add(rec["port"])

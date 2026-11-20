@@ -17,7 +17,7 @@ from sparksi.activity import store as activity_store
 from sparksi.config import CFG, env
 from sparksi.health import DEFAULT_HEALTH_TIMEOUT_S
 from sparksi.launch import monitor_loaded, plan_drop, plan_run, plan_stage, plan_stop, plan_switch
-from sparksi.library import catalog_serving, fleet, row_by_id
+from sparksi.library import catalog_serving, external_refusal, fleet, row_by_id
 from sparksi.log import logger
 from sparksi.never import launcher_refusal
 from sparksi.remote import SshRunner
@@ -730,7 +730,7 @@ def start_run(catalog, row_id: str, *, lock_on: bool, runner=None) -> dict[str, 
     row = row_by_id(snap["library"], row_id)
     if not row:
         return {"verdict": "REFUSE", "reasons": [f"unknown library id {row_id}"]}
-    plan = plan_run(catalog, row, snap["probes"], lock_on=lock_on)
+    plan = plan_run(catalog, row, snap["probes"], lock_on=lock_on, rows=snap["library"])
     if plan["verdict"] != "READY":
         return plan
     return _start_argv(catalog, "run", plan, runner)
@@ -743,6 +743,10 @@ def start_stop(catalog, row_id: str, *, lock_on: bool, runner=None) -> dict[str,
         return {"verdict": "REFUSE", "reasons": [f"unknown library id {row_id}"]}
     if load_in_progress():
         return {"verdict": "REFUSE", "reasons": ["still loading; stop does not interrupt a load"]}
+    outside = external_refusal(row)
+    if outside:
+        # An engine Sparksi did not start: no catalog stop command and no container action.
+        return {"verdict": "REFUSE", "external": True, "stopped": False, "error": outside, "reasons": [outside]}
     if row.get("serving") is False:
         # Not running: no stop command runs, so stopped containers and other harnesses are left alone.
         name = row.get("title") or row_id

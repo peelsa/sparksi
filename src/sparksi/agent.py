@@ -152,7 +152,20 @@ def _probe(req: dict) -> dict:
     disk = shutil.disk_usage("/")
     ports = [int(p) for p in (req.get("ports") or [])]
     address = _probe_address(str(req.get("listen_host") or ""))
-    listening = {str(p): _port_open(p, address) for p in ports}
+    ips = _ips()
+    # A server bound only to this Spark's own tailnet address is closed on
+    # loopback. Try that one address too; never another host, never an
+    # off-limits port.
+    own = _own_tailnet(ips) if address == "127.0.0.1" else ""
+    listening: dict[str, bool] = {}
+    dial: dict[str, str] = {}
+    for p in ports:
+        if _port_open(p, address):
+            listening[str(p)], dial[str(p)] = True, address
+        elif own and not _off_limits(p) and _port_open(p, own):
+            listening[str(p)], dial[str(p)] = True, own
+        else:
+            listening[str(p)] = False
     paths = {}
     for raw in req.get("paths") or []:
         paths[str(raw)] = _path_stat(str(raw))
@@ -162,9 +175,10 @@ def _probe(req: dict) -> dict:
     for port, up in listening.items():
         if up:
             path = http_paths.get(port) or "/health"
-            identity = _http_identity(int(port), path, address)
+            via = dial.get(port, address)
+            identity = _http_identity(int(port), path, via)
             if identity.get("status") != 200 and path != "/v1/models" and port not in http_paths:
-                identity = _http_identity(int(port), "/v1/models", address)
+                identity = _http_identity(int(port), "/v1/models", via)
             http[port] = identity
     out: dict = {
         "ok": True,
@@ -180,7 +194,7 @@ def _probe(req: dict) -> dict:
         "listening": listening,
         "http": http,
         "containers": _running_containers(),
-        "ips": _ips(),
+        "ips": ips,
         "paths": paths,
         "gpu": _gpu(),
     }
@@ -188,6 +202,8 @@ def _probe(req: dict) -> dict:
         out["container_ports"] = _sparksi_container_ports(out.get("containers"), address)
     if req.get("unmanaged_ports"):
         out["unmanaged_containers"] = _unmanaged_container_ports(out.get("containers"), address)
+    if req.get("mounts"):
+        out["mounts"] = _container_mounts(out.get("containers"))
     if req.get("scan_releases"):
         out["releases"] = _scan_releases() if reachable else []
     flat = req.get("scan_flat")
@@ -591,6 +607,34 @@ def _running_containers() -> list[str] | None:
     return sorted(n for n in proc.stdout.split() if n)
 
 
+def _container_mounts(names: list[str] | None) -> dict[str, list[str]] | None:
+    """Host paths each running container mounts (``docker inspect``, read-only).
+
+    None when docker could not be asked. The controller uses it to tell which
+    model's weights an engine it did not start is serving.
+    """
+    if names is None:
+        return None
+    if not names:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Name}}{{range .Mounts}}\t{{.Source}}{{end}}", *names[:32]],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 and not proc.stdout.strip():
+        return None
+    out: dict[str, list[str]] = {}
+    for line in proc.stdout.splitlines():
+        bits = line.split("\t")
+        name = bits[0].strip().lstrip("/")
+        if name:
+            out[name] = [b.strip() for b in bits[1:] if b.strip().startswith("/")][:32]
+    return out
+
+
 def _ips() -> dict:
     """LAN (default-route interface), Tailscale and ConnectX direct-link IPv4s, read live."""
     out: dict = {"lan": None, "tailscale": None, "direct": []}
@@ -615,6 +659,12 @@ def _ips() -> dict:
         elif any(ip.startswith(p) for p in _CFG["direct_prefixes"]):
             out["direct"].append(ip)
     return out
+
+
+def _own_tailnet(ips: dict | None) -> str:
+    """This Spark's own tailnet IPv4 from ``_ips()``, or "" when it has none."""
+    text = str((ips or {}).get("tailscale") or "").strip()
+    return text if text and _probe_address(text) == text else ""
 
 
 def _port_open(port: int, host: str = "127.0.0.1") -> bool:
