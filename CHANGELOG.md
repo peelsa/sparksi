@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A two-Spark engine started outside Sparksi, with the same container name and port on both Sparks and no TP setting or -head/-worker suffix, now shows on both Spark cards instead of the worker reading "Nothing running".
+- The node probe also checks the Spark's own tailnet address when a model port is closed on loopback, so a server bound only to that address is seen. Off-limits ports are never tried there. A port where a catalog row declares served names is asked `/v1/models`, so the served name can be matched.
+- A library model served by an engine Sparksi did not start (its weights mounted by a running container, its served name answering, its catalog containers not running) now shows as serving with "Started outside a Sparksi run". Sparksi never stops, restarts or replaces it: Unload and Restart with changes are greyed, and library Stop, switch, run and stopping an unmanaged container are refused with a clear message.
 - Added `sparksi config validate` and `sparksi config show`. `validate` checks `sparksi.toml` and exits 1 with each problem; `show` prints the settings in force as JSON with secrets redacted (keys such as `x-api-key`, `tokens` and `private-key`, and secret-named or signature URL parameters, also when percent-encoded, included).
 - An unusable `sparksi.toml` (not TOML, not readable, not a regular file, larger than 1 MiB, nested too deeply, a bad node, a table written as a string such as `controller = "x"`, or a config path that cannot be worked out) no longer raises a traceback when Sparksi is imported. The problem is logged once. Every `sparksi` command except `sparksi config ...`, and also `sparksi-monitor`, now prints the message and exits 1 instead of running on the built-in example. A top-level table written as a string is now refused at load instead of failing later.
 

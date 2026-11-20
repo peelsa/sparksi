@@ -252,6 +252,28 @@ def _model_suffix(path: str) -> tuple[str, str] | None:
     return None
 
 
+def _external_container_refusal(cat: dict[str, Any], runner: Any, host: str, container: str) -> str | None:
+    """Refuse a container action on an engine that serves a library row from outside Sparksi.
+
+    Fails closed: when the library cannot be read, nothing is stopped.
+    """
+    from sparksi.library import external_refusal, fleet
+
+    try:
+        rows = fleet(cat, runner)["library"]
+    except Exception:  # noqa: BLE001 — no library answer: refuse rather than guess
+        return "Could not check whether this engine serves a library model; nothing was stopped."
+    wanted = {host, CFG.id_for(host)}
+    for row in rows:
+        engine = row.get("external_engine") if row.get("external") else None
+        if not isinstance(engine, dict):
+            continue
+        for side, names in (engine.get("containers") or {}).items():
+            if {side, CFG.id_for(side)} & wanted and container in (names or []):
+                return external_refusal(row)
+    return None
+
+
 def _named_route(path: str) -> tuple[str, str, str] | None:
     """/api/models/<id>/recipes[/<name>[/default|/rename]] -> (id, name, action)."""
     parts = path.strip("/").split("/")
@@ -1241,6 +1263,9 @@ class Handler(BaseHTTPRequestHandler):
         item = unmanaged.same_item(items, host, port, container)
         if item is None or not item.get("stoppable"):
             return self._json(409, {"error": "That model changed or is not stoppable now; reload and check again.", "stopped": False})
+        outside = _external_container_refusal(cat, runner, host, container)
+        if outside:
+            return self._json(409, {"error": outside, "stopped": False, "external": True})
         result = runner.invoke(host, {"op": "stop_unmanaged", "container": container, "port": port}, timeout=90)
         if not isinstance(result, dict):
             result = {"ok": False, "error": "no answer"}

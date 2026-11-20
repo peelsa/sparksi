@@ -2259,6 +2259,10 @@
     return ok;
   }
   function stopLoaded(id, label, both, asked, noteId) {
+    if (externalRow(id) !== null && !runIsLive(runFor(id))) {
+      setText(noteId || "lock-msg", EXTERNAL_TIP);
+      return;
+    }
     if (lockOn()) {
       setText("lock-msg", "Unlock first, then Stop.");
       return;
@@ -3261,6 +3265,10 @@
     var hostId = roleId(role);
     var picked = null;
     libraryRows.forEach(function (row) { if (row.id === harnessPick) picked = row; });
+    if (picked && picked.external === true) {
+      setText("lock-msg", EXTERNAL_TIP);
+      return;
+    }
     if (picked && picked.port_live && picked.live && picked.launch && picked.launch.stop && seatedOn(picked, role)) {
       stopLoaded(picked.id, picked.title || picked.id, false);
       return;
@@ -3271,9 +3279,14 @@
       var id = libraryIdFor(mod);
       if (id) wanted[id] = true;
     });
+    var outsideHit = libraryRows.filter(function (row) { return wanted[row.id] && row.external === true; });
     var live = libraryRows.filter(function (row) {
-      return wanted[row.id] && row.launch && row.launch.stop;
+      return wanted[row.id] && row.launch && row.launch.stop && row.external !== true;
     });
+    if (!live.length && outsideHit.length) {
+      setText("lock-msg", EXTERNAL_TIP);
+      return;
+    }
     var target = live.length ? live[0] : null;
     if (!target) {
       var video = videoRow();
@@ -3281,7 +3294,7 @@
     }
     if (!target) {
       libraryRows.forEach(function (row) {
-        if (row.port_live && row.live && row.launch && row.launch.stop && seatedOn(row, role)) target = row;
+        if (row.external !== true && row.port_live && row.live && row.launch && row.launch.stop && seatedOn(row, role)) target = row;
       });
     }
     if (!target) {
@@ -7647,15 +7660,32 @@
     }
     return false;
   }
+  /* external-start */
+  /* A library row an engine Sparksi did not start is serving. Display only: Sparksi never
+     stops, restarts or replaces it, and the server refuses those too. */
+  var EXTERNAL_TIP = "Started outside a Sparksi run. Stop it where it was started.";
+  function externalRow(id) {
+    var rows = (typeof libraryRows !== "undefined" && libraryRows) || [];
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].id === id && rows[i].external === true) return rows[i];
+    }
+    return null;
+  }
+  function cardExternal(card) {
+    if (!card || externalRow(card.id) === null) return false;
+    return !runIsLive(runFor(card.id));
+  }
+  /* external-end */
   function paintModelActions() {
     var card = selectedCard();
-    var off = !!card && !modelServing(card);
+    var outside = cardExternal(card);
+    var off = outside || (!!card && !modelServing(card));
     ["model-unload", "model-restart"].forEach(function (id) {
       var btn = el(id);
       if (!btn) return;
       btn.disabled = off;
       btn.setAttribute("aria-disabled", off ? "true" : "false");
-      btn.title = off ? "Not running" : "";
+      btn.title = outside ? EXTERNAL_TIP : (off ? "Not running" : "");
     });
   }
   /* overview-status-start */
@@ -7717,6 +7747,11 @@
     }
     if (state === "stale") {
       return { text: "Not confirmed", title: "The last report for this machine is stale.", failed: false };
+    }
+    var outside = cardExternal(card) ? externalRow(card.id) : null;
+    if (outside) {
+      var outPort = (outside.external_engine && outside.external_engine.port) || outside.port;
+      return { text: "Answering" + (outPort ? (" · port " + outPort) : "") + " · started outside Sparksi", title: EXTERNAL_TIP, failed: false };
     }
     var hits = [];
     ((lastMonitor && lastMonitor.loaded) || []).forEach(function (mod) {
@@ -9901,6 +9936,7 @@
   }
   function unloadModel() {
     var card = selectedCard();
+    if (cardExternal(card)) { setText("model-load-note", EXTERNAL_TIP); return; }
     if (card && !modelServing(card)) { setText("model-load-note", "Not running. Nothing to unload."); return; }
     var run = card && runFor(card.id);
     if (!runIsLive(run)) run = null;
@@ -9941,6 +9977,7 @@
   }
   function restartModel() {
     var card = selectedCard();
+    if (cardExternal(card)) { setText("model-load-note", EXTERNAL_TIP); return; }
     if (card && !modelServing(card)) { setText("model-load-note", "Not running. Use Load."); return; }
     var run = card && runFor(card.id);
     if (!runIsLive(run)) run = null;

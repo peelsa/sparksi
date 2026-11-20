@@ -202,6 +202,8 @@ def _probe(req: dict) -> dict:
         out["container_ports"] = _sparksi_container_ports(out.get("containers"), address)
     if req.get("unmanaged_ports"):
         out["unmanaged_containers"] = _unmanaged_container_ports(out.get("containers"), address)
+    if req.get("mounts"):
+        out["mounts"] = _container_mounts(out.get("containers"))
     if req.get("scan_releases"):
         out["releases"] = _scan_releases() if reachable else []
     flat = req.get("scan_flat")
@@ -603,6 +605,34 @@ def _running_containers() -> list[str] | None:
     if proc.returncode != 0:
         return None
     return sorted(n for n in proc.stdout.split() if n)
+
+
+def _container_mounts(names: list[str] | None) -> dict[str, list[str]] | None:
+    """Host paths each running container mounts (``docker inspect``, read-only).
+
+    None when docker could not be asked. The controller uses it to tell which
+    model's weights an engine it did not start is serving.
+    """
+    if names is None:
+        return None
+    if not names:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Name}}{{range .Mounts}}\t{{.Source}}{{end}}", *names[:32]],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 and not proc.stdout.strip():
+        return None
+    out: dict[str, list[str]] = {}
+    for line in proc.stdout.splitlines():
+        bits = line.split("\t")
+        name = bits[0].strip().lstrip("/")
+        if name:
+            out[name] = [b.strip() for b in bits[1:] if b.strip().startswith("/")][:32]
+    return out
 
 
 def _ips() -> dict:

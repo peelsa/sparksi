@@ -106,12 +106,23 @@ def local_path(row: dict[str, Any], host: str) -> str | None:
 
 
 def http_paths(rows: list[dict[str, Any]]) -> dict[str, str]:
-    """Per-port identity path; ports without one are asked /v1/models."""
+    """Per-port identity path.
+
+    A row's declared ``http`` path wins. A port where a row declares served names
+    is asked /v1/models, so the answer carries the names to match: /health returns
+    200 with no names. Other ports keep the agent's default (/health, then /v1/models).
+    """
     out: dict[str, str] = {}
+    served_ports: list[str] = []
     for row in rows:
-        path = (row.get("identity") or {}).get("http")
+        ident = row.get("identity") or {}
+        path = ident.get("http")
         if path and row.get("port"):
             out[str(row["port"])] = str(path)
+        elif ident.get("served") and row.get("port"):
+            served_ports.append(str(row["port"]))
+    for port in served_ports:
+        out.setdefault(port, "/v1/models")
     return out
 
 
@@ -121,7 +132,9 @@ def _probe_request(catalog: dict[str, Any], host: str, rows: list[dict[str, Any]
         p = local_path(row, host)
         if p:
             paths.append(p)
-    req: dict[str, Any] = {"op": "probe", "ports": probe_ports(), "paths": paths, "http_paths": http_paths(rows)}
+    req: dict[str, Any] = {
+        "op": "probe", "ports": probe_ports(), "paths": paths, "http_paths": http_paths(rows), "mounts": True,
+    }
     if host == CFG.archive_node:
         req["scan_releases"] = True
         flat_row = next((r for r in rows if r.get("archive_flat")), None)
@@ -166,6 +179,108 @@ def identity_check(row: dict[str, Any], probe: dict[str, Any] | None) -> tuple[b
     if ok and ident.get("container") and containers is not None:
         ok = ident["container"] in containers
     return ok, holder
+
+
+EXTERNAL_NOTE = "Started outside a Sparksi run"
+EXTERNAL_REFUSAL = "{title} was started outside a Sparksi run; Sparksi will not stop or replace it. Stop it where it was started."
+
+
+def _served_answers(row: dict[str, Any], probe: dict[str, Any] | None) -> bool:
+    """The row's declared served name answers on its port. Container names are not checked."""
+    probe = probe or {}
+    port = row.get("port")
+    ident = row.get("identity") or {}
+    served = ident.get("served")
+    if not port or ident.get("http") or not served:
+        return False
+    if not (probe.get("listening") or {}).get(str(port)):
+        return False
+    h = (probe.get("http") or {}).get(str(port)) or {}
+    if h.get("status") != 200:
+        return False
+    want = {str(x).lower() for x in ([served] if isinstance(served, str) else served)}
+    return any(str(m).lower() in want for m in h.get("models") or [])
+
+
+def _sparksi_containers(runs: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    """(host, container) of every run side that is not known stopped: Sparksi owns those."""
+    out: set[tuple[str, str]] = set()
+    for run in runs or []:
+        if not isinstance(run, dict) or str(run.get("phase") or "") in _ENDED:
+            continue
+        for node in run.get("nodes") or []:
+            if isinstance(node, dict) and node.get("container"):
+                out.add((str(node.get("host") or ""), str(node["container"])))
+    return out
+
+
+def _mounting(probe: dict[str, Any] | None, path: str) -> list[str] | None:
+    """Running containers on one host that mount ``path`` or a folder inside it. None: unknown."""
+    mounts = (probe or {}).get("mounts")
+    if not isinstance(mounts, dict) or not path:
+        return None
+    root = path.rstrip("/")
+    names = []
+    for name, sources in mounts.items():
+        if any(str(src).rstrip("/") == root or str(src).startswith(root + "/") for src in sources or []):
+            names.append(str(name))
+    return sorted(names)
+
+
+def external_engine(
+    row: dict[str, Any], probes: dict[str, dict[str, Any]], runs: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
+    """An engine Sparksi did not start that serves this row, or None.
+
+    Only for a row whose catalog pins its container names (otherwise the catalog
+    identity already decides). It needs all of: the pinned container is not
+    running on the head, the row's served name answers on its port there, and a
+    running container on the head mounts this row's weights. A sparksi- container
+    or one a not-stopped run recorded is Sparksi's own and never counts.
+    """
+    ident = row.get("identity") or {}
+    pinned = ident.get("container") or ident.get("worker_container")
+    if not pinned or protect.is_off_limits(row.get("port")):
+        return None
+    head = row.get("listen_host") or CFG.head.name
+    probe = probes.get(head) or {}
+    listed = probe.get("containers")
+    if listed is None or (ident.get("container") and ident["container"] in listed):
+        return None
+    if not _served_answers(row, probe):
+        return None
+    owned = _sparksi_containers(list(runs or []))
+    sides: dict[str, list[str]] = {}
+    for host, other in probes.items():
+        if host != head and row.get("placement") != "pair":
+            continue
+        found = _mounting(other, local_path(row, host) or "")
+        if not found:
+            continue
+        found = [n for n in found if not n.startswith("sparksi-") and (host, n) not in owned]
+        if found:
+            sides[host] = found
+    if head not in sides:
+        return None
+    held = [head] + sorted(h for h in sides if h != head)
+    if row.get("placement") == "pair" and CFG.has_worker:
+        # A pair holds the worker too, even when that Spark's probe could not say so.
+        for name in (CFG.head.name, CFG.worker.name):
+            if name not in held:
+                held.append(name)
+    return {
+        "hosts": held,
+        "containers": sides,
+        "port": row.get("port"),
+        "note": EXTERNAL_NOTE,
+    }
+
+
+def external_refusal(row: dict[str, Any] | None) -> str | None:
+    """The refusal for any stop, restart or replace of a row an outside engine serves."""
+    if not row or not row.get("external"):
+        return None
+    return EXTERNAL_REFUSAL.format(title=row.get("title") or row.get("id") or "This model")
 
 
 def _worker_ok(row: dict[str, Any], probe: dict[str, Any] | None) -> bool:
@@ -310,6 +425,16 @@ def annotate(
             item["run_live"] = run_liveness(run, probes, runs)
             if item["run_live"]["up"]:
                 item["serving"] = True
+        # Display only: an outside engine serves this row. It never sets live, so no
+        # stop or switch plan treats it as Sparksi's to stop; external_refusal guards those.
+        outside = None
+        if not head_ok and not (item.get("run_live") or {}).get("up"):
+            outside = external_engine(row, probes, runs)
+        item["external"] = outside is not None
+        if outside is not None:
+            item["external_engine"] = outside
+            item["external_note"] = EXTERNAL_NOTE
+            item["serving"] = True
         for host, probe in probes.items():
             path = local_path(row, host)
             stat = ((probe or {}).get("paths") or {}).get(path or "", {})

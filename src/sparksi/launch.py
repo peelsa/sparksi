@@ -9,7 +9,7 @@ from typing import Any
 from sparksi import protect
 from sparksi.config import CFG
 from sparksi.health import health_paths_for, health_timeout_for
-from sparksi.library import archive_mounted, local_path
+from sparksi.library import archive_mounted, external_refusal, local_path
 from sparksi.never import launcher_refusal
 
 
@@ -184,6 +184,8 @@ def plan_drop(
         reasons.append("confirm must equal the local path")
     if (row.get("on") or {}).get(host) == "live" or row.get("live"):
         reasons.append("weights are in use")
+    elif row.get("external") and host in ((row.get("external_engine") or {}).get("hosts") or []):
+        reasons.append("weights are in use by an engine started outside a Sparksi run")
     if not archive_mounted(probes.get(host) or {}):
         reasons.append(f"{host} has no archive mount")
     archived = row.get("archive_state") == "archived" or bool(_row_tar(row) or row.get("archive_flat"))
@@ -282,7 +284,35 @@ def _live_on_host(row: dict[str, Any], host: str) -> bool:
     return bool(row.get("live")) and (row.get("listen_host") or _head()) == host
 
 
+def _outside_block(target: dict[str, Any], rows: list[dict[str, Any]], hosts: list[str]) -> str | None:
+    """Refuse to start, replace or evict around an engine Sparksi did not start.
+
+    The target itself, or any row an outside engine serves on one of ``hosts``.
+    Sparksi never plans a stop for it, so loading there would collide with it.
+    """
+    mine = external_refusal(target)
+    if mine:
+        return mine
+    wanted = {h for h in hosts if h}
+    for other in rows or []:
+        if other.get("id") == target.get("id") or not other.get("external"):
+            continue
+        engine = other.get("external_engine") or {}
+        held = set(engine.get("hosts") or [other.get("listen_host") or _head()])
+        if held & wanted:
+            title = other.get("title") or other.get("id")
+            port = engine.get("port") or other.get("port")
+            on = ", ".join(_short(h) for h in sorted(held & wanted))
+            return (
+                f"{title} is running on {on} (port {port}), started outside a Sparksi run; "
+                "Sparksi will not stop it. Stop it where it was started, then load again."
+            )
+    return None
+
+
 def _stop_step(other: dict[str, Any], host: str) -> dict[str, Any] | None:
+    if other.get("external"):
+        return None  # never a catalog stop against an engine Sparksi did not start
     seat = seat_for(other, host) or {}
     launch = other.get("launch") or {}
     stop = list(seat.get("stop") or launch.get("stop") or [])
@@ -397,6 +427,13 @@ def plan_switch(
             "steps": [],
             "preview": [],
         }
+    if placement == "pair":
+        hosts = [(target.get("launch") or {}).get("host") or _head(), _worker()]
+    else:
+        hosts = [host or target.get("listen_host") or _head()]
+    outside = _outside_block(target, rows, hosts)
+    if outside:
+        return {"verdict": "REFUSE", "reasons": [outside], "id": target.get("id"), "host": host, "steps": [], "preview": []}
     if placement == "pair":
         launch = target.get("launch") or {}
         start = list(launch.get("start") or [])
@@ -525,11 +562,16 @@ def plan_run(
     probes: dict[str, dict[str, Any]],
     *,
     lock_on: bool,
+    rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     if lock_on:
         reasons.append("lock is ON")
     launch = row.get("launch") or {}
+    hosts = [launch.get("host") or _head()] + ([_worker()] if row.get("placement") == "pair" else [])
+    outside = _outside_block(row, list(rows or []), hosts)
+    if outside:
+        reasons.append(outside)
     start = list(launch.get("start") or [])
     if not start:
         reasons.append("no launcher; this archive can be copied and deleted only")
@@ -557,6 +599,10 @@ def plan_run(
 
 
 def plan_stop(row: dict[str, Any], *, lock_on: bool) -> dict[str, Any]:
+    outside = external_refusal(row)
+    if outside:
+        return {"verdict": "REFUSE", "reasons": [outside], "external": True, "id": row.get("id"),
+                "host": (row.get("launch") or {}).get("host") or _head(), "argv": None}
     reasons: list[str] = []
     if lock_on:
         reasons.append("lock is ON")
