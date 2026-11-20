@@ -7893,9 +7893,41 @@
     if (!Array.isArray(rows)) return lines;
     rows.forEach(function (row) {
       if (!row || row.role !== role || !row.state || row.state === "idle") return;
-      lines.push({ title: row.title || "Live process", status: row.text || row.state, endpoint: {} });
+      var point = (row.state === "answering" || row.state === "observed") ? observedEndpoint(row, role) : {};
+      lines.push({ title: row.title || "Live process", status: row.text || row.state, endpoint: point });
     });
     return lines;
+  }
+  /* A process no run owns still has the client URL the monitor vetted (never loopback or a
+     wildcard). A Spark that is not the lead of a multi-Spark engine names the lead's URL,
+     the same as a run. */
+  function onSparkKey(key, role) {
+    var text = String(key || "");
+    return !!text && (text === roleId(role) || text === rawRoleName(role) || text === role);
+  }
+  function observedEndpoint(row, role) {
+    var port = Number(row && row.port || 0);
+    if (!port) return {};
+    var hit = null;
+    var seen = (typeof lastMonitor !== "undefined" && lastMonitor && lastMonitor.loaded) || [];
+    seen.forEach(function (mod) {
+      if (!mod || Number(mod.port || 0) !== port || String(mod.state || "") === "DOWN") return;
+      var href = String(mod.endpoint || "");
+      if (!/^https?:\/\/[^\s"'<>]+$/.test(href)) return;
+      if (/^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1?\])/i.test(href)) return;
+      var span = mod.span || [];
+      var mine = onSparkKey(mod.host, role);
+      var spanned = span.some(function (key) { return onSparkKey(key, role); });
+      if (!mine && !spanned) return;
+      if (!hit || (mine && !onSparkKey(hit.host, role))) hit = mod;
+    });
+    if (!hit) return {};
+    var href = String(hit.endpoint);
+    if (onSparkKey(hit.host, role)) return { label: href, href: href };
+    var lead = "";
+    sparkRoles().forEach(function (other) { if (!lead && onSparkKey(hit.host, other)) lead = other; });
+    if (!lead) return {};
+    return { label: roleWord(lead) + " endpoint · " + href, href: href };
   }
   /* serving-state-end */
   function activeDisplayed(runs, role) {
