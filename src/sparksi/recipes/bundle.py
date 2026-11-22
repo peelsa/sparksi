@@ -257,12 +257,18 @@ def plan_bundle(
 def _record_pins(runner: Any, host: str, role_name: str, role: dict[str, Any], out: Bundle) -> None:
     if role.get("runtime") == "native":
         binary = str(role.get("binary") or "")
-        if binary.startswith("/") and not role.get("binary_sha256"):
+        recorded = str(role.get("binary_sha256") or "").strip().lower()
+        # An older recipe that records only the binary still gets its libraries recorded.
+        if binary.startswith("/") and not (recorded and role.get("library_sha256")):
             env = role.get("env") if isinstance(role.get("env"), dict) else {}
             ld_path = str(env.get("LD_LIBRARY_PATH") or role.get("ld_library_path") or "")
             read = native_pins(runner, host, binary, ld_path)
             if not read or not read[0]:
                 out.problems.append(f"could not read the SHA-256 of {binary} on {host}")
+                return
+            if recorded and read[0] != recorded:
+                # Its libraries now belong to a different build than the one the recipe records.
+                out.problems.append(f"{binary} on {host} does not match the SHA-256 this recipe records, so its libraries were not recorded")
                 return
             role["binary_sha256"] = read[0]
             if read[1] and not role.get("library_sha256"):

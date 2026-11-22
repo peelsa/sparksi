@@ -301,3 +301,22 @@ def test_the_library_cap_is_one_number_and_a_full_check_is_never_cut_short(tree,
     assert got == ["the head role's library_sha256 must map absolute paths to 64 hex characters"]
     paths = [str(build / "bin" / "server"), *too_many]
     assert agent_main({"op": "file_sha256", "paths": paths})["ok"] is False
+
+
+def test_an_older_recipe_with_only_a_binary_hash_gets_its_libraries_when_bundled(tree):
+    build, system = tree
+    role = {**_native(build, system), "binary_sha256": _sha(build / "bin" / "server")}
+    save_recipe(MODEL, {
+        "kind": "pinned", "engine": "llamacpp", "placement": "head", "port": 8014,
+        "imported_from": "script:example at 2026-11-01T00:00:00Z", "port_note": "", "rendezvous_ports": [],
+        "roles": {"head": role},
+    })
+    catalog = {"library": [{"id": MODEL, "title": "Example"}]}
+    plan = plan_bundle(catalog, _Sparks(), MODEL)
+    assert plan.view()["ok"], plan.problems
+    assert sorted(plan.recipe["roles"]["head"]["library_sha256"]) == [str(build / "bin" / "libone.so.0"), str(build / "lib" / "libtwo.so")]
+    # A binary rebuilt since its hash was recorded: refuse rather than pin the new build's libraries.
+    (build / "bin" / "server").write_bytes(_elf(["libone.so.0"], runpath="$ORIGIN", payload=b"rebuilt"))
+    plan = plan_bundle(catalog, _Sparks(), MODEL)
+    assert not plan.view()["ok"]
+    assert plan.problems == [f"{build / 'bin' / 'server'} on spark-1 does not match the SHA-256 this recipe records, so its libraries were not recorded"]
