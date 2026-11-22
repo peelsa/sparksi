@@ -44,6 +44,7 @@ Each node table accepts these keys:
 - `bind_deny` — addresses a model engine must not listen on, such as that Spark's LAN and WiFi addresses. A recipe plan checks each Spark's `tailscale` address against every Spark's `bind_deny` (plus `0.0.0.0` and `::`) and refuses on a match. It is not applied to the dashboard's own listen addresses
 - `uma_gib` — defaults to 121
 - `mount_roots` — extra host directories a pinned recipe may bind, besides the model cache. `/` is never a root.
+- `recipe_root` — where recipe folders are copied on this Spark. Defaults to `~/.local/share/sparksi/recipes`, where `~` means `[paths] home` (the Spark user's home, not the controller's). It must be absolute after that, and not `/`, the home itself, or a `too_broad` path; otherwise a recipe that uses folder files is refused for this Spark. It counts as a mount root.
 - `[nodes.fabric]` (optional) — used by two-Spark recipes, and only read, never written:
   - `interface` — the ConnectX port that is up
   - `ip` — that port's address
