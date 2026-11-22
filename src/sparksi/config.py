@@ -247,6 +247,11 @@ class Node:
     uma_gib: float = 121
     fabric: Fabric = field(default_factory=Fabric)
     mount_roots: list[str] = field(default_factory=list)
+    # Where recipe folders are copied on this Spark. Empty means the default under [paths] home.
+    recipe_root: str = ""
+
+
+RECIPE_ROOT_DEFAULT = "~/.local/share/sparksi/recipes"
 
 
 def _check_machines(nodes: list[Any], endpoints: list[Any]) -> None:
@@ -329,6 +334,7 @@ class Config:
                 uma_gib=float(n.get("uma_gib") or 121),
                 fabric=_fabric(n.get("fabric") if isinstance(n.get("fabric"), dict) else None),
                 mount_roots=[str(item) for item in (n.get("mount_roots") or []) if str(item)],
+                recipe_root=str(n.get("recipe_root") or ""),
             )
             for n in nodes
         ]
@@ -460,7 +466,9 @@ class Config:
     def mount_roots(self) -> list[str]:
         """Host paths a generated recipe may bind into a container.
 
-        The recipe generator mounts ``hf_cache`` and nothing above it.
+        The recipe generator mounts ``hf_cache`` and nothing above it. Each
+        Spark's recipe folder root is included: Sparksi copies a recipe's own
+        files there before a start.
         """
         roots: list[str] = []
         for item in (self.hf_cache(), self.path("hf_hub")):
@@ -468,11 +476,37 @@ class Config:
             if text and text not in roots:
                 roots.append(text)
         for node in self.nodes:
-            for item in node.mount_roots:
+            for item in [*node.mount_roots, self.node_recipe_root(node)]:
                 text = str(item or "")
                 if text and text not in roots:
                     roots.append(text)
         return roots
+
+    def node_recipe_root(self, node: Node) -> str:
+        """Absolute folder on ``node`` that holds copied recipe folders, or "" when unusable.
+
+        ``[[nodes]] recipe_root`` wins; the default is ``~/.local/share/sparksi/recipes``.
+        A leading ``~`` means ``[paths] home``, the Spark user's home, not the controller's.
+        A root that is ``/``, the home itself, or a too-broad path is refused.
+        """
+        raw = str(node.recipe_root or RECIPE_ROOT_DEFAULT).strip()
+        home = self.path("home")
+        if raw == "~" or raw.startswith("~/"):
+            if not home.startswith("/"):
+                return ""
+            raw = home.rstrip("/") + raw[1:]
+        if not raw.startswith("/"):
+            return ""
+        text = os.path.normpath(raw)
+        broad = {"/", "/home", os.path.normpath(home) if home else "/"}
+        broad.update(os.path.normpath(str(p)) for p in self.paths.get("too_broad") or [])
+        if text in broad or ".." in raw.split("/"):
+            return ""
+        return text
+
+    def recipe_root(self, role: str) -> str:
+        """Recipe folder root on the Spark that runs ``role``."""
+        return self.node_recipe_root(self.node_by_role(role))
 
     def service_commands(self) -> list[list[str]]:
         """Exact argv lists a catalog service may run. Matched verbatim."""
