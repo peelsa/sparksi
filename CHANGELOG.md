@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `sparksi recipes bundle <model-id>` moves an older pinned recipe and the files it mounts into a recipe folder. It records image IDs, binary hashes and the KV reserve, and `--dry-run` writes nothing. `sparksi recipes tidy-backups` moves old `recipes.bak-*` folders and `*.bak*` files into `backups/<date>/`, only moving and never deleting.
 - The recipe page shows a folder recipe's folder, version, file count and whether each Spark's copy matches, and the recipe list gives each recipe's `version`. Once a model has a folder recipe, its catalog launch command is hidden as a way to start it (the `custom` engine and a catalog service Start are refused). Stop still works.
 - A recipe role can record `image_id` (Docker image ID) or, for a native role, `binary_sha256`. Every plan and start checks the Spark that runs the role and refuses a different build with one sentence. A recipe's `[memory] kv_reserve_gib` now wins over the model card's for the memory check; the card's value is the fallback.
 - Before every start of a recipe that uses folder files, the folder is copied to each Spark the recipe uses and checked by hash. A file changed since the check, a copy that cannot be made, or an existing copy that differs refuses the start with one sentence, and nothing runs. A saved change makes a new copy and leaves the old one alone. A dry run shows each Spark's copy as match, missing, differs or unknown, and a run records the folder version it mounts.

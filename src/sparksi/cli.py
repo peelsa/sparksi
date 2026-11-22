@@ -338,6 +338,52 @@ def cmd_recipes_import(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_recipes_bundle(args: argparse.Namespace) -> int:
+    """Move an older pinned recipe into its own recipe folder. Reads the Sparks; never starts anything."""
+    from sparksi.recipes.bundle import plan_bundle, write_bundle
+    from sparksi.remote import get_runner
+
+    catalog = load_catalog()
+    bundle = plan_bundle(catalog, get_runner(catalog), args.model_id, args.recipe or "", keep=list(args.keep or []))
+    view = bundle.view()
+    if args.json:
+        print(json.dumps(view, indent=2, default=str))
+    else:
+        print(f"{bundle.model_id} recipe {bundle.name}: {len(view['files'])} files")
+        for item in view["files"]:
+            print(f"  {item['path']}  {item['sha256'][:16]}  from {', '.join(item['from'])}")
+        for item in view["kept"]:
+            print(f"  kept as is: {item}")
+        for item in view["notes"]:
+            print(f"  note: {item}")
+        for item in view["problems"]:
+            print(item)
+    if bundle.problems:
+        return 1
+    if args.dry_run:
+        print("dry run: nothing was written")
+        return 0
+    ok, said = write_bundle(bundle)
+    print(said)
+    return 0 if ok else 1
+
+
+def cmd_recipes_tidy(args: argparse.Namespace) -> int:
+    """Move old recipe and config backups into backups/<date>/. Never deletes."""
+    from sparksi.recipes.bundle import tidy_backups
+
+    rows = tidy_backups(dry_run=bool(args.dry_run))
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for row in rows:
+            word = "moved" if row["done"] == "yes" else ("would move" if args.dry_run else "left")
+            print(f"{word} {row['from']} -> {row['to']}" + (f" ({row['note']})" if row.get("note") else ""))
+        if not rows:
+            print("no backups to move")
+    return 0
+
+
 def cmd_run_model(args: argparse.Namespace) -> int:
     from sparksi.jobs import start_run
 
@@ -635,10 +681,10 @@ def build_parser() -> argparse.ArgumentParser:
     drp.set_defaults(func=cmd_drop)
 
     def cmd_recipes(args: argparse.Namespace) -> int:
-        print("usage: sparksi recipes import <model-id> [--from SOURCE] [--dry-run]", file=sys.stderr)
+        print("usage: sparksi recipes {import,bundle,tidy-backups} ...", file=sys.stderr)
         return 2
 
-    recipes = sub.add_parser("recipes", help="import a pinned launch recipe (read only)")
+    recipes = sub.add_parser("recipes", help="import, bundle or tidy recipes")
     recipes.set_defaults(func=cmd_recipes)
     recipes_sub = recipes.add_subparsers(dest="recipes_op")
     imp = recipes_sub.add_parser("import", help="read a container, compose file, unit, or script")
@@ -648,6 +694,17 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--all", action="store_true", help="survey every catalog row that has a launcher")
     imp.add_argument("--json", action="store_true")
     imp.set_defaults(func=cmd_recipes_import)
+    bnd = recipes_sub.add_parser("bundle", help="move an older pinned recipe and the files it mounts into a recipe folder")
+    bnd.add_argument("model_id")
+    bnd.add_argument("--recipe", default="", help="recipe name (default: the model's default recipe)")
+    bnd.add_argument("--keep", action="append", default=[], help="a mount source to leave as it is (repeatable)")
+    bnd.add_argument("--dry-run", action="store_true", help="show what would be written and write nothing")
+    bnd.add_argument("--json", action="store_true")
+    bnd.set_defaults(func=cmd_recipes_bundle)
+    tdy = recipes_sub.add_parser("tidy-backups", help="move recipes.bak-* folders and *.bak* files into backups/<date>/")
+    tdy.add_argument("--dry-run", action="store_true", help="list the moves and move nothing")
+    tdy.add_argument("--json", action="store_true")
+    tdy.set_defaults(func=cmd_recipes_tidy)
 
     rn = sub.add_parser("run", help="legacy: start a catalog launcher on this machine (lock off)")
     rn.add_argument("id")
