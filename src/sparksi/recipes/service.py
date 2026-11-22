@@ -43,7 +43,7 @@ from sparksi.recipes.pins import pin_conflicts
 from sparksi.recipes.pinned import FABRIC_ONLY, apply_overrides, apply_token_cache, fabric_only, folder_files, render_pinned, validate_pinned
 from sparksi.recipes.render import render
 from sparksi.recipes.runs import get_run, list_runs, pop_run_view, public_run, push_run_view, refresh_run, start_rendered, stop_recorded
-from sparksi.recipes.store import active_recipe_name, folder_path, is_folder_recipe, load_recipe, save_recipe
+from sparksi.recipes.store import active_recipe_name, folder_names, folder_path, is_folder_recipe, load_recipe, save_recipe
 from sparksi.recipes.validate import (
     ENGINES,
     PINNED_ENGINES,
@@ -1135,9 +1135,16 @@ def list_model_cards(catalog: dict[str, Any], runner: Any) -> dict[str, Any]:
                 body["running"] = live
                 body["status"] = "up" if live else "down"
             body["host"] = _service_host(catalog, card)
+            if has_folder_recipe(card.id):
+                body["folder_recipe"] = True
             services.append(body)
         else:
-            models.append(card.to_dict())
+            body = card.to_dict()
+            if has_folder_recipe(card.id):
+                # The recipe folder replaces the catalog launch command as the way to start this model.
+                body["folder_recipe"] = True
+                body["engines"] = [name for name in body.get("engines") or [] if name != "custom"]
+            models.append(body)
     return {
         "models": models,
         "services": services,
@@ -1447,6 +1454,8 @@ def _plan_model(
         conflicts.append(duplicate)
     if reserve_conflict:
         conflicts.append(reserve_conflict)
+    if not pinned and engine == "custom" and has_folder_recipe(card.id):
+        conflicts.append(FOLDER_STARTS)
     if pinned:
         exclusive = _exclusive_conflict(catalog, card.id, listening)
         if exclusive:
@@ -1650,6 +1659,16 @@ def preview_recipe(catalog: dict[str, Any], runner: Any, model_id: str, query: d
 
 
 RESERVE_MAX_GIB = 128.0
+FOLDER_STARTS = "This model starts from its recipe folder now, not from its catalog launch command. Load its recipe instead."
+
+
+def has_folder_recipe(model_id: str) -> bool:
+    """True once any recipe of this model lives in a recipe folder."""
+    try:
+        return bool(folder_names(model_id))
+    except (OSError, ValueError):
+        return False
+
 
 
 def recipe_reserve_gib(recipe: dict[str, Any]) -> tuple[float | None, str]:
@@ -1935,6 +1954,9 @@ def service_action(catalog: dict[str, Any], runner: Any, model_id: str, action: 
     if not row_is_service(row):
         return 400, {"error": "not a service"}
     opt = CFG.controllable_service(model_id)
+    if action == "start" and not opt and has_folder_recipe(model_id):
+        # Stop still works, so a copy started the old way can be stopped.
+        return 409, {"error": FOLDER_STARTS, "ok": False}
     if opt:
         argv = list(opt[action])
         if action == "start":
