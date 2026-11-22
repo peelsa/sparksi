@@ -37,10 +37,11 @@ from sparksi.recipes.memory import (
     node_peak_is_solo,
     role_need_gib,
 )
-from sparksi.recipes.pinned import FABRIC_ONLY, apply_overrides, apply_token_cache, fabric_only, render_pinned, validate_pinned
+from sparksi.recipes.folder import Resolved, resolve
+from sparksi.recipes.pinned import FABRIC_ONLY, apply_overrides, apply_token_cache, fabric_only, folder_files, render_pinned, validate_pinned
 from sparksi.recipes.render import render
 from sparksi.recipes.runs import get_run, list_runs, pop_run_view, public_run, push_run_view, refresh_run, start_rendered, stop_recorded
-from sparksi.recipes.store import load_recipe, save_recipe
+from sparksi.recipes.store import active_recipe_name, folder_path, is_folder_recipe, load_recipe, save_recipe
 from sparksi.recipes.validate import (
     ENGINES,
     PINNED_ENGINES,
@@ -1470,11 +1471,17 @@ def _plan_model(
             values = defaults.setdefault("values", {})
             if isinstance(values, dict):
                 values["token_note"] = note
-        conflicts.extend(validate_pinned(pinned_recipe, ctx_max=card.max_ctx, runner=runner))
+        resolved = resolve_folder(card.id, pinned_recipe)
+        conflicts.extend(resolved.conflicts)
+        pinned_recipe = resolved.recipe
+        files_view = folder_view(resolved)
+        with folder_files(resolved.local):
+            conflicts.extend(validate_pinned(pinned_recipe, ctx_max=card.max_ctx, runner=runner))
         cleaned = {}
         fields = {}
     else:
         pinned_recipe = None
+        files_view = None
         fields = _compose_fields(defaults, _fold_speculative(raw), explicit)
         cleaned, field_conflicts = validate_fields(
             engine if engine in ENGINES else "vllm",
@@ -1513,6 +1520,8 @@ def _plan_model(
             except ValueError as exc:
                 conflicts.append(str(exc))
                 recipe = None
+            if recipe and files_view:
+                recipe["files"] = files_view
             if recipe and runner is not None:
                 for name, role in (pinned_recipe.get("roles") or {}).items():
                     if not isinstance(role, dict) or role.get("runtime") == "native":
@@ -1591,6 +1600,7 @@ def _plan_model(
         "allowed_images": CFG.allowed_images(),
         "memory_note": memory_note,
         "run_status": _run_status(active) if active else "",
+        "files": files_view,
     }
     from sparksi.recipes.reasons import annotate
 
@@ -1622,6 +1632,29 @@ def preview_recipe(catalog: dict[str, Any], runner: Any, model_id: str, query: d
     recipe["defaults"] = payload.get("defaults") or {}
     recipe["allowed_images"] = payload.get("allowed_images") or CFG.allowed_images()
     return 200, recipe
+
+
+def resolve_folder(model_id: str, recipe: dict[str, Any]) -> Resolved:
+    """The recipe with its folder files mapped to Spark paths, for the recipe being read now."""
+    name = active_recipe_name(model_id)
+    root = folder_path(model_id, name) if is_folder_recipe(model_id, name) else None
+    return resolve(recipe, model_id, name, root)
+
+
+def folder_view(resolved: Resolved) -> dict[str, Any] | None:
+    """What a plan says about the recipe folder: None for a recipe that uses no folder files."""
+    if not resolved.version:
+        return None
+    return {
+        "folder": resolved.folder,
+        "version": resolved.version,
+        "count": len(resolved.entries),
+        "nodes": dict(resolved.nodes),
+        "manifest": [
+            {"path": entry.path, "sha256": entry.sha256, "size": entry.size, "executable": entry.executable}
+            for entry in resolved.entries
+        ],
+    }
 
 
 def write_recipe(
@@ -1659,9 +1692,12 @@ def write_recipe(
                 repo=str(updated.get("repo") or found.repo or ""),
                 revision=str(updated.get("revision") or found.revision or ""),
             )
-        conflicts = token_conflicts + validate_pinned(
-            updated, ctx_max=found.max_ctx if found is not None else None, runner=runner, for_save=True,
-        )
+        # The saved recipe keeps @files/ and @role/ sources; they are checked as the Spark paths they become.
+        resolved = resolve_folder(model_id, updated)
+        with folder_files(resolved.local):
+            conflicts = token_conflicts + resolved.conflicts + validate_pinned(
+                resolved.recipe, ctx_max=found.max_ctx if found is not None else None, runner=runner, for_save=True,
+            )
         if "port" in body:
             conflicts.extend(check_port(body.get("port"), reserved=_reserved_ports(catalog)))
         if conflicts:
@@ -1721,6 +1757,10 @@ def begin_run(catalog: dict[str, Any], runner: Any, body: dict[str, Any]) -> tup
     if not payload.get("ok"):
         return code, payload
     recipe = payload["recipe"]
+    if recipe.get("files"):
+        # Never start a container on folder paths that were not copied and checked on every Spark.
+        why = "This recipe's folder files are not copied to the Sparks yet, so nothing was started."
+        return 409, {"ok": False, "error": why, "conflicts": [why]}
     run = start_rendered(
         recipe,
         runner,

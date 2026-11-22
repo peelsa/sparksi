@@ -9,6 +9,8 @@ import json
 import os
 import re
 import shlex
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from sparksi import protect
@@ -38,11 +40,26 @@ _SHELL = set(";|&$`<>\n\r\\")
 _PLACES = (*ALL_ROLES, "both")
 
 
+# Spark folder -> recipe folder here, for files copied from a recipe folder. A
+# mounted script there is read from this machine: the Spark copy is checked by
+# hash before the start, so both hold the same bytes.
+_FOLDER_FILES: ContextVar[dict[str, str]] = ContextVar("sparksi_folder_files", default={})
+
+
+@contextmanager
+def folder_files(local: dict[str, str]):
+    token = _FOLDER_FILES.set(dict(local or {}))
+    try:
+        yield
+    finally:
+        _FOLDER_FILES.reset(token)
+
+
 def roots_for(role: str) -> list[str]:
-    """Cache root plus that node's extra mount roots. ``/`` is never a root."""
+    """Cache root, that node's extra mount roots and its recipe folder root. ``/`` is never a root."""
     node = CFG.node_by_role(role if role in CFG.roles else "head")
     found: list[str] = []
-    for item in (CFG.hf_cache(), CFG.path("hf_hub"), *list(node.mount_roots)):
+    for item in (CFG.hf_cache(), CFG.path("hf_hub"), *list(node.mount_roots), CFG.node_recipe_root(node)):
         text = os.path.normpath(str(item or ""))
         if text in ("", ".", "/"):
             continue
@@ -834,7 +851,23 @@ def _bind_in_text(text: str, path: str) -> str | None:
 
 
 def _remote_script(runner: Any, node: str, path: str) -> str | None:
-    """File text from the node. ``None`` means it could not be read. Never reads the controller."""
+    """File text from the node. ``None`` means it could not be read.
+
+    The controller is read only for a file copied from a recipe folder, which is
+    read from that folder here.
+    """
+    from sparksi.recipes.folder import local_path
+
+    here = local_path(path, _FOLDER_FILES.get())
+    if here is not None:
+        try:
+            with open(here, "rb") as handle:
+                data = handle.read(1_000_001)
+        except OSError:
+            return None
+        if len(data) > 1_000_000:
+            return None
+        return data.decode("utf-8", errors="replace")
     capture = getattr(runner, "capture", None) if runner is not None else None
     if capture is None or not node or not str(path).startswith("/"):
         return None

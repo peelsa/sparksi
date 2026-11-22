@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A save, dry run or load of a folder recipe checks its `@files/` and `@role/` sources as the Spark paths they become, reads a mounted start script from the folder, and reports the folder, version and manifest in the plan's `files` block. Starting such a recipe is refused until the copy to the Sparks is in place.
 - A recipe folder's files are listed with their SHA-256, and the list's hash is the folder's version. In a recipe folder a mount source can be written `@files/<path>` (shared by every Spark) or `@role/<path>` (that Spark's own file under `roles/<role>/`), and it resolves to `<recipe_root>/<model-id>/<name>/<version>/` on the Spark that runs the role. Each Spark's `recipe_root` defaults to `~/.local/share/sparksi/recipes` and can be set per Spark in `[[nodes]]`.
 - A recipe can now live in its own folder, `recipes/<model-id>/<name>/`, with `recipe.toml` next to the files it mounts (`files/` and `roles/<role>/`). Save writes inside the folder, Save as copies the whole folder, Rename moves it, and Delete moves it into `backups/<date>/deleted/` instead of removing it. Recipes in the older layout work as before.
 - A Spark card for a process no Sparksi run owns, such as an engine started outside Sparksi, shows its client URL with Copy again, as a run does. The worker of a pair shows "Head endpoint" and the head's URL. Loopback and wildcard addresses are never shown.
