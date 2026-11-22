@@ -37,7 +37,7 @@ def resolve_target(host_id: str, catalog: dict[str, Any] | None = None) -> str |
     return check_ssh(str(ssh))
 
 
-_RECIPE_OPS = frozenset({"run", "stop", "status", "service"})
+_RECIPE_OPS = frozenset({"run", "stop", "status", "service", "files_check", "files_stage", "files_read", "file_sha256"})
 
 # Reads that may skip a machine that just failed to connect. Actions always try.
 _READ_OPS = frozenset({"probe", "list_shards"})
