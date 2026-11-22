@@ -114,13 +114,23 @@ def _weights_roots(catalog: dict[str, Any], model_id: str) -> list[str]:
     return [root for root in roots if root]
 
 
-def _read(runner: Any, host: str, path: str) -> tuple[dict[str, Any] | None, str]:
+def _read(runner: Any, host: str, path: str, files_only: bool = False) -> tuple[dict[str, Any] | None, str]:
+    """Files read from ``host``; with ``files_only`` a folder or a file over the limit is not read.
+
+    Such a path comes back as None with the reason "dir" or "large".
+    """
+    req: dict[str, Any] = {"op": "files_read", "paths": [path]}
+    if files_only:
+        req.update(files_only=True, file_max=MAX_FILE_BYTES)
     try:
-        result = runner.invoke(host, {"op": "files_read", "paths": [path]}, timeout=READ_TIMEOUT_S)
+        result = runner.invoke(host, req, timeout=READ_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 — reported as one sentence
         return None, str(exc)
     if not isinstance(result, dict) or not result.get("ok"):
         return None, str((result or {}).get("error") or "no answer")
+    skipped = result.get("skipped") if isinstance(result.get("skipped"), dict) else {}
+    if skipped:
+        return None, str(next(iter(skipped.values())))
     if result.get("links"):
         return None, f"{path} holds a link, which a recipe folder does not carry"
     found = result.get("files") or {}
@@ -184,15 +194,19 @@ def plan_bundle(
             text = str(mount)
             source, _sep, rest = text.partition(":")
             target, _sep2, opts = rest.partition(":")
-            if (
-                not source.startswith("/") or not target.startswith("/")
-                or _under(source, skip) or os.path.normpath(source) in keep_set
-            ):
+            if not source.startswith("/") or not target.startswith("/") or os.path.normpath(source) in keep_set:
                 if source.startswith("/"):
                     out.kept.append(f"{role_name}: {text}")
                 mounts.append(text)
                 continue
-            found, why = _read(runner, host, source)
+            # Under the weights root only a single file within the size limit is a
+            # recipe input (a patch, a config); folders and large files stay put.
+            weights = _under(source, skip)
+            found, why = _read(runner, host, source, files_only=weights)
+            if found is None and weights:
+                out.kept.append(f"{role_name}: {text}")
+                mounts.append(text)
+                continue
             if found is None:
                 out.problems.append(f"could not read {source} on {host} ({why})")
                 mounts.append(text)

@@ -2003,10 +2003,16 @@ def _files_read(req: dict) -> dict:
     """Read-only: files under the mount roots, base64, for copying into a recipe folder.
 
     A folder is read whole (regular files only; links are reported, not followed).
+    With ``files_only`` a folder is not read but listed under ``skipped`` as
+    "dir", and a file over ``file_max`` bytes is listed as "large": the bundle
+    leaves those mounts where they are (weights and caches).
     """
     roots = _CFG.get("mount_roots") or []
     out: dict = {}
     links: list = []
+    skipped: dict = {}
+    files_only = bool(req.get("files_only"))
+    file_max = int(req.get("file_max") or FILES_MAX_BYTES)
     total = 0
     for raw in req.get("paths") or []:
         path = _inside_root(raw, roots)
@@ -2016,6 +2022,12 @@ def _files_read(req: dict) -> dict:
             return {"ok": False, "error": f"refusing to read {raw}"}
         if os.path.islink(path):
             links.append(path)
+            continue
+        if files_only and os.path.isdir(path):
+            skipped[path] = "dir"
+            continue
+        if files_only and os.path.isfile(path) and os.path.getsize(path) > file_max:
+            skipped[path] = "large"
             continue
         if os.path.isfile(path):
             candidates = [path]
@@ -2042,7 +2054,7 @@ def _files_read(req: dict) -> dict:
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "executable": bool(os.stat(full).st_mode & 0o111),
             }
-    return {"ok": True, "files": out, "links": links}
+    return {"ok": True, "files": out, "links": links, "skipped": skipped}
 
 
 def _file_sha256(req: dict) -> dict:
