@@ -85,6 +85,17 @@ A folder wins over an older-layout file with the same name. Save writes `recipe.
 
 `sparksi.toml` and `catalog.yaml` are never written by a recipe save.
 
+### Files a folder recipe mounts
+
+In a folder recipe, a pinned role's mount source (or a native role's `binary`) can name a file in the folder:
+
+- `@files/<path>` is `files/<path>`, the same file for every Spark.
+- `@role/<path>` is `roles/<role>/<path>` for the Spark that runs that role, for example `@role/start.sh:/start.sh:ro` mounts `roles/head/start.sh` on the head and `roles/worker/start.sh` on the worker.
+
+The saved recipe keeps these sources as written. A save, dry run or load checks them as the paths they become on each Spark: `<recipe_root>/<model-id>/<name>/<version>/...`, where the version is the hash of the folder's file list (see `[[nodes]] recipe_root` in [config](config.md)). A file the recipe names but the folder lacks, a path with `..`, a link, or a file under `roles/` for an unknown role refuses the plan. A start script mounted from the folder is checked for wildcard binds from the folder itself. The plan answer has a `files` block: the folder, its version, the file count, each Spark's copy path and the manifest. `recipe.toml` itself is not part of the version.
+
+Until copying the folder to the Sparks is in place, a start of a recipe that uses folder files is refused with "This recipe's folder files are not copied to the Sparks yet, so nothing was started."
+
 ## Loading a recipe
 
 To load a recipe:
