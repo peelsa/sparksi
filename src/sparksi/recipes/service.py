@@ -1807,7 +1807,23 @@ def write_recipe(
     return 200, {"ok": True, "path": str(path.name), "recipe": load_recipe(model_id)}
 
 
+# One start is planned, copied and recorded at a time. A second click, a retry or
+# another model's load while the recipe folder is still being copied would
+# otherwise pass the same plan checks before either run is recorded.
+_BEGIN = threading.Lock()
+BEGIN_BUSY = "Another load is still being set up, so this one was not started; try again in a moment."
+
+
 def begin_run(catalog: dict[str, Any], runner: Any, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not _BEGIN.acquire(blocking=False):
+        return 409, {"ok": False, "error": BEGIN_BUSY, "conflicts": [BEGIN_BUSY]}
+    try:
+        return _begin_run(catalog, runner, body)
+    finally:
+        _BEGIN.release()
+
+
+def _begin_run(catalog: dict[str, Any], runner: Any, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     model_id = str(body.get("id") or body.get("model_id") or "")
     code, payload = plan_model(catalog, runner, model_id, body)
     if not payload.get("ok"):

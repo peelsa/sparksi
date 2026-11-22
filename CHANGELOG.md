@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Only one Load is set up at a time. A second click, a retry or another model's Load while a recipe folder is still being copied to the Sparks is refused with one sentence, instead of passing the same checks and starting twice.
 - Once a model has a recipe folder, the library run (`sparksi run` and the Library Run button) and the library switch (pair and single seat) are refused with one sentence too, so no catalog launch command starts it by another route. Stop still works.
 - `sparksi recipes bundle <model-id>` moves an older pinned recipe and the files it mounts into a recipe folder. It records image IDs, binary hashes and the KV reserve, and `--dry-run` writes nothing. `sparksi recipes tidy-backups` moves old `recipes.bak-*` folders and `*.bak*` files into `backups/<date>/`, only moving and never deleting.
 - The recipe page shows a folder recipe's folder, version, file count and whether each Spark's copy matches, and the recipe list gives each recipe's `version`. Once a model has a folder recipe, its catalog launch command is hidden as a way to start it (the `custom` engine and a catalog service Start are refused). Stop still works.
