@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A recipe folder file may be up to 16 MiB and the whole folder up to 64 MiB (was 64 and 256 MiB), on the controller and in the node agent alike, because a copy is decoded in memory on a Spark that may be next to a loaded model. The "recipe folder changed" refusal is now one sentence.
 - Only one Load is set up at a time. A second click, a retry or another model's Load while a recipe folder is still being copied to the Sparks is refused with one sentence, instead of passing the same checks and starting twice.
 - Once a model has a recipe folder, the library run (`sparksi run` and the Library Run button) and the library switch (pair and single seat) are refused with one sentence too, so no catalog launch command starts it by another route. Stop still works.
 - `sparksi recipes bundle <model-id>` moves an older pinned recipe and the files it mounts into a recipe folder. It records image IDs, binary hashes and the KV reserve, and `--dry-run` writes nothing. `sparksi recipes tidy-backups` moves old `recipes.bak-*` folders and `*.bak*` files into `backups/<date>/`, only moving and never deleting.

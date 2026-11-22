@@ -1810,7 +1810,7 @@ def _evict_sha256() -> dict:
 # A copied recipe folder lives at <recipe_root>/<model>/<name>/<version>/ and is
 # read-only once written. These ops never rewrite or remove an existing copy.
 
-FILES_MAX_BYTES = 256 * 1024 * 1024
+FILES_MAX_BYTES = 64 * 1024 * 1024  # equal to the controller's MAX_TOTAL_BYTES
 
 
 def _inside_root(path: str, roots: list) -> str | None:

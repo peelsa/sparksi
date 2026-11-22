@@ -181,7 +181,7 @@ def test_an_edit_after_the_check_refuses_the_start(site):
     _code, planned = plan_model(_catalog(), sparks, MODEL, {})
     (folder_path(MODEL, NAME) / "files" / "patch.py").write_text("x = 2\n")
     why, states = rf.copy_to_sparks(sparks, planned["files"])
-    assert why == "The recipe folder changed after it was checked, so nothing was started. Load it again."
+    assert why == "The recipe folder changed after it was checked, so nothing was started; load it again."
     assert states == {}
     assert not any(op == "files_stage" for _host, op in sparks.calls)
 
@@ -207,3 +207,40 @@ def test_the_run_record_keeps_the_version_it_mounts(site):
     assert public_run(get_run("r9"))["files_version"] == "abc"
     _save({"id": "r8", "model_id": MODEL, "phase": "ready", "nodes": []})
     assert public_run(get_run("r8"))["files_version"] == ""
+
+
+def test_oversize_folder_files_refuse_with_one_sentence(site, monkeypatch):
+    make, _roots, started = site
+    make("head")
+    monkeypatch.setattr(rf, "MAX_FILE_BYTES", 8)
+    sparks = _Sparks()
+    code, planned = plan_model(_catalog(), sparks, MODEL, {})
+    assert code == 400
+    assert any(c.startswith("recipe file roles/head/start.sh is larger than") for c in planned["conflicts"])
+    assert not any("files/patch.py" in c for c in planned["conflicts"])
+    code, _out = begin_run(_catalog(), sparks, {"id": MODEL})
+    assert code == 400 and started == []
+    assert not any(op == "files_stage" for _host, op in sparks.calls)
+
+
+def test_the_size_caps_stay_small_and_agree():
+    assert rf.MAX_FILE_BYTES <= 16 * 1024 * 1024
+    assert rf.MAX_TOTAL_BYTES <= 64 * 1024 * 1024
+    assert agent.FILES_MAX_BYTES == rf.MAX_TOTAL_BYTES
+
+
+def test_the_agent_refuses_a_copy_over_its_cap(site, monkeypatch):
+    import base64
+    import hashlib
+
+    _make, roots, _started = site
+    monkeypatch.setattr(agent, "FILES_MAX_BYTES", 4)
+    data = b"0123456789"
+    target = str(roots[CFG.head.name] / MODEL / NAME / "v1")
+    out = agent_main({
+        "op": "files_stage", "dir": target,
+        "manifest": [{"path": "files/a", "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "executable": False}],
+        "files": [{"path": "files/a", "data": base64.b64encode(data).decode("ascii")}],
+    })
+    assert out == {"ok": False, "error": "recipe folder files are too large"}
+    assert not os.path.exists(target)
