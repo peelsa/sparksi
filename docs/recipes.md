@@ -94,7 +94,17 @@ In a folder recipe, a pinned role's mount source (or a native role's `binary`) c
 
 The saved recipe keeps these sources as written. A save, dry run or load checks them as the paths they become on each Spark: `<recipe_root>/<model-id>/<name>/<version>/...`, where the version is the hash of the folder's file list (see `[[nodes]] recipe_root` in [config](config.md)). A file the recipe names but the folder lacks, a path with `..`, a link, or a file under `roles/` for an unknown role refuses the plan. A start script mounted from the folder is checked for wildcard binds from the folder itself. The plan answer has a `files` block: the folder, its version, the file count, each Spark's copy path and the manifest. `recipe.toml` itself is not part of the version.
 
-Until copying the folder to the Sparks is in place, a start of a recipe that uses folder files is refused with "This recipe's folder files are not copied to the Sparks yet, so nothing was started."
+### Copy and check before every start
+
+Before every start of a recipe that uses folder files, Sparksi does three things:
+
+1. It reads the folder again. If any file changed since the check, the start is refused: "The recipe folder changed after it was checked, so nothing was started. Load it again."
+2. It copies the folder's files to each Spark the recipe uses, under `<recipe_root>/<model-id>/<name>/<version>/`. The node agent writes the copy in a temporary folder, checks every file's SHA-256, makes the copy read-only and renames it into place.
+3. It checks the result on every Spark before any container starts.
+
+A copy that is already there is only compared, never rewritten. Because the folder name is the version, a saved change makes a new copy and never touches a copy a running container has mounted. If a copy cannot be made, or an existing copy differs, nothing starts and the answer is one sentence, for example "spark-b's copy of this recipe's files does not match the recipe folder, so nothing was started."
+
+A dry run is read-only. Its `files.sparks` block shows each Spark's copy as `match`, `missing` (it will be copied at start), `differs` (this refuses the plan) or `unknown`. The run record keeps the version it mounts as `files_version`. A run started before its recipe was moved into a folder keeps the mounts it has.
 
 ## Loading a recipe
 

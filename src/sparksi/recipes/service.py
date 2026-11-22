@@ -37,7 +37,7 @@ from sparksi.recipes.memory import (
     node_peak_is_solo,
     role_need_gib,
 )
-from sparksi.recipes.folder import Resolved, resolve
+from sparksi.recipes.folder import Resolved, check_sparks, copy_to_sparks, resolve
 from sparksi.recipes.pinned import FABRIC_ONLY, apply_overrides, apply_token_cache, fabric_only, folder_files, render_pinned, validate_pinned
 from sparksi.recipes.render import render
 from sparksi.recipes.runs import get_run, list_runs, pop_run_view, public_run, push_run_view, refresh_run, start_rendered, stop_recorded
@@ -1475,6 +1475,12 @@ def _plan_model(
         conflicts.extend(resolved.conflicts)
         pinned_recipe = resolved.recipe
         files_view = folder_view(resolved)
+        if files_view:
+            # Read-only here: a missing copy is made at start; a copy that differs refuses.
+            files_view["sparks"] = check_sparks(runner, files_view)
+            for row in files_view["sparks"].values():
+                if row.get("state") == "differs":
+                    conflicts.append(f"{row['host']}'s copy of this recipe's files does not match the recipe folder")
         with folder_files(resolved.local):
             conflicts.extend(validate_pinned(pinned_recipe, ctx_max=card.max_ctx, runner=runner))
         cleaned = {}
@@ -1758,9 +1764,11 @@ def begin_run(catalog: dict[str, Any], runner: Any, body: dict[str, Any]) -> tup
         return code, payload
     recipe = payload["recipe"]
     if recipe.get("files"):
-        # Never start a container on folder paths that were not copied and checked on every Spark.
-        why = "This recipe's folder files are not copied to the Sparks yet, so nothing was started."
-        return 409, {"ok": False, "error": why, "conflicts": [why]}
+        # Copy the folder to every Spark the recipe uses and check it by hash first.
+        # A container is never started on folder paths that did not check out.
+        why, states = copy_to_sparks(runner, recipe["files"])
+        if why:
+            return 409, {"ok": False, "error": why, "conflicts": [why], "files_sparks": states}
     run = start_rendered(
         recipe,
         runner,

@@ -253,6 +253,7 @@ def _public(run: dict[str, Any]) -> dict[str, Any]:
         "started": run.get("started"),
         "started_by": run.get("started_by") or "",
         "health_note": run.get("health_note") or "",
+        "files_version": str((run.get("files") or {}).get("version") or ""),
     }
 
 
@@ -974,6 +975,10 @@ def start_rendered(
         "measured_gib": None,
         "started_by": "sparksi",
     }
+    files = recipe.get("files") if isinstance(recipe.get("files"), dict) else None
+    if files:
+        # The folder version this run mounts. A later edit makes a new version and leaves this one alone.
+        run["files"] = {"version": str(files.get("version") or ""), "folder": str(files.get("folder") or ""), "nodes": dict(files.get("nodes") or {})}
     _save(run)
     _audit("run", f"load {run.get('model_id') or ''}".rstrip(), phase="starting", machine=str((nodes[0] or {}).get("host") if nodes else ""))
     replaced_sides = _replace_sides(replace_run_id)
