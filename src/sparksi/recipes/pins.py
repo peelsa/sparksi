@@ -19,6 +19,7 @@ from sparksi.config import CFG
 
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+LIBS_MAX = 256  # equal to the node agent's LIBS_MAX: the most libraries one binary records
 
 
 def image_id(runner: Any, host: str, image: str) -> str | None:
@@ -103,7 +104,7 @@ def _library_pins(role: dict[str, Any]) -> dict[str, str] | None:
     libs = role.get("library_sha256")
     if libs in (None, "", {}):
         return {}
-    if not isinstance(libs, dict):
+    if not isinstance(libs, dict) or len(libs) > LIBS_MAX:
         return None
     out = {}
     for path, digest in libs.items():

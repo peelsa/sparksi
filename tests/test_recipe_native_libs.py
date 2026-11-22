@@ -248,3 +248,56 @@ def test_the_folder_files_version_still_ignores_nothing(tmp_path):
     (tmp_path / "recipe.toml").write_text('kind = "pinned"\n')
     assert rf.scan(tmp_path).version != first
     assert copy.copy(rf.scan(tmp_path).version) == rf.scan(tmp_path).version
+
+
+def test_a_malformed_elf_is_read_as_no_libraries_not_a_crash(tmp_path):
+    good = _elf(["libx.so"], runpath="$ORIGIN")
+    bad = {"empty": b"", "short": good[:70], "elf32": b"\x7fELF\x01\x01" + good[6:], "big_endian": b"\x7fELF\x02\x02" + good[6:]}
+    for name, at in (("phoff", 0x20), ("dyn_offset", 64 + 56 + 8), ("load_vaddr", 64 + 8)):
+        data = bytearray(good)
+        struct.pack_into("<Q", data, at, (1 << 64) - 1)
+        bad[name] = bytes(data)
+    for name, data in bad.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        assert agent._elf_dynamic(str(path)) is None, name
+
+
+def test_a_library_in_the_tree_that_is_malformed_is_still_recorded(tree):
+    build, system = tree
+    (build / "lib" / "libtwo.so").write_bytes(b"\x7fELF\x02\x01" + b"\xff" * 80)
+    out = agent_main({"op": "file_sha256", "path": str(build / "bin" / "server"), "libs": True})
+    assert str(build / "lib" / "libtwo.so") in out["libs"]
+
+
+def test_a_library_found_through_its_loaders_rpath_is_recorded(tree):
+    """libone has no RPATH or RUNPATH; the loader then searches the binary's RPATH."""
+    build, system = tree
+    (build / "bin" / "server").write_bytes(_elf(["libone.so.0"], rpath="$ORIGIN:$ORIGIN/../lib"))
+    (build / "bin" / "libone.so.0.1").write_bytes(_elf(["libtwo.so"]))
+    out = agent_main({"op": "file_sha256", "path": str(build / "bin" / "server"), "libs": True})
+    assert sorted(out["libs"]) == [str(build / "bin" / "libone.so.0"), str(build / "lib" / "libtwo.so")]
+    # A RUNPATH on the binary is not inherited: libone then cannot find libtwo.
+    (build / "bin" / "server").write_bytes(_elf(["libone.so.0"], runpath="$ORIGIN:$ORIGIN/../lib"))
+    out = agent_main({"op": "file_sha256", "path": str(build / "bin" / "server"), "libs": True})
+    assert sorted(out["libs"]) == [str(build / "bin" / "libone.so.0")]
+
+
+def test_the_library_cap_is_one_number_and_a_full_check_is_never_cut_short(tree, monkeypatch):
+    from sparksi.recipes import pins
+
+    build, system = tree
+    assert pins.LIBS_MAX == agent.LIBS_MAX
+    monkeypatch.setattr(agent, "LIBS_MAX", 2)
+    monkeypatch.setattr(pins, "LIBS_MAX", 2)
+    (build / "lib" / "libthree.so").write_bytes(_elf([]))
+    (build / "bin" / "server").write_bytes(_elf(["libone.so.0", "libtwo.so", "libthree.so"], runpath="$ORIGIN:$ORIGIN/../lib"))
+    out = agent_main({"op": "file_sha256", "path": str(build / "bin" / "server"), "libs": True})
+    assert len(out["libs"]) == 2  # never more than the cap
+    role = {**_native(build, system), "binary_sha256": _sha(build / "bin" / "server"), "library_sha256": out["libs"]}
+    assert pin_conflicts(_Sparks(), {"roles": {"head": role}}) == []  # binary + a full set of libraries fit one check
+    too_many = {**out["libs"], str(build / "lib" / "libthree.so"): _sha(build / "lib" / "libthree.so")}
+    got = pin_conflicts(_Sparks(), {"roles": {"head": {**role, "library_sha256": too_many}}})
+    assert got == ["the head role's library_sha256 must map absolute paths to 64 hex characters"]
+    paths = [str(build / "bin" / "server"), *too_many]
+    assert agent_main({"op": "file_sha256", "paths": paths})["ok"] is False

@@ -2055,7 +2055,10 @@ def _file_sha256(req: dict) -> dict:
     roots = _CFG.get("mount_roots") or []
     if req.get("paths") is not None:
         files: dict = {}
-        for raw in list(req.get("paths") or [])[:LIBS_MAX]:
+        paths = list(req.get("paths") or [])
+        if len(paths) > LIBS_MAX + 1:  # a binary and its recorded libraries; never cut short
+            return {"ok": False, "error": f"refusing more than {LIBS_MAX + 1} files in one check"}
+        for raw in paths:
             path = _inside_root(raw, roots)
             if path is None:
                 return {"ok": False, "error": f"refusing {raw}: outside the mount roots"}
@@ -2126,7 +2129,7 @@ def _elf_dynamic(path: str) -> tuple[list, list, list] | None:
                 return None
             handle.seek(start)
             strings = handle.read(strsz)
-    except (OSError, struct.error):
+    except (OSError, struct.error, ValueError, OverflowError):  # a truncated or malformed file
         return None
 
     def text(index: int) -> str:
@@ -2155,18 +2158,27 @@ def _tree_libs(binary: str, ld_library_path: str, roots: list) -> dict:
         return {}
     env_dirs = [part for part in ld_library_path.split(":") if part]
     found: dict = {}
-    pending = [binary]
+    # (file, RPATH folders of the files that loaded it): an object without RUNPATH also
+    # searches its loaders' RPATH, as the dynamic loader does.
+    pending: list = [(binary, [])]
     seen = {os.path.realpath(binary)}
     while pending and len(found) < LIBS_MAX:
-        current = pending.pop(0)
+        current, inherited = pending.pop(0)
         info = _elf_dynamic(current)
         if not info:
             continue
         needed, rpath, runpath = info
         origin = os.path.dirname(os.path.realpath(current))
-        dirs = ([] if runpath else rpath) + env_dirs + runpath
-        dirs = [d.replace("${ORIGIN}", origin).replace("$ORIGIN", origin) for d in dirs if d]
+
+        def expand(folders: list, origin: str = origin) -> list:
+            return [d.replace("${ORIGIN}", origin).replace("$ORIGIN", origin) for d in folders if d]
+
+        own = [] if runpath else expand(rpath)
+        chain = own + inherited
+        dirs = ([] if runpath else chain) + env_dirs + expand(runpath)
         for name in needed:
+            if len(found) >= LIBS_MAX:
+                break
             if not name or "/" in name:
                 continue
             for folder in dirs:
@@ -2180,7 +2192,7 @@ def _tree_libs(binary: str, ld_library_path: str, roots: list) -> dict:
                     break  # a system library or one outside the tree: not recorded
                 seen.add(real)
                 found[candidate] = _file_digest(candidate)
-                pending.append(candidate)
+                pending.append((candidate, chain))
                 break
     return dict(sorted(found.items()))
 
