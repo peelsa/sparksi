@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import threading
@@ -38,6 +39,7 @@ from sparksi.recipes.memory import (
     role_need_gib,
 )
 from sparksi.recipes.folder import Resolved, check_sparks, copy_to_sparks, resolve
+from sparksi.recipes.pins import pin_conflicts
 from sparksi.recipes.pinned import FABRIC_ONLY, apply_overrides, apply_token_cache, fabric_only, folder_files, render_pinned, validate_pinned
 from sparksi.recipes.render import render
 from sparksi.recipes.runs import get_run, list_runs, pop_run_view, public_run, push_run_view, refresh_run, start_rendered, stop_recorded
@@ -1431,6 +1433,10 @@ def _plan_model(
         return 404, {"error": "unknown model", "conflicts": ["unknown model"]}
     explicit = _explicit_keys(query, body)
     requested = _merge_saved(model_id, query or {}, body, card)
+    reserve, reserve_conflict = recipe_reserve_gib(requested)
+    if reserve is not None:
+        # The recipe's own KV reserve wins; the model card's is only the fallback.
+        card = dataclasses.replace(card, kv_reserve_gib=reserve)
     replaced = stopped_replace(card.id, str((body or {}).get("replace_run_id") or ""))
     listening = _without_replaced_port(listening, replaced, runner)
     engine, placement, port, conflicts = _choose(card, requested, listening, explicit, catalog)
@@ -1439,6 +1445,8 @@ def _plan_model(
     duplicate = _duplicate_start(card)
     if duplicate:
         conflicts.append(duplicate)
+    if reserve_conflict:
+        conflicts.append(reserve_conflict)
     if pinned:
         exclusive = _exclusive_conflict(catalog, card.id, listening)
         if exclusive:
@@ -1483,6 +1491,7 @@ def _plan_model(
                     conflicts.append(f"{row['host']}'s copy of this recipe's files does not match the recipe folder")
         with folder_files(resolved.local):
             conflicts.extend(validate_pinned(pinned_recipe, ctx_max=card.max_ctx, runner=runner))
+        conflicts.extend(pin_conflicts(runner, pinned_recipe))
         cleaned = {}
         fields = {}
     else:
@@ -1638,6 +1647,28 @@ def preview_recipe(catalog: dict[str, Any], runner: Any, model_id: str, query: d
     recipe["defaults"] = payload.get("defaults") or {}
     recipe["allowed_images"] = payload.get("allowed_images") or CFG.allowed_images()
     return 200, recipe
+
+
+RESERVE_MAX_GIB = 128.0
+
+
+def recipe_reserve_gib(recipe: dict[str, Any]) -> tuple[float | None, str]:
+    """The recipe's ``[memory] kv_reserve_gib`` and a sentence when it is not usable."""
+    memory = recipe.get("memory")
+    if memory in (None, ""):
+        return None, ""
+    if not isinstance(memory, dict):
+        return None, "memory must be a table"
+    value = memory.get("kv_reserve_gib")
+    if value in (None, ""):
+        return None, ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None, "memory.kv_reserve_gib must be a number of GiB"
+    if not 0 <= number <= RESERVE_MAX_GIB:
+        return None, f"memory.kv_reserve_gib must be between 0 and {RESERVE_MAX_GIB:g} GiB"
+    return number, ""
 
 
 def resolve_folder(model_id: str, recipe: dict[str, Any]) -> Resolved:

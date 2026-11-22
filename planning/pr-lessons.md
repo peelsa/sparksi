@@ -39,3 +39,4 @@ one line: what was missed, and the check that would have caught it.
 - A run record can stay `ready` after both of its containers exit outside Sparksi; mark it gone (or stale) when every side's container has left the fresh container lists.
 - `heartbeat.answer_probe` answers a loopback probe from loopback and wildcard listeners only; give it the agent's own-tailnet fallback so a beat and an SSH probe agree on a server bound to the tailnet address.
 - `monitor.models._engine_port_tp` and the `monitor/peer.py` shell collector still read TP only from `TP=` / `TENSOR_PARALLEL_SIZE=`; give them the announcer's `--tp`, `--tensor-parallel-size` and `WORLD_SIZE` forms.
+- The memory estimate for a two-Spark pinned run can read about 20 GiB higher than the live peak (97 vs 117 GiB in one case); find which term (KV reserve, util or margin) is counted twice, with a test. Out of scope for the recipe-folder PRs.

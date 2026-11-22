@@ -106,6 +106,32 @@ A copy that is already there is only compared, never rewritten. Because the fold
 
 A dry run is read-only. Its `files.sparks` block shows each Spark's copy as `match`, `missing` (it will be copied at start), `differs` (this refuses the plan) or `unknown`. The run record keeps the version it mounts as `files_version`. A run started before its recipe was moved into a folder keeps the mounts it has.
 
+### Recorded builds and memory
+
+A role can record the exact build it runs, so a re-tagged image or a rebuilt binary is caught before a start:
+
+```toml
+[roles.head]
+image = "example.invalid/vllm:1"
+image_id = "sha256:<64 hex>"   # from: docker image inspect --format '{{.Id}}' <image>
+
+[roles.worker]
+runtime = "native"
+binary = "/opt/server/bin/server"
+binary_sha256 = "<64 hex>"     # from: sha256sum <binary>
+```
+
+Every plan and every start checks the Spark that runs the role. A different build refuses with one sentence, for example "spark-a has a different build of image example.invalid/vllm:1 than this recipe records, so it will not start." The image and the binary are never copied into the recipe folder. They stay where they are, and only their identity is recorded.
+
+A recipe can set its own KV reserve, which the memory check uses instead of the model card's:
+
+```toml
+[memory]
+kv_reserve_gib = 15
+```
+
+Without `[memory]`, the model card's `kv_reserve_gib` is used as before.
+
 ## Loading a recipe
 
 To load a recipe:
