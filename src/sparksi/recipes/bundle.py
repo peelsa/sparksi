@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from sparksi.config import CFG
-from sparksi.recipes.folder import scan
+from sparksi.recipes.folder import MAX_FILE_BYTES, MAX_TOTAL_BYTES, scan
 from sparksi.recipes.pins import binary_sha256, image_id
 from sparksi.recipes.store import (
     RECIPE_FILE,
@@ -192,6 +192,11 @@ def plan_bundle(
                 if data is None:
                     out.problems.append(f"{full} on {host} did not arrive intact")
                     continue
+                if len(data) > MAX_FILE_BYTES:
+                    out.problems.append(
+                        f"{full} on {host} is larger than {MAX_FILE_BYTES >> 20} MiB, so leave its mount as it is with --keep"
+                    )
+                    continue
                 rel = "" if full == source else os.path.relpath(full, source).replace(os.sep, "/")
                 files[rel] = data
                 modes[rel] = bool(item.get("executable"))
@@ -224,6 +229,10 @@ def plan_bundle(
         if "mounts" in role:
             role["mounts"] = mounts
         _record_pins(runner, host, role_name, role, out)
+    if sum(len(data) for data in out.files.values()) > MAX_TOTAL_BYTES:
+        out.problems.append(
+            f"the files to bundle add up to more than {MAX_TOTAL_BYTES >> 20} MiB, so leave the largest mounts as they are with --keep"
+        )
     reserve = _card_reserve(catalog, model_id)
     if reserve is not None and not (isinstance(recipe.get("memory"), dict) and "kv_reserve_gib" in recipe["memory"]):
         recipe["memory"] = {"kv_reserve_gib": reserve}
@@ -327,6 +336,9 @@ def backup_moves(stamp: str | None = None) -> list[tuple[Path, Path]]:
     if recipes.is_dir():
         for current, dirs, files in os.walk(recipes):
             dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not os.path.islink(os.path.join(current, d)))
+            if RECIPE_FILE in files:
+                # A recipe folder: its files/ and roles/ are what the recipe mounts, whatever their names.
+                dirs[:] = []
             for file_name in sorted(files):
                 full = Path(current) / file_name
                 if ".bak" in file_name and full.is_file() and not full.is_symlink():

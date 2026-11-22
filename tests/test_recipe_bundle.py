@@ -199,3 +199,38 @@ def test_the_cli_dry_run_writes_nothing(site, monkeypatch, capsys):
     assert "roles/head/start.sh" in out and "dry run: nothing was written" in out
     assert not folder_path(MODEL, "default").exists()
     assert cli.main(["recipes", "tidy-backups", "--dry-run"]) == 0
+
+
+def test_tidy_backups_never_moves_a_file_a_recipe_folder_carries(site):
+    save_recipe(MODEL, _recipe(site))
+    assert write_bundle(plan_bundle(_catalog(), _Sparks(), MODEL))[0]
+    root = folder_path(MODEL, "default")
+    carried = root / "files" / "opt" / "app" / "patch.bak.py"
+    carried.write_text("carried\n", encoding="utf-8")
+    beside = root / "recipe.toml.bak-1"
+    beside.write_text("old\n", encoding="utf-8")
+    rows = tidy_backups(stamp="20261122", dry_run=False)
+    assert carried.read_text(encoding="utf-8") == "carried\n"
+    assert [row["from"] for row in rows] == [str(beside)]
+    assert not beside.exists()
+
+
+def test_a_file_too_large_for_a_folder_is_refused_before_anything_is_written(site, monkeypatch):
+    from sparksi.recipes import bundle
+
+    save_recipe(MODEL, _recipe(site))
+    monkeypatch.setattr(bundle, "MAX_FILE_BYTES", 8)
+    plan = plan_bundle(_catalog(), _Sparks(), MODEL)
+    assert any(p.endswith("so leave its mount as it is with --keep") and "inner.sh" in p for p in plan.problems)
+    ok, said = write_bundle(plan)
+    assert not ok and said == plan.problems[0]
+    assert not folder_path(MODEL, "default").exists()
+
+
+def test_files_that_add_up_too_large_are_refused(site, monkeypatch):
+    from sparksi.recipes import bundle
+
+    save_recipe(MODEL, _recipe(site))
+    monkeypatch.setattr(bundle, "MAX_TOTAL_BYTES", 8)
+    plan = plan_bundle(_catalog(), _Sparks(), MODEL)
+    assert plan.problems == ["the files to bundle add up to more than 0 MiB, so leave the largest mounts as they are with --keep"]
