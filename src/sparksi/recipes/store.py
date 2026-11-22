@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Per-model recipe files. Only ``~/.config/sparksi/recipes/<id>.toml`` is written."""
+"""Per-model recipe files.
+
+Two layouts are read. A recipe folder, ``recipes/<id>/<name>/recipe.toml``, keeps
+the settings next to the files the recipe mounts (``files/`` and
+``roles/<role>/``). The older layout keeps the default at ``recipes/<id>.toml``
+and other recipes at ``named/<id>/<name>.toml``. A folder wins over an older
+file of the same name. The default's name is in ``named/<id>/index.json``.
+"""
 
 from __future__ import annotations
 
@@ -84,8 +91,27 @@ def valid_recipe_name(name: Any) -> bool:
     return isinstance(name, str) and bool(_NAME_RE.fullmatch(name))
 
 
+def contained(base: Path, *parts: str) -> Path:
+    """``base`` joined with ``parts``, refused when the result is not strictly inside ``base``."""
+    root = os.path.normpath(str(base))
+    full = os.path.normpath(os.path.join(root, *[str(part) for part in parts]))
+    if not full.startswith(root + os.sep):
+        raise ValueError("recipe path is outside the recipes folder")
+    return Path(full)
+
+
 def named_dir(model_id: str) -> Path:
-    return recipes_dir() / "named" / model_id
+    return contained(recipes_dir(), "named", model_id)
+
+
+def legacy_default_path(model_id: str) -> Path:
+    """Older layout: the default recipe file."""
+    return contained(recipes_dir(), f"{model_id}.toml")
+
+
+def legacy_named_path(model_id: str, name: str) -> Path:
+    """Older layout: a non-default recipe file."""
+    return contained(recipes_dir(), "named", model_id, f"{name}.toml")
 
 
 def default_recipe_name(model_id: str) -> str:
@@ -107,10 +133,48 @@ def set_default_name(model_id: str, name: str) -> None:
     os.replace(tmp, target / "index.json")
 
 
+RECIPE_FILE = "recipe.toml"
+
+
+def folder_path(model_id: str, name: str) -> Path:
+    """The recipe folder for this name, whether or not it exists."""
+    return contained(recipes_dir(), model_id, name)
+
+
+def folder_file(model_id: str, name: str) -> Path:
+    """``recipe.toml`` inside the recipe folder."""
+    return contained(recipes_dir(), model_id, name, RECIPE_FILE)
+
+
+def is_folder_recipe(model_id: str, name: str) -> bool:
+    return valid_recipe_name(name) and folder_file(model_id, name).is_file()
+
+
+def folder_names(model_id: str) -> list[str]:
+    """Names with a recipe folder, sorted."""
+    root = contained(recipes_dir(), model_id)
+    if not root.is_dir():
+        return []
+    return sorted(
+        child.name for child in root.iterdir()
+        if child.is_dir() and valid_recipe_name(child.name) and (child / RECIPE_FILE).is_file()
+    )
+
+
+def backups_dir(stamp: str | None = None) -> Path:
+    """``~/.config/sparksi/backups/<date>``: where moved-aside recipes go. Nothing there is deleted."""
+    from datetime import datetime
+
+    day = stamp or datetime.now().strftime("%Y%m%d")
+    return contained(recipes_dir().parent, "backups", day)
+
+
 def named_recipe_path(model_id: str, name: str) -> Path:
+    if is_folder_recipe(model_id, name):
+        return folder_file(model_id, name)
     if name == default_recipe_name(model_id):
-        return recipes_dir() / f"{model_id}.toml"
-    return named_dir(model_id) / f"{name}.toml"
+        return legacy_default_path(model_id)
+    return legacy_named_path(model_id, name)
 
 
 @contextmanager
@@ -125,7 +189,8 @@ def using_recipe(model_id: str, name: str | None):
 def recipe_names(model_id: str) -> list[str]:
     names: list[str] = []
     default = default_recipe_name(model_id)
-    if (recipes_dir() / f"{model_id}.toml").is_file():
+    folders = folder_names(model_id)
+    if legacy_default_path(model_id).is_file() or default in folders:
         names.append(default)
     seen = set(names)
     for path in sorted(named_dir(model_id).glob("*.toml")):
@@ -133,14 +198,29 @@ def recipe_names(model_id: str) -> list[str]:
         if valid_recipe_name(stem) and stem != default and stem not in seen:
             names.append(stem)
             seen.add(stem)
+    for name in folders:
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
     return names
+
+
+def active_recipe_name(model_id: str) -> str:
+    """The recipe a plan or start for this model reads: the selected one, else the default."""
+    active = _ACTIVE.get()
+    if active is not None and active[0] == model_id:
+        return active[1]
+    return default_recipe_name(model_id)
 
 
 def recipe_path(model_id: str) -> Path:
     active = _ACTIVE.get()
     if active is not None and active[0] == model_id:
         return named_recipe_path(model_id, active[1])
-    return recipes_dir() / f"{model_id}.toml"
+    default = default_recipe_name(model_id)
+    if is_folder_recipe(model_id, default):
+        return folder_file(model_id, default)
+    return legacy_default_path(model_id)
 
 
 def load_recipe(model_id: str) -> dict[str, Any]:

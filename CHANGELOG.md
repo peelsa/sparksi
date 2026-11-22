@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A recipe can now live in its own folder, `recipes/<model-id>/<name>/`, with `recipe.toml` next to the files it mounts (`files/` and `roles/<role>/`). Save writes inside the folder, Save as copies the whole folder, Rename moves it, and Delete moves it into `backups/<date>/deleted/` instead of removing it. Recipes in the older layout work as before.
 - A Spark card for a process no Sparksi run owns, such as an engine started outside Sparksi, shows its client URL with Copy again, as a run does. The worker of a pair shows "Head endpoint" and the head's URL. Loopback and wildcard addresses are never shown.
 - A two-Spark engine started outside Sparksi, with the same container name and port on both Sparks and no TP setting or -head/-worker suffix, now shows on both Spark cards instead of the worker reading "Nothing running".
 - The node probe also checks the Spark's own tailnet address when a model port is closed on loopback, so a server bound only to that address is seen. Off-limits ports are never tried there. A port where a catalog row declares served names is asked `/v1/models`, so the served name can be matched.
