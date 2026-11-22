@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,7 +13,10 @@ from sparksi.recipes.pinned_settings import pinned_settings
 from sparksi.recipes.service import valid_id, write_recipe
 from sparksi.recipes.store import (
     DEFAULT_NAME,
+    backups_dir,
     default_recipe_name,
+    folder_path,
+    is_folder_recipe,
     load_recipe,
     named_dir,
     named_recipe_path,
@@ -58,6 +62,8 @@ def _summary(model_id: str, name: str, default: str) -> dict[str, Any]:
         # Save is refused only on an original pinned command; a Save as copy saves in place.
         "locked": kind == "pinned" and not copied_from,
         "copied_from": copied_from,
+        # A recipe folder keeps its settings, start scripts and patch files together.
+        "folder": is_folder_recipe(model_id, name),
         "engine": str(recipe.get("engine") or ""),
         "placement": str(recipe.get("placement") or ""),
         "modified": modified,
@@ -182,6 +188,11 @@ def save_as(model_id: str, body: dict[str, Any], runner: Any = None) -> tuple[in
         source = default_recipe_name(model_id) if names else ""
     if not names:
         set_default_name(model_id, name)  # first recipe becomes the default
+    if is_folder_recipe(model_id, name) or (exists and source and source != name and is_folder_recipe(model_id, source)):
+        # A folder holds files as well as settings: it is never overwritten by a copy.
+        return 409, {"error": f"a recipe named {name} already exists; pick another name", "exists": True}
+    if source and source != name and is_folder_recipe(model_id, source):
+        return _save_as_folder(model_id, name, source, body, runner, first=not names)
     target = named_recipe_path(model_id, name)
     previous = target.read_bytes() if target.is_file() else None
     if source and source != name:
@@ -213,6 +224,37 @@ def save_as(model_id: str, body: dict[str, Any], runner: Any = None) -> tuple[in
     return 200, out
 
 
+def _save_as_folder(model_id: str, name: str, source: str, body: dict[str, Any], runner: Any, *, first: bool) -> tuple[int, dict[str, Any]]:
+    """Save as from a recipe folder: the new recipe is a full copy of the folder, files included."""
+    target = folder_path(model_id, name)
+    tmp = target.parent / f".{name}.tmp"
+    shutil.rmtree(tmp, ignore_errors=True)  # a leftover from an interrupted copy of this same name
+    shutil.copytree(folder_path(model_id, source), tmp, symlinks=True)
+    os.replace(tmp, target)
+    if first:
+        set_default_name(model_id, name)
+    form = _form(body)
+    copied_from = source if (_kind(model_id, source) == "pinned" or form.get("kind") == "pinned") else ""
+    with using_recipe(model_id, name):
+        code, out = write_recipe(model_id, form, runner, copied_from=copied_from)
+    if code != 200:
+        shutil.rmtree(target, ignore_errors=True)  # only the copy made just above
+        return code, out
+    out["name"] = name
+    return 200, out
+
+
+def _move_aside(model_id: str, name: str) -> None:
+    """A deleted recipe folder is moved into backups/<date>/deleted/, never removed."""
+    dest = backups_dir() / "deleted" / model_id / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = dest.with_name(f"{name}.{n}")
+    shutil.move(str(folder_path(model_id, name)), str(dest))
+
+
 def set_default(model_id: str, name: str) -> tuple[int, dict[str, Any]]:
     bad = _bad(model_id, name)
     if bad is not None:
@@ -226,9 +268,11 @@ def set_default(model_id: str, name: str) -> tuple[int, dict[str, Any]]:
     moved = named_dir(model_id) / f"{current}.toml"
     src = named_dir(model_id) / f"{name}.toml"
     named_dir(model_id).mkdir(parents=True, exist_ok=True)
-    if base.is_file():
+    # A recipe folder stays where it is; only the older layout keeps the default at <id>.toml.
+    if base.is_file() and not is_folder_recipe(model_id, current):
         os.replace(base, moved)
-    os.replace(src, base)
+    if not is_folder_recipe(model_id, name):
+        os.replace(src, base)
     set_default_name(model_id, name)
     return list_named(model_id)
 
@@ -251,6 +295,8 @@ def rename_named(model_id: str, name: str, body: dict[str, Any]) -> tuple[int, d
     # A rename moves no launch command: the default only changes its name in
     # index.json and stays at <id>.toml, so Load default recipe is unchanged.
     current = default_recipe_name(model_id)
+    if is_folder_recipe(model_id, new) or (new in names and is_folder_recipe(model_id, name)):
+        return 409, {"error": f"a recipe named {new} already exists", "exists": True}
     if new in names:
         if body.get("overwrite") is not True:
             return 409, {"error": f"a recipe named {new} already exists", "exists": True}
@@ -259,7 +305,11 @@ def rename_named(model_id: str, name: str, body: dict[str, Any]) -> tuple[int, d
         if _locked(model_id, new):
             return 409, _keep_pinned(new)
         (named_dir(model_id) / f"{new}.toml").unlink(missing_ok=True)
-    if name == current:
+    if is_folder_recipe(model_id, name):
+        os.replace(folder_path(model_id, name), folder_path(model_id, new))
+        if name == current:
+            set_default_name(model_id, new)
+    elif name == current:
         set_default_name(model_id, new)
     else:
         os.replace(named_dir(model_id) / f"{name}.toml", named_dir(model_id) / f"{new}.toml")
@@ -278,5 +328,8 @@ def delete_named(model_id: str, name: str) -> tuple[int, dict[str, Any]]:
         other != name and _kind(model_id, other) == "pinned" for other in recipe_names(model_id)
     ):
         return 409, {"error": "this is the model's only pinned launch command, so it cannot be deleted"}
-    (named_dir(model_id) / f"{name}.toml").unlink(missing_ok=True)
+    if is_folder_recipe(model_id, name):
+        _move_aside(model_id, name)
+    else:
+        (named_dir(model_id) / f"{name}.toml").unlink(missing_ok=True)
     return list_named(model_id)

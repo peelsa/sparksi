@@ -77,9 +77,11 @@ Recipes live in `$XDG_CONFIG_HOME/sparksi/recipes` (default `~/.config/sparksi/r
 
 Layout:
 
-- Default recipe: `<model-id>.toml`
-- Other recipes: `named/<model-id>/<name>.toml`
-- `named/<model-id>/index.json` records the default's name.
+- Recipe folder: `<model-id>/<name>/recipe.toml`. The folder also holds the files the recipe mounts: `files/` for files every Spark uses, and `roles/<role>/` (for example `roles/head/start.sh` and `roles/worker/start.sh`) for files one Spark uses.
+- Older layout: the default recipe at `<model-id>.toml` and other recipes at `named/<model-id>/<name>.toml`.
+- `named/<model-id>/index.json` records the default's name in both layouts.
+
+A folder wins over an older-layout file with the same name. Save writes `recipe.toml` inside the folder. Save as from a folder recipe copies the whole folder, files included, under the new name. Save as and Rename never replace an existing folder. Set as default only changes the name in `index.json`; a folder is never moved by it. Rename moves the folder. Delete moves the folder into `~/.config/sparksi/backups/<date>/deleted/<model-id>/<name>/` and removes nothing.
 
 `sparksi.toml` and `catalog.yaml` are never written by a recipe save.
 
