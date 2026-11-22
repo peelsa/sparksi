@@ -255,8 +255,13 @@ def _scalar(value: Any) -> str:
     raise TypeError(type(value).__name__)
 
 
+def _key(key: str) -> str:
+    """A TOML key: bare when it can be, quoted otherwise (a library path, for one)."""
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _scalar(key)
+
+
 def _emit(key: str, value: Any) -> str:
-    return f"{key} = {_scalar(value)}"
+    return f"{_key(key)} = {_scalar(value)}"
 
 
 def _emit_table(prefix: str, data: dict[str, Any], lines: list[str]) -> None:
@@ -270,7 +275,7 @@ def _emit_table(prefix: str, data: dict[str, Any], lines: list[str]) -> None:
     for key, value in scalars:
         lines.append(_emit(key, value))
     for key, value in tables:
-        path = f"{prefix}.{key}" if prefix else key
+        path = f"{prefix}.{_key(key)}" if prefix else _key(key)
         lines.append("")
         lines.append(f"[{path}]")
         _emit_table(path, value, lines)
@@ -324,13 +329,22 @@ def save_recipe(model_id: str, fields: dict[str, Any]) -> Path:
 
     An env value that looks like a token is refused. The message names the key only.
     """
+    text = recipe_text(fields)
+    path = recipe_path(model_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def recipe_text(fields: dict[str, Any]) -> str:
+    """The recipe.toml text ``save_recipe`` writes for these fields; raises ValueError like it."""
     unknown = sorted(str(key) for key in fields if str(key) not in KEYS)
     if unknown:
         listed = ", ".join(unknown)
         raise ValueError(f"unknown recipe key {listed}" if len(unknown) == 1 else f"unknown recipe keys: {listed}")
     _refuse_token_values(fields)
-    path = recipe_path(model_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# Local launch recipe. Sparksi does not write sparksi.toml or catalog.yaml.", ""]
     tables: list[tuple[str, dict[str, Any]]] = []
     for key in KEYS:
@@ -345,8 +359,4 @@ def save_recipe(model_id: str, fields: dict[str, Any]) -> Path:
         lines.append("")
         lines.append(f"[{key}]")
         _emit_table(key, value, lines)
-    text = "\n".join(lines) + "\n"
-    tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-    return path
+    return "\n".join(lines) + "\n"
