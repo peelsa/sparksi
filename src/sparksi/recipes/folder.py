@@ -49,10 +49,11 @@ class Folder:
     root: Path
     entries: list[Entry] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    settings_sha256: str = ""  # recipe.toml, which also holds the recorded image and file hashes
 
     @property
     def version(self) -> str:
-        return version_of(self.entries)
+        return version_of(self.entries, self.settings_sha256)
 
     def paths(self) -> set[str]:
         return {entry.path for entry in self.entries}
@@ -69,6 +70,16 @@ def _sha256(path: Path) -> str:
 def scan(root: Path) -> Folder:
     """Every carried file under ``root``, sorted. Links, devices and oversize files are problems."""
     found = Folder(root=root)
+    settings = root / "recipe.toml"
+    try:
+        info = settings.lstat()
+    except OSError:
+        info = None
+    if info is not None:
+        if stat.S_ISREG(info.st_mode):
+            found.settings_sha256 = _sha256(settings)
+        else:
+            found.problems.append("recipe.toml in the recipe folder must be a regular file")
     total = 0
     for top in CARRIED:
         base = root / top
@@ -113,12 +124,18 @@ def manifest_text(entries: list[Entry]) -> str:
     return "".join(f"{entry.sha256}  {entry.path}\n" for entry in sorted(entries, key=lambda e: e.path))
 
 
-def version_of(entries: list[Entry]) -> str:
-    """Short hash of the manifest plus which files are executable."""
+def version_of(entries: list[Entry], settings_sha256: str = "") -> str:
+    """Short hash of the manifest, which files are executable, and ``recipe.toml``.
+
+    ``recipe.toml`` counts so a folder with no files still has a version, and a
+    change to its recorded image or file hashes makes a new one.
+    """
     digest = hashlib.sha256(manifest_text(entries).encode("utf-8"))
     for entry in sorted(entries, key=lambda e: e.path):
         if entry.executable:
             digest.update(f"x {entry.path}\n".encode("utf-8"))
+    if settings_sha256:
+        digest.update(f"recipe.toml {settings_sha256}\n".encode("utf-8"))
     return digest.hexdigest()[:VERSION_CHARS]
 
 
@@ -198,14 +215,16 @@ def resolve(recipe: dict[str, Any], model_id: str, name: str, root: Path | None)
     """A copy of ``recipe`` with ``@files/`` and ``@role/`` sources turned into Spark paths.
 
     ``root`` is the recipe folder here, or None for an older-layout recipe. The
-    recipe passed in is never changed.
+    recipe passed in is never changed. A folder recipe gets a version and a copy
+    folder per Spark even when it mounts no folder files.
     """
     out = Resolved(recipe=copy.deepcopy(recipe))
-    if not uses_folder(recipe):
-        return out
     if root is None:
-        out.conflicts.append("this recipe names @files/ or @role/ files but is not in a recipe folder")
+        if uses_folder(recipe):
+            out.conflicts.append("this recipe names @files/ or @role/ files but is not in a recipe folder")
         return out
+    # A folder recipe always has a version, even with no files: its Sparks still get
+    # a (possibly empty) copy, so the page shows the folder and each Spark's state.
     found = scan(root)
     out.conflicts.extend(found.problems)
     out.entries = found.entries

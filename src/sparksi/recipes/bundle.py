@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Any
 
 from sparksi.config import CFG
-from sparksi.recipes.folder import MAX_FILE_BYTES, MAX_TOTAL_BYTES, scan
-from sparksi.recipes.pins import binary_sha256, image_id
+from sparksi.recipes.folder import MAX_FILE_BYTES, MAX_TOTAL_BYTES, Entry, scan, version_of
+from sparksi.recipes.pins import image_id, native_pins
 from sparksi.recipes.store import (
     RECIPE_FILE,
     backups_dir,
@@ -37,6 +37,7 @@ from sparksi.recipes.store import (
     named_recipe_path,
     recipe_names,
     recipes_dir,
+    recipe_text,
     save_recipe,
     using_recipe,
     valid_recipe_name,
@@ -77,7 +78,20 @@ class Bundle:
                 for rel, data in sorted(self.files.items())
             ],
             "recipe": self.recipe,
+            "version": self.version(),
         }
+
+    def version(self) -> str:
+        """The folder version this bundle will have once written; "" when the recipe cannot be saved."""
+        try:
+            settings = hashlib.sha256(recipe_text(self.recipe).encode("utf-8")).hexdigest()
+        except (TypeError, ValueError):
+            return ""
+        entries = [
+            Entry(rel, hashlib.sha256(data).hexdigest(), len(data), self.executable.get(rel, False))
+            for rel, data in self.files.items()
+        ]
+        return version_of(entries, settings)
 
 
 def _under(path: str, roots: list[str]) -> bool:
@@ -243,12 +257,24 @@ def plan_bundle(
 def _record_pins(runner: Any, host: str, role_name: str, role: dict[str, Any], out: Bundle) -> None:
     if role.get("runtime") == "native":
         binary = str(role.get("binary") or "")
-        if binary.startswith("/") and not role.get("binary_sha256"):
-            digest = binary_sha256(runner, host, binary)
-            if digest:
-                role["binary_sha256"] = digest
-            else:
+        recorded = str(role.get("binary_sha256") or "").strip().lower()
+        # An older recipe that records only the binary still gets its libraries recorded.
+        if binary.startswith("/") and not (recorded and role.get("library_sha256")):
+            env = role.get("env") if isinstance(role.get("env"), dict) else {}
+            ld_path = str(env.get("LD_LIBRARY_PATH") or role.get("ld_library_path") or "")
+            read = native_pins(runner, host, binary, ld_path)
+            if not read or not read[0]:
                 out.problems.append(f"could not read the SHA-256 of {binary} on {host}")
+                return
+            if recorded and read[0] != recorded:
+                # Its libraries now belong to a different build than the one the recipe records.
+                out.problems.append(f"{binary} on {host} does not match the SHA-256 this recipe records, so its libraries were not recorded")
+                return
+            role["binary_sha256"] = read[0]
+            if read[1] and not role.get("library_sha256"):
+                # Libraries it loads from its own build tree; system libraries are left out.
+                role["library_sha256"] = dict(read[1])
+                out.notes.append(f"recorded {len(read[1])} libraries {binary} loads from its build tree")
         return
     image = str(role.get("image") or "")
     if image and not role.get("image_id"):

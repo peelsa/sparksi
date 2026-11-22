@@ -92,7 +92,7 @@ In a folder recipe, a pinned role's mount source (or a native role's `binary`) c
 - `@files/<path>` is `files/<path>`, the same file for every Spark.
 - `@role/<path>` is `roles/<role>/<path>` for the Spark that runs that role, for example `@role/start.sh:/start.sh:ro` mounts `roles/head/start.sh` on the head and `roles/worker/start.sh` on the worker.
 
-The saved recipe keeps these sources as written. A save, dry run or load checks them as the paths they become on each Spark: `<recipe_root>/<model-id>/<name>/<version>/...`, where the version is the hash of the folder's file list (see `[[nodes]] recipe_root` in [config](config.md)). A file the recipe names but the folder lacks, a path with `..`, a link, or a file under `roles/` for an unknown role refuses the plan. A start script mounted from the folder is checked for wildcard binds from the folder itself. The plan answer has a `files` block: the folder, its version, the file count, each Spark's copy path and the manifest. `recipe.toml` itself is not part of the version.
+The saved recipe keeps these sources as written. A save, dry run or load checks them as the paths they become on each Spark: `<recipe_root>/<model-id>/<name>/<version>/...`, where the version is the hash of the folder's file list and of `recipe.toml` (see `[[nodes]] recipe_root` in [config](config.md)). A file the recipe names but the folder lacks, a path with `..`, a link, or a file under `roles/` for an unknown role refuses the plan. A start script mounted from the folder is checked for wildcard binds from the folder itself. The plan answer has a `files` block: the folder, its version, the file count, each Spark's copy path and the manifest. `recipe.toml` is never copied, but its hash is part of the version, so a folder with no files still has a version and a changed recorded hash makes a new one.
 
 ### Copy and check before every start
 
@@ -108,7 +108,7 @@ A dry run is read-only. Its `files.sparks` block shows each Spark's copy as `mat
 
 ### What the recipe page shows
 
-For a folder recipe, the recipe page shows the folder, its version (the first 16 characters of the hash of its files) and the number of files. It also shows one line for each Spark the recipe uses: the copy matches, it is not copied yet (Load copies it first), it does not match (Load is refused), or it could not be checked. The recipe list (`GET /api/models/<id>/recipes`) gives each recipe's `folder` and `version`. A plan gives the same under `files`, with each Spark's state in `files.sparks`.
+For a folder recipe, the recipe page shows the folder, its version (the first 16 characters of the hash of its files and `recipe.toml`) and the number of files, which may be 0. It also shows one line for each Spark the recipe uses: the copy matches, it is not copied yet (Load copies it first), it does not match (Load is refused), or it could not be checked. The recipe list (`GET /api/models/<id>/recipes`) gives each recipe's `folder` and `version`. A plan gives the same under `files`, with each Spark's state in `files.sparks`.
 
 Once a model has a recipe in a folder, its catalog launch command is no longer a way to start it. The model's `custom` engine is hidden, a plan with it is refused, and a catalog service Start is refused with "This model starts from its recipe folder now, not from its catalog launch command. Load its recipe instead." Stop still works, so a copy started the old way can be stopped. The catalog block itself stays in the catalog until you delete it.
 
@@ -125,7 +125,12 @@ image_id = "sha256:<64 hex>"   # from: docker image inspect --format '{{.Id}}' <
 runtime = "native"
 binary = "/opt/server/bin/server"
 binary_sha256 = "<64 hex>"     # from: sha256sum <binary>
+
+[roles.worker.library_sha256]   # libraries the binary loads from its own build tree
+"/opt/server/bin/libexample.so.0" = "<64 hex>"
 ```
+
+For a native role, `sparksi recipes bundle` records `binary_sha256` and `library_sha256`. An older recipe that records only `binary_sha256` gets its libraries too, once its binary still matches that hash; a binary that no longer matches refuses the bundle. The libraries are found by reading the binary's needed libraries (and theirs), its RPATH or RUNPATH (with `$ORIGIN`, and the RPATH of the files that load it, as the dynamic loader does) and the role's `LD_LIBRARY_PATH`, without running anything. A file that is not a 64-bit little-endian ELF, or a damaged one, is read as loading nothing, and at most 256 libraries are recorded. Only libraries inside the binary's own tree (the folder above its `bin/`) and inside the Spark's mount roots are recorded, so system and CUDA libraries are left out. The start check reads the binary and every recorded library in one call, and a changed or missing one refuses with one sentence, for example "/opt/server/bin/libexample.so.0 on spark-a does not match the SHA-256 this recipe records, so it will not start." A library added to the tree later is not seen until the binary is bundled again.
 
 Every plan and every start checks the Spark that runs the role. A different build refuses with one sentence, for example "spark-a has a different build of image example.invalid/vllm:1 than this recipe records, so it will not start." The image and the binary are never copied into the recipe folder. They stay where they are, and only their identity is recorded.
 
@@ -140,7 +145,7 @@ Without `[memory]`, the model card's `kv_reserve_gib` is used as before.
 
 ### Moving an older recipe into a folder
 
-`sparksi recipes bundle <model-id> [--recipe NAME] [--keep SOURCE] [--dry-run]` moves an older pinned recipe into its own folder. It reads each file the recipe mounts from the Spark that mounts it (read only) and puts it in the folder. It also rewrites each mount to an `@files/` or `@role/` source, and records each role's `image_id` (or `binary_sha256` for a native role) and the model card's KV reserve as `[memory] kv_reserve_gib`.
+`sparksi recipes bundle <model-id> [--recipe NAME] [--keep SOURCE] [--dry-run]` moves an older pinned recipe into its own folder. It reads each file the recipe mounts from the Spark that mounts it (read only) and puts it in the folder. It also rewrites each mount to an `@files/` or `@role/` source, and records each role's `image_id` (or `binary_sha256` and `library_sha256` for a native role) and the model card's KV reserve as `[memory] kv_reserve_gib`.
 
 - A file mounted as the role's start script (a `.sh` the command runs) becomes `roles/<role>/start.sh`. The head and worker scripts stay separate.
 - Other files go under `files/<container path>`. When the head and the worker mount the same container path with different bytes, each copy goes under `roles/<role>/` instead.

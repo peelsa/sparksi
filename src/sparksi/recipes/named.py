@@ -50,7 +50,7 @@ def _folder_version(model_id: str, name: str) -> str:
     from sparksi.recipes.folder import scan
 
     found = scan(folder_path(model_id, name))
-    return "" if found.problems or not found.entries else found.version
+    return "" if found.problems else found.version
 
 
 def _summary(model_id: str, name: str, default: str) -> dict[str, Any]:

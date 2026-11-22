@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -2045,13 +2046,155 @@ def _files_read(req: dict) -> dict:
 
 
 def _file_sha256(req: dict) -> dict:
-    """Read-only: SHA-256 of one file under the mount roots (a pinned binary, for example)."""
-    path = _inside_root(req.get("path"), _CFG.get("mount_roots") or [])
+    """Read-only: SHA-256 of files under the mount roots (a pinned binary, for example).
+
+    ``path`` hashes one file. With ``libs`` true it also lists the shared
+    libraries that file loads from its own build tree (see ``_tree_libs``).
+    ``paths`` hashes several files in one call and answers ``files``.
+    """
+    roots = _CFG.get("mount_roots") or []
+    if req.get("paths") is not None:
+        files: dict = {}
+        paths = list(req.get("paths") or [])
+        if len(paths) > LIBS_MAX + 1:  # a binary and its recorded libraries; never cut short
+            return {"ok": False, "error": f"refusing more than {LIBS_MAX + 1} files in one check"}
+        for raw in paths:
+            path = _inside_root(raw, roots)
+            if path is None:
+                return {"ok": False, "error": f"refusing {raw}: outside the mount roots"}
+            found = os.path.isfile(path)
+            files[str(raw)] = {"exists": found, "sha256": _file_digest(path) if found else ""}
+        return {"ok": True, "files": files}
+    path = _inside_root(req.get("path"), roots)
     if path is None:
         return {"ok": False, "error": "refusing a file outside the mount roots"}
     if not os.path.isfile(path):
         return {"ok": True, "exists": False, "sha256": ""}
-    return {"ok": True, "exists": True, "sha256": _file_digest(path)}
+    out = {"ok": True, "exists": True, "sha256": _file_digest(path)}
+    if req.get("libs"):
+        out["libs"] = _tree_libs(path, str(req.get("ld_library_path") or ""), roots)
+    return out
+
+
+# --- shared libraries a native binary loads from its own build tree ---------
+# Read from the ELF dynamic section (DT_NEEDED, DT_RPATH, DT_RUNPATH); nothing
+# is run. Only libraries under the binary's tree (the folder above the one it
+# sits in) and inside the mount roots count; system libraries are left out.
+
+LIBS_MAX = 256
+_DT_NEEDED, _DT_STRTAB, _DT_STRSZ, _DT_RPATH, _DT_RUNPATH = 1, 5, 10, 15, 29
+
+
+def _elf_dynamic(path: str) -> tuple[list, list, list] | None:
+    """(needed, rpath, runpath) of a 64-bit little-endian ELF file; None when it is not one."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(64)
+            if len(head) < 64 or head[:4] != b"\x7fELF" or head[4] != 2 or head[5] != 1:
+                return None
+            (phoff,) = struct.unpack_from("<Q", head, 0x20)
+            phentsize, phnum = struct.unpack_from("<HH", head, 0x36)
+            if phentsize < 56 or phnum > 512:
+                return None
+            handle.seek(phoff)
+            table = handle.read(phentsize * phnum)
+            loads = []
+            dynamic = None
+            for index in range(phnum):
+                p_type, _flags, p_offset, p_vaddr, _paddr, p_filesz, _memsz, _align = struct.unpack_from(
+                    "<IIQQQQQQ", table, index * phentsize
+                )
+                if p_type == 1:
+                    loads.append((p_vaddr, p_offset, p_filesz))
+                elif p_type == 2:
+                    dynamic = (p_offset, p_filesz)
+            if dynamic is None:
+                return [], [], []
+            if dynamic[1] > 1 << 20:
+                return None
+            handle.seek(dynamic[0])
+            raw = handle.read(dynamic[1])
+            entries = []
+            for offset in range(0, len(raw) - 15, 16):
+                tag, value = struct.unpack_from("<qQ", raw, offset)
+                if tag == 0:
+                    break
+                entries.append((tag, value))
+            tags = dict(entries)
+            strtab, strsz = tags.get(_DT_STRTAB), tags.get(_DT_STRSZ)
+            if strtab is None or strsz is None or strsz > 1 << 22:
+                return None
+            start = next((off + strtab - vaddr for vaddr, off, size in loads if vaddr <= strtab < vaddr + size), None)
+            if start is None:
+                return None
+            handle.seek(start)
+            strings = handle.read(strsz)
+    except (OSError, struct.error, ValueError, OverflowError):  # a truncated or malformed file
+        return None
+
+    def text(index: int) -> str:
+        end = strings.find(b"\0", index)
+        return strings[index:end if end >= 0 else len(strings)].decode("utf-8", "replace")
+
+    needed: list = []
+    rpath: list = []
+    runpath: list = []
+    for tag, value in entries:
+        if value >= len(strings):
+            continue
+        if tag == _DT_NEEDED:
+            needed.append(text(value))
+        elif tag == _DT_RPATH:
+            rpath.extend(text(value).split(":"))
+        elif tag == _DT_RUNPATH:
+            runpath.extend(text(value).split(":"))
+    return needed, rpath, runpath
+
+
+def _tree_libs(binary: str, ld_library_path: str, roots: list) -> dict:
+    """Path -> SHA-256 of each shared library ``binary`` loads from its own build tree."""
+    tree = os.path.dirname(os.path.dirname(os.path.realpath(binary)))
+    if tree in ("", "/"):
+        return {}
+    env_dirs = [part for part in ld_library_path.split(":") if part]
+    found: dict = {}
+    # (file, RPATH folders of the files that loaded it): an object without RUNPATH also
+    # searches its loaders' RPATH, as the dynamic loader does.
+    pending: list = [(binary, [])]
+    seen = {os.path.realpath(binary)}
+    while pending and len(found) < LIBS_MAX:
+        current, inherited = pending.pop(0)
+        info = _elf_dynamic(current)
+        if not info:
+            continue
+        needed, rpath, runpath = info
+        origin = os.path.dirname(os.path.realpath(current))
+
+        def expand(folders: list, origin: str = origin) -> list:
+            return [d.replace("${ORIGIN}", origin).replace("$ORIGIN", origin) for d in folders if d]
+
+        own = [] if runpath else expand(rpath)
+        chain = own + inherited
+        dirs = ([] if runpath else chain) + env_dirs + expand(runpath)
+        for name in needed:
+            if len(found) >= LIBS_MAX:
+                break
+            if not name or "/" in name:
+                continue
+            for folder in dirs:
+                candidate = os.path.normpath(os.path.join(folder, name))
+                if not os.path.isfile(candidate):
+                    continue
+                real = os.path.realpath(candidate)
+                if real in seen:
+                    break
+                if not real.startswith(tree + os.sep) or _inside_root(candidate, roots) is None:
+                    break  # a system library or one outside the tree: not recorded
+                seen.add(real)
+                found[candidate] = _file_digest(candidate)
+                pending.append((candidate, chain))
+                break
+    return dict(sorted(found.items()))
 
 
 def _image_command(argv: list) -> list[str]:

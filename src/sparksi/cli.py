@@ -349,7 +349,7 @@ def cmd_recipes_bundle(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(view, indent=2, default=str))
     else:
-        print(f"{bundle.model_id} recipe {bundle.name}: {len(view['files'])} files")
+        print(f"{bundle.model_id} recipe {bundle.name}: {len(view['files'])} files, version {view['version'] or 'unknown'}")
         for item in view["files"]:
             print(f"  {item['path']}  {item['sha256'][:16]}  from {', '.join(item['from'])}")
         for item in view["kept"]:
