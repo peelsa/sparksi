@@ -138,6 +138,19 @@ kv_reserve_gib = 15
 
 Without `[memory]`, the model card's `kv_reserve_gib` is used as before.
 
+### Moving an older recipe into a folder
+
+`sparksi recipes bundle <model-id> [--recipe NAME] [--keep SOURCE] [--dry-run]` moves an older pinned recipe into its own folder. It reads each file the recipe mounts from the Spark that mounts it (read only) and puts it in the folder. It also rewrites each mount to an `@files/` or `@role/` source, and records each role's `image_id` (or `binary_sha256` for a native role) and the model card's KV reserve as `[memory] kv_reserve_gib`.
+
+- A file mounted as the role's start script (a `.sh` the command runs) becomes `roles/<role>/start.sh`. The head and worker scripts stay separate.
+- Other files go under `files/<container path>`. When the head and the worker mount the same container path with different bytes, each copy goes under `roles/<role>/` instead.
+- Weights and the Hugging Face cache are never copied, and nor is a source given with `--keep`. Those mounts stay as they are.
+- A link, a missing file or a file over the size limit refuses the bundle, and nothing is written.
+
+`--dry-run` lists every file, its hash and where it was read from, and writes nothing. A write builds the folder in a temporary sibling, checks every hash, renames it into place and moves the older recipe file to `backups/<date>/bundled/<model-id>/<name>.toml`. Nothing is deleted. To undo it, move that file back and move the new folder aside.
+
+`sparksi recipes tidy-backups [--dry-run]` moves `recipes.bak-*` folders and `*.bak*` files from the config folder and the recipes folder into `backups/<date>/`. It only moves. A file whose target already exists is left where it is.
+
 ## Loading a recipe
 
 To load a recipe:
