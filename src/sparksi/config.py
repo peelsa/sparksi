@@ -589,6 +589,7 @@ class Config:
             "too_broad": ["/", "/home", home, *[str(p) for p in self.paths.get("too_broad") or []]],
             "direct_prefixes": [str(p) for p in self.paths.get("direct_prefixes") or []],
             "mount_roots": self.mount_roots(),
+            "recipe_roots": [root for root in (self.node_recipe_root(node) for node in self.nodes) if root],
             "service_commands": self.service_commands(),
             # Off unless the file sets [controller] stop_unmanaged = true; the agent refuses otherwise.
             "stop_unmanaged": self.controller.get("stop_unmanaged") is True,

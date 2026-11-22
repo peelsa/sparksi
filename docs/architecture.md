@@ -14,7 +14,12 @@ container and not an OOM killer.
 - `sparksi.announce` runs on each Spark (standard library only) and sends one
   datagram every 3 s to the controller's announce port (default 7501).
 - `sparksi.agent` is sent over SSH for each operation (standard library only,
-  never installed).
+  never installed). For recipe folders it has four ops. `files_stage` writes a
+  copy once under that Spark's recipe root, checks every file by SHA-256, makes
+  it read-only and renames it into place. It never rewrites or removes an
+  existing copy; it only compares it. `files_check` compares a copy with a
+  manifest and reports missing, changed and extra files. `files_read` and
+  `file_sha256` read files under the mount roots without changing them.
 - `sparksi.monitor` shapes the announce data into the monitor card, which the
   dashboard and the terminal UI (`sparksi-monitor`) both read.
 

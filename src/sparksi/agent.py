@@ -8,6 +8,7 @@ this process checks them again before any write or delete.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import signal
 import socket
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
 # --- COMPAT: node copy of sparksi.compat (stdlib only; tests/test_compat.py keeps it equal) ---
@@ -52,6 +54,8 @@ _CFG: dict = {
     ],
     # Exact argv lists a catalog service may run. Matched verbatim.
     "service_commands": [],
+    # Folders on this Spark that hold copied recipe folders. Empty refuses every copy.
+    "recipe_roots": [],
     "stop_unmanaged": False,
 }
 
@@ -88,6 +92,10 @@ def configure(values: dict | None) -> None:
             if isinstance(val, list):
                 _CFG["mount_roots"] = _clean_roots(val)
                 _MOUNTS_CONFIGURED = True
+            continue
+        if key == "recipe_roots":
+            if isinstance(val, list):
+                _CFG["recipe_roots"] = _clean_roots(val)
             continue
         if key in _CFG and val not in (None, "", []):
             _CFG[key] = list(val) if isinstance(_CFG[key], list) else str(val)
@@ -142,6 +150,14 @@ def main(req: dict) -> dict:
             return _service(req)
         if op == "stop_unmanaged":
             return _stop_unmanaged(req)
+        if op == "files_check":
+            return _files_check(req)
+        if op == "files_stage":
+            return _files_stage(req)
+        if op == "files_read":
+            return _files_read(req)
+        if op == "file_sha256":
+            return _file_sha256(req)
         return {"ok": False, "error": f"unknown op {op!r}"}
     except Exception as e:  # noqa: BLE001 — remote JSON must carry the failure
         return {"ok": False, "error": str(e)}
@@ -1788,6 +1804,254 @@ def _evict_sha256() -> dict:
         detail = (proc.stderr or "could not read helper").strip()[-200:]
         return {"ok": False, "error": detail}
     return {"ok": True, "sha256": digest}
+
+
+# --- recipe folder copies -------------------------------------------------
+# A copied recipe folder lives at <recipe_root>/<model>/<name>/<version>/ and is
+# read-only once written. These ops never rewrite or remove an existing copy.
+
+FILES_MAX_BYTES = 256 * 1024 * 1024
+
+
+def _inside_root(path: str, roots: list) -> str | None:
+    """Normalised ``path`` when it is strictly inside one of ``roots``; None otherwise."""
+    raw = str(path or "")
+    if not raw.startswith("/") or ".." in raw.split("/"):
+        return None
+    text = os.path.normpath(raw)
+    for root in roots:
+        base = os.path.normpath(str(root))
+        if base in ("", ".", "/"):
+            continue
+        if text.startswith(base + os.sep):
+            return text
+    return None
+
+
+def _clean_rel(rel: str) -> str | None:
+    text = str(rel or "")
+    if not text or text.startswith("/") or "\\" in text:
+        return None
+    parts = text.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    if parts[0] not in ("files", "roles") or len(parts) < 2:
+        return None
+    return "/".join(parts)
+
+
+def _file_digest(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _manifest(req: dict) -> dict | None:
+    """rel -> (sha256, executable) from the request; None when any entry is malformed."""
+    found: dict = {}
+    for item in req.get("manifest") or []:
+        if not isinstance(item, dict):
+            return None
+        rel = _clean_rel(item.get("path"))
+        sha = str(item.get("sha256") or "")
+        if rel is None or len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha) or rel in found:
+            return None
+        found[rel] = (sha, bool(item.get("executable")))
+    return found
+
+
+def _compare(target: str, wanted: dict) -> dict:
+    """Hash every file in a copy and compare it with the manifest."""
+    if not os.path.isdir(target) or os.path.islink(target):
+        return {"ok": True, "state": "missing", "missing": sorted(wanted), "differs": [], "extra": []}
+    seen: dict = {}
+    for current, dirs, files in os.walk(target, followlinks=False):
+        for name in files + [d for d in dirs if os.path.islink(os.path.join(current, d))]:
+            full = os.path.join(current, name)
+            rel = os.path.relpath(full, target).replace(os.sep, "/")
+            if os.path.islink(full) or not os.path.isfile(full):
+                seen[rel] = None
+                continue
+            seen[rel] = (_file_digest(full), bool(os.stat(full).st_mode & 0o111))
+    missing = sorted(rel for rel in wanted if rel not in seen)
+    differs = sorted(rel for rel in wanted if rel in seen and seen[rel] != wanted[rel])
+    extra = sorted(rel for rel in seen if rel not in wanted)
+    state = "match" if not (missing or differs or extra) else "differs"
+    return {"ok": True, "state": state, "missing": missing, "differs": differs, "extra": extra}
+
+
+def _files_check(req: dict) -> dict:
+    """Read-only: does the copy at ``dir`` hold exactly the manifest?"""
+    target = _inside_root(req.get("dir"), _CFG.get("recipe_roots") or [])
+    if target is None:
+        return {"ok": False, "error": "refusing a recipe folder outside the recipe roots"}
+    wanted = _manifest(req)
+    if wanted is None:
+        return {"ok": False, "error": "bad recipe folder manifest"}
+    out = _compare(target, wanted)
+    out["dir"] = target
+    return out
+
+
+def _files_stage(req: dict) -> dict:
+    """Write a recipe folder copy once, check it by hash, then make it read-only.
+
+    An existing copy is only compared, never rewritten. The copy is built in a
+    temporary sibling and renamed into place after every hash matches.
+    """
+    target = _inside_root(req.get("dir"), _CFG.get("recipe_roots") or [])
+    if target is None:
+        return {"ok": False, "error": "refusing a recipe folder outside the recipe roots"}
+    wanted = _manifest(req)
+    if wanted is None:
+        return {"ok": False, "error": "bad recipe folder manifest"}
+    if os.path.lexists(target):
+        out = _compare(target, wanted)
+        out["dir"] = target
+        out["copied"] = False
+        return out
+    blobs: dict = {}
+    total = 0
+    for item in req.get("files") or []:
+        rel = _clean_rel(item.get("path")) if isinstance(item, dict) else None
+        if rel is None or rel not in wanted or rel in blobs:
+            return {"ok": False, "error": "bad recipe folder file list"}
+        try:
+            data = base64.b64decode(str(item.get("data") or ""), validate=True)
+        except (ValueError, TypeError):
+            return {"ok": False, "error": f"bad data for {rel}"}
+        total += len(data)
+        if total > FILES_MAX_BYTES:
+            return {"ok": False, "error": "recipe folder files are too large"}
+        if hashlib.sha256(data).hexdigest() != wanted[rel][0]:
+            return {"ok": False, "error": f"{rel} did not arrive intact"}
+        blobs[rel] = data
+    if set(blobs) != set(wanted):
+        return {"ok": False, "error": "recipe folder file list does not match its manifest"}
+    parent = os.path.dirname(target)
+    # A linked folder on the way must not carry the copy outside its recipe root.
+    root = next(
+        os.path.normpath(str(r)) for r in _CFG.get("recipe_roots") or []
+        if target.startswith(os.path.normpath(str(r)) + os.sep)
+    )
+    os.makedirs(root, mode=0o755, exist_ok=True)
+    real_root = os.path.realpath(root)
+
+    def within(path: str) -> bool:
+        real = os.path.realpath(path)
+        return real == real_root or real.startswith(real_root + os.sep)
+
+    existing = parent
+    while not os.path.lexists(existing):
+        existing = os.path.dirname(existing)
+    if not within(existing):
+        return {"ok": False, "error": "refusing a recipe folder outside the recipe roots"}
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    if not within(parent):
+        return {"ok": False, "error": "refusing a recipe folder outside the recipe roots"}
+    tmp = tempfile.mkdtemp(prefix=".incoming-", dir=parent)
+    try:
+        for rel in sorted(blobs):
+            full = os.path.join(tmp, *rel.split("/"))
+            os.makedirs(os.path.dirname(full), mode=0o755, exist_ok=True)
+            with open(full, "xb") as handle:
+                handle.write(blobs[rel])
+            os.chmod(full, 0o555 if wanted[rel][1] else 0o444)
+        check = _compare(tmp, wanted)
+        if check["state"] != "match":
+            raise OSError("the written copy does not match its manifest")
+        for current, dirs, _files in os.walk(tmp, topdown=False):
+            for name in dirs:
+                os.chmod(os.path.join(current, name), 0o555)
+        os.chmod(tmp, 0o555)
+        try:
+            os.rename(tmp, target)
+        except OSError:
+            if not os.path.isdir(target):
+                raise
+            # Another start copied the same version first: keep that one.
+            _drop_tree(tmp)
+            out = _compare(target, wanted)
+            out["dir"] = target
+            out["copied"] = False
+            return out
+    except BaseException:
+        _drop_tree(tmp)
+        raise
+    out = _compare(target, wanted)
+    out["dir"] = target
+    out["copied"] = True
+    return out
+
+
+def _drop_tree(path: str) -> None:
+    """Remove a temporary copy this op made. Only ever called on its own mkdtemp folder."""
+    for current, dirs, _files in os.walk(path):
+        os.chmod(current, 0o755)
+        for name in dirs:
+            try:
+                os.chmod(os.path.join(current, name), 0o755)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _files_read(req: dict) -> dict:
+    """Read-only: files under the mount roots, base64, for copying into a recipe folder.
+
+    A folder is read whole (regular files only; links are reported, not followed).
+    """
+    roots = _CFG.get("mount_roots") or []
+    out: dict = {}
+    links: list = []
+    total = 0
+    for raw in req.get("paths") or []:
+        path = _inside_root(raw, roots)
+        if path is None:
+            return {"ok": False, "error": f"refusing to read {raw}: outside the mount roots"}
+        if any(path == p or path.startswith(p + os.sep) for p in blocked_prefixes()):
+            return {"ok": False, "error": f"refusing to read {raw}"}
+        if os.path.islink(path):
+            links.append(path)
+            continue
+        if os.path.isfile(path):
+            candidates = [path]
+        elif os.path.isdir(path):
+            candidates = []
+            for current, dirs, files in os.walk(path, followlinks=False):
+                dirs.sort()
+                for name in sorted(files) + [d for d in dirs if os.path.islink(os.path.join(current, d))]:
+                    candidates.append(os.path.join(current, name))
+        else:
+            out[path] = None
+            continue
+        for full in candidates:
+            if os.path.islink(full) or not os.path.isfile(full):
+                links.append(full)
+                continue
+            with open(full, "rb") as handle:
+                data = handle.read(FILES_MAX_BYTES + 1)
+            total += len(data)
+            if total > FILES_MAX_BYTES:
+                return {"ok": False, "error": "files are too large to copy into a recipe folder"}
+            out[full] = {
+                "data": base64.b64encode(data).decode("ascii"),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "executable": bool(os.stat(full).st_mode & 0o111),
+            }
+    return {"ok": True, "files": out, "links": links}
+
+
+def _file_sha256(req: dict) -> dict:
+    """Read-only: SHA-256 of one file under the mount roots (a pinned binary, for example)."""
+    path = _inside_root(req.get("path"), _CFG.get("mount_roots") or [])
+    if path is None:
+        return {"ok": False, "error": "refusing a file outside the mount roots"}
+    if not os.path.isfile(path):
+        return {"ok": True, "exists": False, "sha256": ""}
+    return {"ok": True, "exists": True, "sha256": _file_digest(path)}
 
 
 def _image_command(argv: list) -> list[str]:
