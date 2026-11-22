@@ -14,14 +14,16 @@ from sparksi.recipes.service import valid_id, write_recipe
 from sparksi.recipes.store import (
     DEFAULT_NAME,
     backups_dir,
+    contained,
     default_recipe_name,
     folder_path,
     is_folder_recipe,
     load_recipe,
+    legacy_default_path,
+    legacy_named_path,
     named_dir,
     named_recipe_path,
     recipe_names,
-    recipes_dir,
     set_default_name,
     using_recipe,
     valid_recipe_name,
@@ -227,7 +229,7 @@ def save_as(model_id: str, body: dict[str, Any], runner: Any = None) -> tuple[in
 def _save_as_folder(model_id: str, name: str, source: str, body: dict[str, Any], runner: Any, *, first: bool) -> tuple[int, dict[str, Any]]:
     """Save as from a recipe folder: the new recipe is a full copy of the folder, files included."""
     target = folder_path(model_id, name)
-    tmp = target.parent / f".{name}.tmp"
+    tmp = contained(target.parent, f".{name}.tmp")
     shutil.rmtree(tmp, ignore_errors=True)  # a leftover from an interrupted copy of this same name
     shutil.copytree(folder_path(model_id, source), tmp, symlinks=True)
     os.replace(tmp, target)
@@ -246,12 +248,13 @@ def _save_as_folder(model_id: str, name: str, source: str, body: dict[str, Any],
 
 def _move_aside(model_id: str, name: str) -> None:
     """A deleted recipe folder is moved into backups/<date>/deleted/, never removed."""
-    dest = backups_dir() / "deleted" / model_id / name
+    base = backups_dir()
+    dest = contained(base, "deleted", model_id, name)
     dest.parent.mkdir(parents=True, exist_ok=True)
     n = 1
     while dest.exists():
         n += 1
-        dest = dest.with_name(f"{name}.{n}")
+        dest = contained(base, "deleted", model_id, f"{name}.{n}")
     shutil.move(str(folder_path(model_id, name)), str(dest))
 
 
@@ -264,9 +267,9 @@ def set_default(model_id: str, name: str) -> tuple[int, dict[str, Any]]:
     current = default_recipe_name(model_id)
     if name == current:
         return list_named(model_id)
-    base = recipes_dir() / f"{model_id}.toml"
-    moved = named_dir(model_id) / f"{current}.toml"
-    src = named_dir(model_id) / f"{name}.toml"
+    base = legacy_default_path(model_id)
+    moved = legacy_named_path(model_id, current)
+    src = legacy_named_path(model_id, name)
     named_dir(model_id).mkdir(parents=True, exist_ok=True)
     # A recipe folder stays where it is; only the older layout keeps the default at <id>.toml.
     if base.is_file() and not is_folder_recipe(model_id, current):
@@ -304,7 +307,7 @@ def rename_named(model_id: str, name: str, body: dict[str, Any]) -> tuple[int, d
             return 409, {"error": "the default recipe cannot be replaced by a rename"}
         if _locked(model_id, new):
             return 409, _keep_pinned(new)
-        (named_dir(model_id) / f"{new}.toml").unlink(missing_ok=True)
+        legacy_named_path(model_id, new).unlink(missing_ok=True)
     if is_folder_recipe(model_id, name):
         os.replace(folder_path(model_id, name), folder_path(model_id, new))
         if name == current:
@@ -312,7 +315,7 @@ def rename_named(model_id: str, name: str, body: dict[str, Any]) -> tuple[int, d
     elif name == current:
         set_default_name(model_id, new)
     else:
-        os.replace(named_dir(model_id) / f"{name}.toml", named_dir(model_id) / f"{new}.toml")
+        os.replace(legacy_named_path(model_id, name), legacy_named_path(model_id, new))
     return list_named(model_id)
 
 
@@ -331,5 +334,5 @@ def delete_named(model_id: str, name: str) -> tuple[int, dict[str, Any]]:
     if is_folder_recipe(model_id, name):
         _move_aside(model_id, name)
     else:
-        (named_dir(model_id) / f"{name}.toml").unlink(missing_ok=True)
+        legacy_named_path(model_id, name).unlink(missing_ok=True)
     return list_named(model_id)
