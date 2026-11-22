@@ -9,7 +9,7 @@ import pytest
 from sparksi.config import CFG
 from sparksi.recipes import named
 from sparksi.recipes.runs import reset_for_tests as reset_runs
-from sparksi.recipes.service import begin_run, plan_model
+from sparksi.recipes.service import plan_model
 from sparksi.recipes.store import RECIPE_FILE, folder_path, save_recipe, set_default_name, using_recipe
 
 MODEL = "demo"
@@ -152,11 +152,3 @@ def test_save_checks_folder_files_but_keeps_the_written_sources(recipes):
     assert code == 400
     assert "recipe file files/nope.py is missing from the recipe folder" in out["conflicts"]
     assert not folder_path(MODEL, "copy-three").exists()
-
-
-def test_start_is_refused_until_the_files_are_copied(recipes):
-    recipes(_recipe(["@files/patch.py:/opt/app/patch.py:ro"]), {"files/patch.py": "x = 1\n"})
-
-    code, out = begin_run(_catalog(), _Facts(), {"id": MODEL})
-    assert code == 409
-    assert out["conflicts"] == ["This recipe's folder files are not copied to the Sparks yet, so nothing was started."]

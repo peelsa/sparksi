@@ -13,6 +13,7 @@ container has mounted.
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import os
@@ -241,3 +242,86 @@ def local_path(node_path: str, local: dict[str, str]) -> str | None:
                 return None
             return str(Path(here) / rest)
     return None
+
+
+# --- copying to the Sparks -------------------------------------------------
+
+COPY_TIMEOUT_S = 180
+
+
+def _payload(entries: list[Entry]) -> list[dict[str, Any]]:
+    return [{"path": e.path, "sha256": e.sha256, "size": e.size, "executable": e.executable} for e in entries]
+
+
+def _targets(files: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """(role, Spark name, copy folder) once per Spark."""
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str, str]] = []
+    for role, target in sorted((files.get("nodes") or {}).items()):
+        host = CFG.node_by_role(str(role)).name
+        if (host, str(target)) in seen:
+            continue
+        seen.add((host, str(target)))
+        out.append((str(role), host, str(target)))
+    return out
+
+
+def _mismatch(host: str) -> str:
+    return f"{host}'s copy of this recipe's files does not match the recipe folder, so nothing was started."
+
+
+def check_sparks(runner: Any, files: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Read-only: each Spark's copy of this version. State is match, missing, differs or unknown."""
+    out: dict[str, dict[str, Any]] = {}
+    if not files or runner is None:
+        return out
+    manifest = list(files.get("manifest") or [])
+    for role, host, target in _targets(files):
+        try:
+            result = runner.invoke(host, {"op": "files_check", "dir": target, "manifest": manifest}, timeout=30)
+        except Exception as exc:  # noqa: BLE001 — a dark Spark is unknown, not a crash
+            result = {"ok": False, "error": str(exc)}
+        state = str(result.get("state") or "") if isinstance(result, dict) and result.get("ok") else "unknown"
+        row = {"host": host, "dir": target, "state": state or "unknown"}
+        if state == "differs":
+            row["differs"] = list(result.get("differs") or []) + list(result.get("missing") or []) + list(result.get("extra") or [])
+        if state == "unknown" and isinstance(result, dict):
+            row["error"] = str(result.get("error") or "no answer")[:200]
+        out[role] = row
+    return out
+
+
+def copy_to_sparks(runner: Any, files: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Copy this version to every Spark the recipe uses and check it by hash.
+
+    Returns one plain sentence when anything is wrong (nothing may start), else "".
+    The folder is scanned again first: a file changed since the plan refuses.
+    """
+    folder = Path(str(files.get("folder") or ""))
+    found = scan(folder)
+    if found.problems:
+        return found.problems[0], {}
+    if found.version != files.get("version"):
+        return "The recipe folder changed after it was checked, so nothing was started. Load it again.", {}
+    manifest = _payload(found.entries)
+    blobs = []
+    for entry in found.entries:
+        data = (folder / entry.path).read_bytes()
+        if hashlib.sha256(data).hexdigest() != entry.sha256:
+            return "The recipe folder changed after it was checked, so nothing was started. Load it again.", {}
+        blobs.append({"path": entry.path, "data": base64.b64encode(data).decode("ascii")})
+    states: dict[str, dict[str, Any]] = {}
+    for role, host, target in _targets(files):
+        req = {"op": "files_stage", "dir": target, "manifest": manifest, "files": blobs}
+        try:
+            result = runner.invoke(host, req, timeout=COPY_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        if not isinstance(result, dict) or not result.get("ok"):
+            why = str((result or {}).get("error") or "no answer").strip()[:200] if isinstance(result, dict) else "no answer"
+            return f"Could not copy this recipe's files to {host} ({why}), so nothing was started.", states
+        state = str(result.get("state") or "")
+        states[role] = {"host": host, "dir": target, "state": state, "copied": bool(result.get("copied"))}
+        if state != "match":
+            return _mismatch(host), states
+    return "", states
