@@ -29,8 +29,11 @@ ROLE_PREFIX = "@role/"
 CARRIED = ("files", "roles")
 MANIFEST = "MANIFEST.sha256"
 VERSION_CHARS = 16
-MAX_FILE_BYTES = 64 * 1024 * 1024
-MAX_TOTAL_BYTES = 256 * 1024 * 1024
+# A copy travels inside one agent request and is decoded in memory on a Spark that
+# may sit next to a model holding most of its memory, so keep it small. Scripts,
+# patches and templates are about 1 MB per recipe.
+MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -302,13 +305,13 @@ def copy_to_sparks(runner: Any, files: dict[str, Any]) -> tuple[str, dict[str, d
     if found.problems:
         return found.problems[0], {}
     if found.version != files.get("version"):
-        return "The recipe folder changed after it was checked, so nothing was started. Load it again.", {}
+        return "The recipe folder changed after it was checked, so nothing was started; load it again.", {}
     manifest = _payload(found.entries)
     blobs = []
     for entry in found.entries:
         data = (folder / entry.path).read_bytes()
         if hashlib.sha256(data).hexdigest() != entry.sha256:
-            return "The recipe folder changed after it was checked, so nothing was started. Load it again.", {}
+            return "The recipe folder changed after it was checked, so nothing was started; load it again.", {}
         blobs.append({"path": entry.path, "data": base64.b64encode(data).decode("ascii")})
     states: dict[str, dict[str, Any]] = {}
     for role, host, target in _targets(files):
