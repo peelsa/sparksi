@@ -1227,6 +1227,7 @@
       <button type="button" id="model-load-default">Load default recipe</button>
       <p class="note" id="model-default-source"></p>
       <p class="note" id="model-default-summary"></p>
+      <div id="model-recipe-folder" hidden></div>
       <h3>1 · Model</h3>
       <p id="model-size"></p>
       <p id="model-estimate"></p>
@@ -9614,10 +9615,41 @@
     if (body.argv_preview) return body;
     return body.draft || body.recipe || null;
   }
+  /* A folder recipe: where its files live, their version, and whether each Spark's copy matches. */
+  var FOLDER_STATES = {
+    match: "copy matches",
+    missing: "not copied yet; Load copies it first",
+    differs: "copy does not match; Load is refused",
+    unknown: "could not check"
+  };
+  function paintRecipeFolder(files) {
+    var box = el("model-recipe-folder");
+    if (!box) return;
+    clear(box);
+    if (!files || !files.version) { box.hidden = true; return; }
+    box.hidden = false;
+    var head = document.createElement("p");
+    head.className = "note";
+    var count = Number(files.count) || 0;
+    head.textContent = "Recipe folder " + String(files.folder || "") + " · version " + String(files.version) + " · " + count + (count === 1 ? " file" : " files");
+    box.appendChild(head);
+    var sparks = files.sparks || {};
+    Object.keys(sparks).sort().forEach(function (role) {
+      var row = sparks[role] || {};
+      var line = document.createElement("p");
+      line.className = "note";
+      var state = String(row.state || "unknown");
+      line.textContent = String(row.host || role) + ": " + (FOLDER_STATES[state] || FOLDER_STATES.unknown);
+      if (row.dir) line.title = String(row.dir);
+      box.appendChild(line);
+    });
+  }
   function applyPreview(payload, fill) {
     var card = selectedCard();
     if (!card) return;
     if (payload && payload.id && payload.id !== card.id) return;
+    /* Painted before any early return, so another model's folder never stays on screen. */
+    paintRecipeFolder((payload && payload.files) || (recipeOf(payload) || {}).files || null);
     var fromDefaults = fill === true || fill === "defaults";
     if (fromDefaults) {
       var defaults = payload && payload.defaults;
@@ -10070,6 +10102,19 @@
         mark.className = "protected";
         mark.textContent = "Protected";
         row.appendChild(mark);
+      } else if (svc.folder_recipe && !svc.controllable) {
+        /* Its recipe folder is the one way to start it now; Stop stays for a copy started the old way. */
+        var moved = document.createElement("p");
+        moved.className = "note";
+        moved.textContent = "Starts from its recipe folder";
+        row.appendChild(moved);
+        var halt = document.createElement("button");
+        halt.type = "button";
+        halt.className = "halt";
+        halt.textContent = "Stop";
+        halt.disabled = lockOn();
+        halt.addEventListener("click", function () { serviceAction(svc, "stop"); });
+        row.appendChild(halt);
       } else {
         var start = document.createElement("button");
         start.type = "button";

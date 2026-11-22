@@ -106,6 +106,12 @@ A copy that is already there is only compared, never rewritten. Because the fold
 
 A dry run is read-only. Its `files.sparks` block shows each Spark's copy as `match`, `missing` (it will be copied at start), `differs` (this refuses the plan) or `unknown`. The run record keeps the version it mounts as `files_version`. A run started before its recipe was moved into a folder keeps the mounts it has.
 
+### What the recipe page shows
+
+For a folder recipe, the recipe page shows the folder, its version (the first 16 characters of the hash of its files) and the number of files. It also shows one line for each Spark the recipe uses: the copy matches, it is not copied yet (Load copies it first), it does not match (Load is refused), or it could not be checked. The recipe list (`GET /api/models/<id>/recipes`) gives each recipe's `folder` and `version`. A plan gives the same under `files`, with each Spark's state in `files.sparks`.
+
+Once a model has a recipe in a folder, its catalog launch command is no longer a way to start it. The model's `custom` engine is hidden, a plan with it is refused, and a catalog service Start is refused with "This model starts from its recipe folder now, not from its catalog launch command. Load its recipe instead." Stop still works, so a copy started the old way can be stopped. The catalog block itself stays in the catalog until you delete it.
+
 ### Recorded builds and memory
 
 A role can record the exact build it runs, so a re-tagged image or a rebuilt binary is caught before a start:

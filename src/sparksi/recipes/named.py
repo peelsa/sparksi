@@ -44,6 +44,15 @@ def _bad(model_id: str, name: str) -> tuple[int, dict[str, Any]] | None:
     return None
 
 
+def _folder_version(model_id: str, name: str) -> str:
+    if not is_folder_recipe(model_id, name):
+        return ""
+    from sparksi.recipes.folder import scan
+
+    found = scan(folder_path(model_id, name))
+    return "" if found.problems or not found.entries else found.version
+
+
 def _summary(model_id: str, name: str, default: str) -> dict[str, Any]:
     with using_recipe(model_id, name):
         recipe = load_recipe(model_id)
@@ -66,6 +75,8 @@ def _summary(model_id: str, name: str, default: str) -> dict[str, Any]:
         "copied_from": copied_from,
         # A recipe folder keeps its settings, start scripts and patch files together.
         "folder": is_folder_recipe(model_id, name),
+        # The version a start would copy to the Sparks: the hash of the folder's files.
+        "version": _folder_version(model_id, name),
         "engine": str(recipe.get("engine") or ""),
         "placement": str(recipe.get("placement") or ""),
         "modified": modified,
