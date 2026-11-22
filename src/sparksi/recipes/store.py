@@ -63,6 +63,7 @@ KEYS = (
     "presence_penalty",
     "alias",
     "reasoning",
+    "memory",
 )
 
 
