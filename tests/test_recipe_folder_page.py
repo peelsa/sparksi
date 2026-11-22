@@ -140,3 +140,10 @@ def test_the_page_paints_the_folder_with_text_only():
     assert "innerHTML" not in body and "textContent" in body
     assert "Load is refused" in body and "Load copies it first" in body
     assert "Starts from its recipe folder" in page
+
+
+def test_the_folder_block_is_repainted_before_any_early_return():
+    page = STATIC.read_text(encoding="utf-8")
+    start = page.index("function applyPreview")
+    body = page[start:page.index("var fromDefaults", start)]
+    assert "paintRecipeFolder(" in body

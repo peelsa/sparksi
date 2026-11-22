@@ -9648,6 +9648,8 @@
     var card = selectedCard();
     if (!card) return;
     if (payload && payload.id && payload.id !== card.id) return;
+    /* Painted before any early return, so another model's folder never stays on screen. */
+    paintRecipeFolder((payload && payload.files) || (recipeOf(payload) || {}).files || null);
     var fromDefaults = fill === true || fill === "defaults";
     if (fromDefaults) {
       var defaults = payload && payload.defaults;
@@ -9663,7 +9665,6 @@
       fieldsByModel[card.id] = "";
     }
     var recipe = recipeOf(payload) || {};
-    paintRecipeFolder((payload && payload.files) || recipe.files || null);
     var conflicts = (payload && payload.conflicts) || [];
     var draft = fill === "draft" ? recallDraft(modelDrafts, card.id) : null;
     if (draft) setText("model-title", card.title || card.id);
