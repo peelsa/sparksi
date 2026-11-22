@@ -1659,7 +1659,7 @@ def preview_recipe(catalog: dict[str, Any], runner: Any, model_id: str, query: d
 
 
 RESERVE_MAX_GIB = 128.0
-FOLDER_STARTS = "This model starts from its recipe folder now, not from its catalog launch command. Load its recipe instead."
+FOLDER_STARTS = "This model now starts from its recipe folder, so load its recipe instead of its catalog launch command."
 
 
 def has_folder_recipe(model_id: str) -> bool:

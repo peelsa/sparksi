@@ -403,6 +403,14 @@ def _unknown_holder(target: dict[str, Any], host: str, steps: list[dict[str, Any
     return f"port {target.get('port')} on {_short(host)} is held by {holder}; stop it first"
 
 
+def _folder_refusal(row: dict[str, Any]) -> str | None:
+    """D4: once a model has a recipe folder, its catalog launch and seat starts are refused."""
+    from sparksi.recipes.service import FOLDER_STARTS, has_folder_recipe
+
+    rid = str(row.get("id") or "")
+    return FOLDER_STARTS if rid and has_folder_recipe(rid) else None
+
+
 def plan_switch(
     catalog: dict[str, Any],
     target: dict[str, Any],
@@ -416,6 +424,9 @@ def plan_switch(
     reasons: list[str] = []
     if lock_on:
         reasons.append("lock is ON")
+    moved = _folder_refusal(target)
+    if moved:
+        return {"verdict": "REFUSE", "reasons": [moved], "id": target.get("id"), "host": host, "steps": [], "preview": []}
     placement = target.get("placement") or "single"
     steps: list[dict[str, Any]] = []
     if placement == "pair" and not CFG.has_worker:
@@ -567,6 +578,9 @@ def plan_run(
     reasons: list[str] = []
     if lock_on:
         reasons.append("lock is ON")
+    moved = _folder_refusal(row)
+    if moved:
+        reasons.append(moved)
     launch = row.get("launch") or {}
     hosts = [launch.get("host") or _head()] + ([_worker()] if row.get("placement") == "pair" else [])
     outside = _outside_block(row, list(rows or []), hosts)
