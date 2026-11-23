@@ -2000,6 +2000,51 @@ def _drop_tree(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+def _single_recipe_input(path: str, limit: int) -> dict:
+    """Only a regular file with no linked path component; never walk or follow a link.
+
+    Open directories relative to held descriptors so swapping a parent for a
+    link between stat and open cannot redirect the file read.
+    """
+    parts = path.strip("/").split("/")
+    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            info = os.stat(part, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                return {"skip": "link"}
+            if not stat.S_ISDIR(info.st_mode):
+                return {"skip": "missing"}
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        leaf = parts[-1]
+        info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            return {"skip": "link"}
+        if stat.S_ISDIR(info.st_mode):
+            return {"skip": "dir"}
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return {"skip": "large" if stat.S_ISREG(info.st_mode) else "special"}
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as handle:
+            now = os.fstat(handle.fileno())
+            if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+                return {"error": f"{path} changed while it was read"}
+            data = handle.read(limit + 1)
+        if len(data) > limit:
+            return {"skip": "large"}
+        return {"size": len(data), "file": {
+            "data": base64.b64encode(data).decode("ascii"),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "executable": bool(now.st_mode & 0o111),
+        }}
+    except FileNotFoundError:
+        return {"skip": "missing"}
+    finally:
+        os.close(parent)
+
+
 def _files_read(req: dict) -> dict:
     """Read-only: files under the mount roots, base64, for copying into a recipe folder.
 
@@ -2025,36 +2070,16 @@ def _files_read(req: dict) -> dict:
             links.append(path)
             continue
         if files_only:
-            # Decide on one stat and read what was stated: a path swapped for a folder,
-            # a link or a larger file after the check is never read as a folder.
-            try:
-                info = os.lstat(path)
-            except FileNotFoundError:
-                out[path] = None
-                continue
-            if stat.S_ISDIR(info.st_mode):
-                skipped[path] = "dir"
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_size > file_max:
-                skipped[path] = "large" if stat.S_ISREG(info.st_mode) else "special"
-                continue
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-            with os.fdopen(fd, "rb") as handle:
-                now = os.fstat(handle.fileno())
-                if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
-                    return {"ok": False, "error": f"{raw} changed while it was read"}
-                data = handle.read(file_max + 1)
-            if len(data) > file_max:
-                skipped[path] = "large"
-                continue
-            total += len(data)
-            if total > FILES_MAX_BYTES:
-                return {"ok": False, "error": "files are too large to copy into a recipe folder"}
-            out[path] = {
-                "data": base64.b64encode(data).decode("ascii"),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "executable": bool(now.st_mode & 0o111),
-            }
+            read = _single_recipe_input(path, file_max)
+            if read.get("skip"):
+                skipped[path] = read["skip"]
+            elif read.get("error"):
+                return {"ok": False, "error": read["error"]}
+            else:
+                total += read["size"]
+                if total > FILES_MAX_BYTES:
+                    return {"ok": False, "error": "files are too large to copy into a recipe folder"}
+                out[path] = read["file"]
             continue
         if os.path.isfile(path):
             candidates = [path]

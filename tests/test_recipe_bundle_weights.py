@@ -178,7 +178,7 @@ def _one_role(svc, extra: list[str], placement: str = "head") -> None:
 
 
 def test_links_hard_links_and_a_linked_folder_under_the_weights_root(service):
-    """A link stays; a hard link and a file reached through a linked folder are regular files and are pinned."""
+    """A hard link is a regular file and is pinned; no symbolic link component is followed."""
     os.link(service / "attention.py", service / "hard.py")
     os.symlink(service / "model", service / "linked-dir")
     (service / "model" / "small.json").write_bytes(b"{}\n")
@@ -188,7 +188,8 @@ def test_links_hard_links_and_a_linked_folder_under_the_weights_root(service):
     assert view["ok"], view["problems"]
     paths = {f["path"]: f["sha256"] for f in view["files"]}
     assert paths["files/opt/hard.py"] == hashlib.sha256(PATCHES["attention.py"]).hexdigest()
-    assert paths["files/opt/small.json"] == hashlib.sha256(b"{}\n").hexdigest()
+    assert "files/opt/small.json" not in paths
+    assert f"head: {service}/linked-dir/small.json:/opt/small.json" in view["kept"]
     assert "files/opt/soft.py" not in paths and f"head: {service}/soft.py:/opt/soft.py" in view["kept"]
 
 
@@ -265,9 +266,9 @@ def test_a_weights_file_swapped_after_its_stat_is_never_read_as_something_else(s
     # A file that grew past the limit after the stat is left where it is, not read whole.
     real_open = agent.os.open
 
-    def grow(p, flags, *a):
-        fd = real_open(p, flags, *a)
-        if p == path:
+    def grow(p, flags, *a, **kw):
+        fd = real_open(p, flags, *a, **kw)
+        if p == "modelopt.py":
             with open(path, "ab") as handle:
                 handle.write(b"x" * 4096)
         return fd
