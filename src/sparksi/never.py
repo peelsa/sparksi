@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import re
+
 MUTATOR_VERBS = ("load", "evict", "install")
 
 REFUSE_MSG = (
@@ -32,7 +34,15 @@ NVIDIA_SMI_ALLOW_PREFIX = (
     "--format",
     "--list-gpus",
 )
-NVIDIA_SMI_ALLOW_EXACT = {"-L", "-h", "--help", "--format=csv,noheader,nounits"}
+NVIDIA_SMI_ALLOW_EXACT = {"-L", "-h", "--help", "--format=csv,noheader,nounits", "-q", "--query"}
+NVIDIA_SMI_DISPLAY_SECTIONS = frozenset({
+    "CLOCK",
+    "CLOCKS",
+    "SUPPORTED_CLOCKS",
+    "UTILIZATION",
+    "TEMPERATURE",
+    "PERFORMANCE",
+})
 NVIDIA_SMI_DENY_SUBSTR = (
     "reset",
     "persistenced",
@@ -40,7 +50,12 @@ NVIDIA_SMI_DENY_SUBSTR = (
     "power-limit",
     "gpu-reset",
     "applications-clocks",
+    "lock-gpu-clocks",
+    "lock-memory-clocks",
 )
+
+# Only a non-negative integer may appear as a GPU index or a max MHz in a cap command.
+CLOCK_LOCK_INT = re.compile(r"(?:0|[1-9][0-9]*)")
 
 
 class Refused(RuntimeError):
@@ -103,15 +118,31 @@ def nvidia_smi_is_readonly(rest: list[str]) -> bool:
     """Query/list flags only. Refuse reset / persistenced / any mutate argv."""
     if not rest:
         return False
-    for a in rest:
+    i = 0
+    while i < len(rest):
+        a = rest[i]
         al = a.lower()
-        if a in ("-r", "--gpu-reset", "--reset"):
+        if a in ("-r", "--gpu-reset", "--reset", "-lgc", "-rgc", "-ac", "-rac", "-pl"):
             return False
         if any(s in al for s in NVIDIA_SMI_DENY_SUBSTR):
             return False
         if a.startswith("--query-") or a.startswith("--format"):
+            i += 1
             continue
         if a in NVIDIA_SMI_ALLOW_EXACT or a.startswith("--list"):
+            i += 1
+            continue
+        if a == "-d" or a.startswith("--display="):
+            if a == "-d":
+                if i + 1 >= len(rest):
+                    return False
+                section = rest[i + 1]
+                i += 2
+            else:
+                section = a.split("=", 1)[1]
+                i += 1
+            if section.upper() not in NVIDIA_SMI_DISPLAY_SECTIONS:
+                return False
             continue
         if a.startswith("-"):
             return False
@@ -120,12 +151,53 @@ def nvidia_smi_is_readonly(rest: list[str]) -> bool:
     return True
 
 
+def clock_lock_int_text(value: int) -> str:
+    """Return a digits-only form of a non-negative int, or raise."""
+    if type(value) is not int or value < 0:
+        raise ValueError("expected a non-negative integer")
+    text = format(value, "d")
+    if CLOCK_LOCK_INT.fullmatch(text) is None or int(text) != value:
+        raise ValueError("expected a non-negative integer")
+    return text
+
+
+def nvidia_smi_is_clock_lock(argv: list[str] | tuple[str, ...]) -> bool:
+    """True only for the two cap commands, with a validated GPU index and MHz.
+
+    The only allowed shapes are::
+
+        sudo -n nvidia-smi -i <gpu> -lgc 0,<MHz>
+        sudo -n nvidia-smi -i <gpu> -rgc
+
+    ``<gpu>`` and ``<MHz>`` are non-negative integers with no extra flags,
+    no path to sudo or nvidia-smi, and no other sudo use.
+    """
+    parts = list(argv)
+    if not parts or any(not isinstance(part, str) or not part for part in parts):
+        return False
+    if parts[:4] != ["sudo", "-n", "nvidia-smi", "-i"]:
+        return False
+    if len(parts) == 6 and parts[5] == "-rgc":
+        return CLOCK_LOCK_INT.fullmatch(parts[4]) is not None
+    if len(parts) == 7 and parts[5] == "-lgc":
+        spec = parts[6]
+        if not spec.startswith("0,"):
+            return False
+        return (
+            CLOCK_LOCK_INT.fullmatch(parts[4]) is not None
+            and CLOCK_LOCK_INT.fullmatch(spec[2:]) is not None
+        )
+    return False
+
+
 def observation_refusal(argv: list[str] | tuple[str, ...]) -> str | None:
     """Refuse anything that is not a node-fact read. None means the argv may run."""
     if not argv or any(not isinstance(part, str) or not part for part in argv):
         return "refusing empty observation"
     prog = argv[0].rsplit("/", 1)[-1]
     rest = list(argv[1:])
+    if prog == "sudo":
+        return "refusing non-readonly command"
     if prog == "free" and rest in (["-b"], ["-m"], ["-g"]):
         return None
     if prog == "cat" and rest == ["/proc/meminfo"]:

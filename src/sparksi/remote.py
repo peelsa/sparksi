@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from sparksi.agent import main as agent_main
 from sparksi.catalog import load_catalog
-from sparksi.never import launcher_refusal, observation_refusal
+from sparksi.never import launcher_refusal, nvidia_smi_is_clock_lock, observation_refusal
 from sparksi.config import CFG
 from sparksi.hostcheck import check_ssh
 
@@ -224,6 +224,8 @@ class LocalRunner:
         return out
 
     def run_argv(self, host: str, argv: list[str], timeout: int = 3600) -> dict[str, Any]:
+        if any(isinstance(a, str) and a.rsplit("/", 1)[-1] == "nvidia-smi" for a in argv or []):
+            return {"ok": False, "error": "refusing nvidia-smi on the launch path"}
         if self.argv_fn is None:
             return {"ok": False, "error": "no argv runner"}
         out = self.argv_fn(host, {"argv": argv}, timeout)
@@ -233,6 +235,25 @@ class LocalRunner:
         if self.argv_fn is None:
             return {"ok": False, "error": "no argv runner", "stdout": "", "stderr": "", "code": None}
         out = self.argv_fn(host, {"argv": argv, "capture": True}, timeout)
+        if not isinstance(out, dict):
+            return {"ok": False, "error": "argv runner returned a non-object", "stdout": "", "stderr": "", "code": None}
+        out.setdefault("stdout", out.get("tail") or "")
+        out.setdefault("stderr", "")
+        return out
+
+    def run_gpu_clock(self, host: str, gpu_index: int, max_mhz: int | None, timeout: int = 8) -> dict[str, Any]:
+        """Set or clear a GPU clock cap. Builds the allowed sudo -n argv from integers only."""
+        from sparksi.gpu_clocks import clock_lock_argv
+
+        try:
+            argv = clock_lock_argv(gpu_index, max_mhz)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "stdout": "", "stderr": "", "code": None}
+        if not nvidia_smi_is_clock_lock(argv):
+            return {"ok": False, "error": "refusing non-clock-lock command", "stdout": "", "stderr": "", "code": None}
+        if self.argv_fn is None:
+            return {"ok": False, "error": "no argv runner", "stdout": "", "stderr": "", "code": None}
+        out = self.argv_fn(host, {"gpu_index": gpu_index, "max_mhz": max_mhz, "gpu_clock": True}, timeout)
         if not isinstance(out, dict):
             return {"ok": False, "error": "argv runner returned a non-object", "stdout": "", "stderr": "", "code": None}
         out.setdefault("stdout", out.get("tail") or "")
@@ -311,6 +332,8 @@ class SshRunner:
     def run_argv(self, host: str, argv: list[str], timeout: int = 3600) -> dict[str, Any]:
         if not argv or any(not isinstance(a, str) for a in argv):
             return {"ok": False, "error": "empty argv"}
+        if any(a.rsplit("/", 1)[-1] == "nvidia-smi" for a in argv):
+            return {"ok": False, "error": "refusing nvidia-smi on the launch path"}
         blocked = launcher_refusal(argv)
         if blocked:
             return {"ok": False, "error": blocked}
@@ -357,6 +380,45 @@ class SshRunner:
             "stdout": proc.stdout or "",
             "stderr": proc.stderr or "",
             "error": None if proc.returncode == 0 else ((proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:400]),
+        }
+
+    def run_gpu_clock(self, host: str, gpu_index: int, max_mhz: int | None, timeout: int = 8) -> dict[str, Any]:
+        """Set or clear a GPU clock cap over SSH.
+
+        The command line is built here from a validated GPU index and MHz, never
+        from a caller-supplied argv, so only ``sudo -n nvidia-smi -i <gpu> ...``
+        can run.
+        """
+        from sparksi.gpu_clocks import clock_lock_argv
+
+        try:
+            argv = clock_lock_argv(gpu_index, max_mhz)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "stdout": "", "stderr": "", "code": None}
+        if not nvidia_smi_is_clock_lock(argv):
+            return {"ok": False, "error": "refusing non-clock-lock command", "stdout": "", "stderr": "", "code": None}
+        try:
+            target = resolve_target(host, self.catalog)
+        except ValueError as exc:
+            return {"ok": False, "error": f"refused ssh destination for {host}: {exc}", "stdout": "", "stderr": "", "code": None}
+        cmd = list(argv) if target is None else [*_ssh_opts(target, 3), *argv]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if target is not None and isinstance(exc, subprocess.TimeoutExpired):
+                _drop_master(target)
+            return {"ok": False, "error": str(exc), "stdout": "", "stderr": "", "code": 255}
+        if target is not None and proc.returncode != 255:
+            _note_reach(target, None)
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        error = None if proc.returncode == 0 else (stderr or stdout or f"exit {proc.returncode}").strip()[:400]
+        return {
+            "ok": proc.returncode == 0,
+            "code": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": error,
         }
 
     def agent_call(self, host: str, op: str, payload: dict[str, Any] | None = None, timeout: int = 60) -> dict[str, Any]:

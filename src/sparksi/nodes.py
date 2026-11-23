@@ -28,11 +28,16 @@ _CACHE_LOCK = threading.Lock()
 _CACHE: dict[str, Any] = {"mono": 0.0, "key": None, "data": None}
 
 
-def reset_cache_for_tests() -> None:
+def invalidate_cache() -> None:
+    """Drop the node-fact TTL so the next read talks to the Sparks again."""
     with _CACHE_LOCK:
         _CACHE["mono"] = 0.0
         _CACHE["key"] = None
         _CACHE["data"] = None
+
+
+def reset_cache_for_tests() -> None:
+    invalidate_cache()
     # Model-card facts live next to this cache. Import lazily: service imports nodes.
     from sparksi.recipes.service import reset_facts_cache
 
@@ -134,6 +139,10 @@ def parse_meminfo(text: str) -> dict[str, float] | None:
 
 
 def parse_nvidia(text: str) -> dict[str, float] | None:
+    """CSV from ``--query-gpu=utilization.gpu,temperature.gpu[,clocks...]``.
+
+    Extra trailing fields are optional: current graphics MHz, then max MHz.
+    """
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.lower().startswith("utilization"):
@@ -153,13 +162,18 @@ def parse_nvidia(text: str) -> dict[str, float] | None:
                 return None
 
         util, temp = num(0), num(1)
-        if util is None and temp is None:
+        clock, clock_max = num(2), num(3)
+        if util is None and temp is None and clock is None and clock_max is None:
             return None
         out: dict[str, float] = {}
         if util is not None:
             out["util_pct"] = util
         if temp is not None:
             out["temp_c"] = temp
+        if clock is not None:
+            out["clock_mhz"] = clock
+        if clock_max is not None:
+            out["clock_max_mhz"] = clock_max
         return out
     return None
 
@@ -374,10 +388,22 @@ def _read_node(catalog: dict[str, Any], spec: dict[str, str], call: Any) -> dict
     card["mem"] = mem
     gpu_raw = call([
         "nvidia-smi",
-        "--query-gpu=utilization.gpu,temperature.gpu",
+        "--query-gpu=utilization.gpu,temperature.gpu,clocks.current.graphics,clocks.max.graphics",
         "--format=csv,noheader,nounits",
     ])
-    card["gpu"] = parse_nvidia(gpu_raw.get("stdout") or "")
+    gpu = parse_nvidia(gpu_raw.get("stdout") or "") or {}
+    clock_raw = call(["nvidia-smi", "-q", "--display=CLOCK"])
+    if (clock_raw.get("stdout") or "").strip():
+        from sparksi.gpu_clocks import parse_clock_report
+
+        for key, value in parse_clock_report(clock_raw.get("stdout") or "").items():
+            if value is not None:
+                gpu[key] = value
+    if gpu:
+        from sparksi.gpu_clocks import with_memo
+
+        gpu = with_memo(spec["key"], gpu)
+    card["gpu"] = gpu or None
     ports_raw = call(["ss", "-ltn"])
     listeners = parse_ss_ltn(ports_raw.get("stdout") or "")
     card["listeners"] = listeners

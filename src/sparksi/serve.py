@@ -47,7 +47,7 @@ from sparksi.jobs import (
     start_switch,
 )
 from sparksi.log import logger
-from sparksi.nodes import node_report
+from sparksi.nodes import invalidate_cache, node_report, node_specs
 from sparksi.launch import monitor_loaded, plan_switch
 from sparksi.library import fleet, row_by_id, sync_report
 from sparksi.models import list_models
@@ -318,6 +318,52 @@ def _run_stop_id(path: str) -> str | None:
     parts = path.strip("/").split("/")
     if len(parts) == 4 and parts[0] == "api" and parts[1] == "runs" and parts[3] == "stop" and valid_id(parts[2]):
         return parts[2]
+    return None
+
+
+def _gpu_clocks_node(path: str) -> str | None:
+    parts = path.strip("/").split("/")
+    if len(parts) == 4 and parts[0] == "api" and parts[1] == "nodes" and parts[3] == "gpu-clocks" and valid_id(parts[2]):
+        return parts[2]
+    return None
+
+
+def _gpu_clock_busy(spec: dict[str, str]) -> str | None:
+    """Why a clock change on this Spark needs a second OK, or None when nothing is running.
+
+    A loaded model on the Spark (or spanning it, for a pair), or a Sparksi run that names it
+    and has not stopped, counts. When the monitor card cannot be read, the answer is unknown,
+    so the change also needs the OK.
+    """
+    names = {spec.get("id"), spec.get("name"), spec.get("key")}
+    names.discard(None)
+    names.discard("")
+    loaded = monitor_loaded()
+    if loaded is None:
+        return "Sparksi cannot tell whether a model is running on this Spark. Confirm to change the GPU clock cap anyway."
+    for rec in loaded:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("video_service") is True or rec.get("kind") == "video_service":
+            continue
+        host = rec.get("host") or CFG.head.id
+        span = rec.get("span") or []
+        if host in names or any(item in names for item in span):
+            return "A model is running on this Spark. Confirm to change the GPU clock cap while it runs."
+    try:
+        from sparksi.recipes.runs import list_runs
+
+        runs = list_runs()
+    except Exception:  # noqa: BLE001
+        return "Sparksi cannot tell whether a model is running on this Spark. Confirm to change the GPU clock cap anyway."
+    for run in runs:
+        if str(run.get("phase") or "") in ("failed", "timed_out", "stopped", "cancelled"):
+            continue
+        for node in run.get("nodes") or []:
+            if str(node.get("phase") or "") in ("failed", "timed_out", "stopped", "cancelled"):
+                continue
+            if node.get("host") in names:
+                return "A model is starting or running on this Spark. Confirm to change the GPU clock cap while it runs."
     return None
 
 
@@ -1277,6 +1323,70 @@ class Handler(BaseHTTPRequestHandler):
         READS.expire()
         return self._json(200 if stopped else 500, {"stopped": stopped, "error": detail, "host": host, "port": port, "container": container})
 
+    def _set_gpu_clocks(self, node_key: str, body: dict[str, Any], token: str | None) -> None:
+        """Apply or clear a per-Spark GPU max-clock cap with sudo -n only; no persistence."""
+        from sparksi.gpu_clocks import apply_clock, begin_save, end_save, parse_request_mhz
+
+        if not _writes_allowed(self, body, token):
+            return None
+        cat = load_catalog()
+        spec = None
+        for item in node_specs(cat):
+            if node_key in (item["id"], item["name"], item["role"], item["key"]):
+                spec = item
+                break
+        if spec is None:
+            return self._json(404, {"error": "Unknown Spark.", "ok": False})
+        max_mhz, why = parse_request_mhz(body)
+        if why:
+            return self._json(400, {"error": why, "ok": False, "id": spec["id"], "role": spec["role"]})
+        if body.get("confirm_running") is not True:
+            busy = _gpu_clock_busy(spec)
+            if busy:
+                return self._json(409, {
+                    "ok": False,
+                    "needs_confirm": True,
+                    "error": busy,
+                    "id": spec["id"],
+                    "role": spec["role"],
+                })
+        if not begin_save(spec["key"]):
+            return self._json(409, {
+                "ok": False,
+                "error": "A clock change is already running on this Spark. Wait for it to finish.",
+                "id": spec["id"],
+                "role": spec["role"],
+            })
+        try:
+            runner = active_runner(cat)
+            result = apply_clock(runner, spec["key"], max_mhz)
+        finally:
+            end_save(spec["key"])
+        gpu = result.get("gpu") or {}
+        payload = {
+            "ok": bool(result.get("ok")),
+            "id": spec["id"],
+            "name": spec["name"],
+            "role": spec["role"],
+            "gpu": gpu,
+        }
+        if result.get("error"):
+            payload["error"] = result["error"]
+        if result.get("ok") or result.get("kind") == "failed":
+            # A failure after some GPU took the change still moved the Spark: refresh reads.
+            invalidate_cache()
+            READS.expire()
+            SLOW_READS.expire()
+        if result.get("ok"):
+            if max_mhz is None:
+                note_activity("gpu-clock", f"GPU clock cap cleared on {spec['id']}")
+            else:
+                note_activity("gpu-clock", f"GPU max clock {max_mhz} MHz on {spec['id']}")
+            return self._json(200, payload)
+        # Permission and nvidia-smi failures are shown as written so the page can quote them.
+        status = 400 if result.get("kind") == "invalid" else 502
+        return self._json(status, payload)
+
     def do_POST(self) -> None:  # noqa: N802
         if STATE.readonly:
             return self._json(403, {"error": "read-only stage"})
@@ -1286,6 +1396,9 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             body = self._body_json()
             token = _read_token(self, body)
+            node_key = _gpu_clocks_node(path)
+            if node_key:
+                return self._set_gpu_clocks(node_key, body, token)
             if path == "/api/lock":
                 data = STATE.lock.acquire("api").to_dict()
                 note_activity("lock", "Lock on")
