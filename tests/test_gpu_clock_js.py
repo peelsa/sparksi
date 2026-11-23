@@ -197,3 +197,22 @@ def test_bad_input_and_in_flight_second_click_do_not_post_twice() -> None:
     assert "whole number" in got["firstMsg"]
     assert got["firstPosts"] == 0
     assert got["secondPosts"] == 0
+
+
+def test_running_model_asks_before_save() -> None:
+    got = _run(
+        """
+        globalThis.runningRoles = { head: true };
+        var notes = [];
+        confirmGpuClock = function (note, proceed) { notes.push(note); };
+        paintGpuClocks();
+        var head = gpuClockBox("head");
+        head.querySelector("input").value = "2000";
+        saveGpuClock("head");
+        process.stdout.write(JSON.stringify({ notes: notes, posts: posted.length }));
+        """
+    )
+    assert got["posts"] == 0
+    assert len(got["notes"]) == 1
+    assert "running" in got["notes"][0].lower()
+    assert "2000" in got["notes"][0]

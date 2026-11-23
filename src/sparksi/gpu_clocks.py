@@ -3,11 +3,13 @@
 """Per-Spark GPU max-clock cap: query, validate, and apply via nvidia-smi.
 
 The cap is a live nvidia-smi lock, not a setting that survives reboot.
-``nvidia-smi -lgc`` and ``-rgc`` require root according to the tool itself;
-this module never prefixes sudo. A permission error is returned as-is.
-Range limits come from the GPU's own nvidia-smi report. When the GPU does
-not report a minimum, 0 is used because that is the lower bound nvidia-smi
-documents for ``-lgc MIN,MAX``.
+Setting or clearing it uses only ``sudo -n nvidia-smi -i <gpu> -lgc 0,<MHz>``
+or ``sudo -n nvidia-smi -i <gpu> -rgc`` (non-interactive, never a prompt).
+No other command is run with sudo, and sudoers is never edited. If sudo -n
+fails, the error is returned as written. Range limits come from the GPU's
+own nvidia-smi report. When the GPU does not report a minimum, 0 is used
+because that is the lower bound nvidia-smi documents for ``-lgc MIN,MAX``.
+The GPU index is read from nvidia-smi, never from the browser.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from sparksi.never import nvidia_smi_is_clock_lock
+from sparksi.never import clock_lock_int_text, nvidia_smi_is_clock_lock
 
 QUERY_CSV = [
     "nvidia-smi",
@@ -23,22 +25,38 @@ QUERY_CSV = [
     "--format=csv,noheader,nounits",
 ]
 QUERY_CLOCK = ["nvidia-smi", "-q", "--display=CLOCK"]
+QUERY_INDEX = ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"]
 
 _MHZ = re.compile(r"(-?\d+)\s*(?:MHz)?\s*$", re.I)
 _SECTION = re.compile(r"^([A-Za-z][A-Za-z0-9 ]+?)\s*(?::\s*(.*))?$")
 _FIELD = re.compile(r"^(Graphics|SM|Memory|Video|Min|Max)\s*:\s*(.*)$", re.I)
 
 
-def clock_lock_argv(max_mhz: int | None) -> list[str]:
-    """Exact argv for a max cap (``-lgc 0,N``) or a clear (``-rgc``)."""
+def clock_lock_argv(gpu_index: int, max_mhz: int | None) -> list[str]:
+    """Exact argv: ``sudo -n nvidia-smi -i <gpu> -lgc 0,N`` or ``... -rgc``."""
+    index = clock_lock_int_text(gpu_index)
     if max_mhz is None:
-        return ["nvidia-smi", "-rgc"]
-    if not isinstance(max_mhz, int) or isinstance(max_mhz, bool) or max_mhz < 0:
-        raise ValueError("max clock must be a non-negative integer MHz, or empty to clear")
-    argv = ["nvidia-smi", "-lgc", f"0,{max_mhz}"]
+        argv = ["sudo", "-n", "nvidia-smi", "-i", index, "-rgc"]
+    else:
+        argv = ["sudo", "-n", "nvidia-smi", "-i", index, "-lgc", "0," + clock_lock_int_text(max_mhz)]
     if not nvidia_smi_is_clock_lock(argv):
-        raise ValueError("max clock is not a valid lock argument")
+        raise ValueError("clock cap command is not a valid lock argument")
     return argv
+
+
+def parse_gpu_indices(text: str) -> list[int]:
+    """Accepted GPU indexes from ``nvidia-smi --query-gpu=index``. Junk lines are dropped."""
+    from sparksi.never import CLOCK_LOCK_INT
+
+    out: list[int] = []
+    for raw in text.splitlines():
+        token = raw.strip()
+        if CLOCK_LOCK_INT.fullmatch(token) is None:
+            continue
+        value = int(token)
+        if value not in out:
+            out.append(value)
+    return out
 
 
 def _mhz(raw: str) -> int | None:
@@ -193,31 +211,47 @@ def read_clocks(runner: Any, host: str, timeout: int = 8) -> dict[str, Any]:
     return {"ok": True, "error": None, "gpu": gpu}
 
 
+def gpu_indices(runner: Any, host: str, timeout: int = 8) -> tuple[list[int], str | None]:
+    """Read GPU indexes with a query (no sudo)."""
+    capture = getattr(runner, "capture", None)
+    if capture is None:
+        return [], "runner cannot query GPU indexes"
+    raw = capture(host, list(QUERY_INDEX), timeout=timeout)
+    if not isinstance(raw, dict):
+        return [], "runner returned a non-object"
+    found = parse_gpu_indices(raw.get("stdout") or "")
+    if found:
+        return found, None
+    err = str(raw.get("error") or raw.get("stderr") or "").strip()
+    return [], err or "The GPU index could not be read, so the cap was not changed."
+
+
 def apply_clock(runner: Any, host: str, max_mhz: int | None, timeout: int = 8) -> dict[str, Any]:
-    """Set or clear the cap, then read the clocks back. Never uses sudo."""
+    """Set or clear the cap with sudo -n, then read the clocks back."""
     before = read_clocks(runner, host, timeout=timeout)
     gpu = dict(before.get("gpu") or {})
     err = validate_max_mhz(max_mhz, gpu)
     if err:
         return {"ok": False, "error": err, "gpu": gpu}
-    try:
-        argv = clock_lock_argv(max_mhz)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc), "gpu": gpu}
+    indexes, index_err = gpu_indices(runner, host, timeout=timeout)
+    if not indexes:
+        return {"ok": False, "error": index_err or "The GPU index could not be read, so the cap was not changed.", "gpu": gpu}
     run = getattr(runner, "run_gpu_clock", None)
     if run is None:
         return {"ok": False, "error": "runner cannot set GPU clocks", "gpu": gpu}
-    result = run(host, argv, timeout=timeout)
-    if not isinstance(result, dict):
-        return {"ok": False, "error": "runner returned a non-object", "gpu": gpu}
-    if not result.get("ok"):
-        message = str(result.get("error") or result.get("stderr") or result.get("stdout") or "nvidia-smi failed").strip()
-        after = read_clocks(runner, host, timeout=timeout)
-        return {
-            "ok": False,
-            "error": message or "nvidia-smi failed",
-            "gpu": dict(after.get("gpu") or gpu),
-        }
+    result: dict[str, Any] | None = None
+    for index in indexes:
+        result = run(host, index, max_mhz, timeout=timeout)
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "runner returned a non-object", "gpu": gpu}
+        if not result.get("ok"):
+            message = str(result.get("error") or result.get("stderr") or result.get("stdout") or "nvidia-smi failed").strip()
+            after = read_clocks(runner, host, timeout=timeout)
+            return {
+                "ok": False,
+                "error": message or "nvidia-smi failed",
+                "gpu": dict(after.get("gpu") or gpu),
+            }
     after = read_clocks(runner, host, timeout=timeout)
     out_gpu = dict(after.get("gpu") or gpu)
     if max_mhz is None:

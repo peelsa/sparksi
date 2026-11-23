@@ -8,7 +8,7 @@ The sidebar links are Overview, Model Manager, Library, Archive, Network, Option
 
 The serving boxes at the top show what each Spark is running: the model name, the state (for example Ready), the port, and the endpoint URL with a Copy button. When two Sparks share one run, a link between their boxes says so.
 
-Each Spark's box also has a GPU max-clock field in MHz and a Save button. The current clock and the cap already applied are shown as read-only. An empty field means no cap. Save needs the lock off. If a model is running on that Spark, Save asks first. The cap is applied immediately with nvidia-smi, without sudo, and does not return after a reboot. A failed command, including a permissions error, is shown on the box. The allowed range comes from that GPU's own report.
+Each Spark's box also has a GPU max-clock field in MHz and a Save button. The current clock and the cap already applied are shown as read-only. An empty field means no cap. Save needs the lock off. If a model is running on that Spark, Save asks first. The cap is applied immediately with sudo -n nvidia-smi (non-interactive, and no other sudo use) and does not return after a reboot. A failed command, including a sudo or permissions error, is shown on the box. The allowed range comes from that GPU's own report.
 
 "Models started outside Sparksi" lists models answering on a Spark that Sparksi did not start. The Stop button for them is off unless `sparksi.toml` sets `[controller] stop_unmanaged = true`. When it is on, Stop asks first and needs the lock off.
 

@@ -1285,7 +1285,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200 if stopped else 500, {"stopped": stopped, "error": detail, "host": host, "port": port, "container": container})
 
     def _set_gpu_clocks(self, node_key: str, body: dict[str, Any], token: str | None) -> None:
-        """Apply or clear a per-Spark GPU max-clock cap. No sudo; no persistence."""
+        """Apply or clear a per-Spark GPU max-clock cap with sudo -n only; no persistence."""
         from sparksi.gpu_clocks import apply_clock, parse_request_mhz
 
         if not _writes_allowed(self, body, token):

@@ -239,13 +239,19 @@ class LocalRunner:
         out.setdefault("stderr", "")
         return out
 
-    def run_gpu_clock(self, host: str, argv: list[str], timeout: int = 8) -> dict[str, Any]:
-        """Set or clear a GPU clock cap. Refuses anything that is not the allowed argv."""
+    def run_gpu_clock(self, host: str, gpu_index: int, max_mhz: int | None, timeout: int = 8) -> dict[str, Any]:
+        """Set or clear a GPU clock cap. Builds the allowed sudo -n argv from integers only."""
+        from sparksi.gpu_clocks import clock_lock_argv
+
+        try:
+            argv = clock_lock_argv(gpu_index, max_mhz)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "stdout": "", "stderr": "", "code": None}
         if not nvidia_smi_is_clock_lock(argv):
             return {"ok": False, "error": "refusing non-clock-lock command", "stdout": "", "stderr": "", "code": None}
         if self.argv_fn is None:
             return {"ok": False, "error": "no argv runner", "stdout": "", "stderr": "", "code": None}
-        out = self.argv_fn(host, {"argv": argv, "gpu_clock": True}, timeout)
+        out = self.argv_fn(host, {"gpu_index": gpu_index, "max_mhz": max_mhz, "gpu_clock": True}, timeout)
         if not isinstance(out, dict):
             return {"ok": False, "error": "argv runner returned a non-object", "stdout": "", "stderr": "", "code": None}
         out.setdefault("stdout", out.get("tail") or "")
@@ -324,6 +330,8 @@ class SshRunner:
     def run_argv(self, host: str, argv: list[str], timeout: int = 3600) -> dict[str, Any]:
         if not argv or any(not isinstance(a, str) for a in argv):
             return {"ok": False, "error": "empty argv"}
+        if any(a.rsplit("/", 1)[-1] == "nvidia-smi" for a in argv):
+            return {"ok": False, "error": "refusing nvidia-smi on the launch path"}
         blocked = launcher_refusal(argv)
         if blocked:
             return {"ok": False, "error": blocked}
@@ -372,13 +380,21 @@ class SshRunner:
             "error": None if proc.returncode == 0 else ((proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:400]),
         }
 
-    def run_gpu_clock(self, host: str, argv: list[str], timeout: int = 8) -> dict[str, Any]:
-        """Set or clear a GPU clock cap over SSH. Refuses anything that is not the allowed argv."""
+    def run_gpu_clock(self, host: str, gpu_index: int, max_mhz: int | None, timeout: int = 8) -> dict[str, Any]:
+        """Set or clear a GPU clock cap over SSH.
+
+        The command line is built here from a validated GPU index and MHz, never
+        from a caller-supplied argv, so only ``sudo -n nvidia-smi -i <gpu> ...``
+        can run.
+        """
+        from sparksi.gpu_clocks import clock_lock_argv
+
+        try:
+            argv = clock_lock_argv(gpu_index, max_mhz)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "stdout": "", "stderr": "", "code": None}
         if not nvidia_smi_is_clock_lock(argv):
             return {"ok": False, "error": "refusing non-clock-lock command", "stdout": "", "stderr": "", "code": None}
-        blocked = launcher_refusal(argv)
-        if blocked:
-            return {"ok": False, "error": blocked, "stdout": "", "stderr": "", "code": None}
         try:
             target = resolve_target(host, self.catalog)
         except ValueError as exc:

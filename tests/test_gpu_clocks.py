@@ -13,14 +13,22 @@ import pytest
 from sparksi.gpu_clocks import (
     QUERY_CLOCK,
     QUERY_CSV,
+    QUERY_INDEX,
     apply_clock,
     clock_lock_argv,
     parse_clock_report,
+    parse_gpu_indices,
     parse_request_mhz,
     validate_max_mhz,
 )
 from sparksi.lock import Lock
-from sparksi.never import nvidia_smi_is_clock_lock, nvidia_smi_is_readonly, observation_refusal, subprocess_is_readonly
+from sparksi.never import (
+    launcher_refusal,
+    nvidia_smi_is_clock_lock,
+    nvidia_smi_is_readonly,
+    observation_refusal,
+    subprocess_is_readonly,
+)
 from sparksi.nodes import parse_nvidia
 from sparksi.serve import STATE, DualServer, Handler
 
@@ -68,35 +76,49 @@ GPU 00000000:01:00.0
 
 
 def test_clock_lock_allowlist_is_exact() -> None:
-    assert nvidia_smi_is_clock_lock(["nvidia-smi", "-lgc", "0,2000"])
-    assert nvidia_smi_is_clock_lock(["nvidia-smi", "--lock-gpu-clocks=0,2000"])
-    assert nvidia_smi_is_clock_lock(["/usr/bin/nvidia-smi", "-rgc"])
-    assert nvidia_smi_is_clock_lock(["nvidia-smi", "--reset-gpu-clocks"])
-    assert clock_lock_argv(2000) == ["nvidia-smi", "-lgc", "0,2000"]
-    assert clock_lock_argv(None) == ["nvidia-smi", "-rgc"]
+    set_cmd = ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,2000"]
+    clear_cmd = ["sudo", "-n", "nvidia-smi", "-i", "0", "-rgc"]
+    assert nvidia_smi_is_clock_lock(set_cmd)
+    assert nvidia_smi_is_clock_lock(clear_cmd)
+    assert nvidia_smi_is_clock_lock(["sudo", "-n", "nvidia-smi", "-i", "1", "-lgc", "0,210"])
+    assert clock_lock_argv(0, 2000) == set_cmd
+    assert clock_lock_argv(0, None) == clear_cmd
     for argv in (
-        ["nvidia-smi", "-lgc", "2000"],
-        ["nvidia-smi", "-lgc", "1,2000"],
-        ["nvidia-smi", "-lgc", "0,2000", "--mode=0"],
-        ["nvidia-smi", "-lgc", "0,02000"],
-        ["nvidia-smi", "-lgc", "0,2000;id"],
-        ["sudo", "nvidia-smi", "-lgc", "0,2000"],
-        ["nvidia-smi", "-ac", "0,2000"],
-        ["nvidia-smi", "-pl", "100"],
-        ["nvidia-smi", "-r"],
-        ["nvidia-smi", "-lgc", "0,2000", "-rgc"],
-        ["nvidia-smi"],
+        ["nvidia-smi", "-lgc", "0,2000"],
+        ["nvidia-smi", "-rgc"],
+        ["sudo", "nvidia-smi", "-i", "0", "-lgc", "0,2000"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,2000", "--mode=0"],
+        ["sudo", "-n", "-u", "root", "nvidia-smi", "-i", "0", "-rgc"],
+        ["sudo", "-n", "nvidia-smi", "-lgc", "0,2000"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "2000"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "1,2000"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,02000"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,2000;id"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0;id", "-lgc", "0,2000"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0$(id)", "-rgc"],
+        ["sudo", "-n", "nvidia-smi", "-i", "-1", "-rgc"],
+        ["sudo", "-n", "nvidia-smi", "-i", "00", "-rgc"],
+        ["sudo", "-n", "/usr/bin/nvidia-smi", "-i", "0", "-rgc"],
+        ["/usr/bin/sudo", "-n", "nvidia-smi", "-i", "0", "-rgc"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-ac", "0,2000"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-pl", "100"],
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-r"],
+        ["sudo"],
     ):
         assert not nvidia_smi_is_clock_lock(argv), argv
-        if argv and argv[0].rsplit("/", 1)[-1] == "nvidia-smi":
-            assert not nvidia_smi_is_readonly(argv[1:]), argv
-            assert observation_refusal(argv) is not None
-            assert not subprocess_is_readonly(argv)
+        assert observation_refusal(argv) is not None, argv
+        assert not subprocess_is_readonly(argv), argv
+    # Catalog service starts may still use sudo systemctl; that path is unchanged.
+    assert launcher_refusal(["sudo", "systemctl", "start", "studio-b"]) is None
+    # Clock caps are not a launch command; observation and the clock allowlist handle them.
+    assert observation_refusal(set_cmd) is not None
+    assert observation_refusal(clear_cmd) is not None
 
 
 def test_clock_queries_are_readonly() -> None:
     assert observation_refusal(QUERY_CSV) is None
     assert observation_refusal(QUERY_CLOCK) is None
+    assert observation_refusal(QUERY_INDEX) is None
     assert nvidia_smi_is_readonly(QUERY_CLOCK[1:])
     assert nvidia_smi_is_readonly(["-q", "-d", "CLOCK"])
     assert not nvidia_smi_is_readonly(["-q", "-d", "CLOCK", "-lgc", "0,2000"])
@@ -120,6 +142,9 @@ def test_parse_clock_report_and_csv() -> None:
     csv = parse_nvidia("12, 47, 2411, 3003\n")
     assert csv == {"util_pct": 12.0, "temp_c": 47.0, "clock_mhz": 2411.0, "clock_max_mhz": 3003.0}
     assert parse_nvidia("12, 47\n") == {"util_pct": 12.0, "temp_c": 47.0}
+    assert parse_gpu_indices("0\n") == [0]
+    assert parse_gpu_indices("0\n1\n") == [0, 1]
+    assert parse_gpu_indices("0;id\n00\n-1\nindex\n 2 \n") == [2]
 
 
 def test_validate_and_request_body() -> None:
@@ -139,13 +164,18 @@ def test_validate_and_request_body() -> None:
     assert parse_request_mhz({"max_mhz": "2000"}) == (2000, None)
     assert parse_request_mhz({"max_mhz": 2000.5})[0] is None
     assert parse_request_mhz({"max_mhz": True})[0] is None
+    assert parse_request_mhz({"max_mhz": "2000;id"})[0] is None
+    assert parse_request_mhz({"max_mhz": "0,2000"})[0] is None
+    assert parse_request_mhz({"max_mhz": "-lgc"})[0] is None
 
 
 class ClockRunner:
-    def __init__(self, *, fail: str | None = None, cap: int | None = None, max_mhz: int = 3003):
+    def __init__(self, *, fail: str | None = None, cap: int | None = None, max_mhz: int = 3003, indexes: list[int] | None = None, index_text: str | None = None):
         self.fail = fail
         self.cap = cap
         self.max_mhz = max_mhz
+        self.indexes = list(indexes) if indexes is not None else [0]
+        self.index_text = index_text
         self.applied: list[list[str]] = []
 
     def capture(self, host, argv, timeout=8):
@@ -158,16 +188,20 @@ class ClockRunner:
             else:
                 text = CLOCK_WITH_CAP.replace("2000", str(self.cap)).replace("3003", str(self.max_mhz)).replace("1800", str(self.cap))
             return {"ok": True, "code": 0, "stdout": text, "stderr": ""}
+        if argv == QUERY_INDEX:
+            text = self.index_text if self.index_text is not None else "".join(f"{i}\n" for i in self.indexes)
+            return {"ok": True, "code": 0, "stdout": text, "stderr": ""}
         return {"ok": False, "error": "unexpected query", "stdout": "", "stderr": "", "code": 1}
 
-    def run_gpu_clock(self, host, argv, timeout=8):
+    def run_gpu_clock(self, host, gpu_index, max_mhz, timeout=8):
+        argv = clock_lock_argv(gpu_index, max_mhz)
         self.applied.append(list(argv))
         if self.fail:
             return {"ok": False, "error": self.fail, "stdout": "", "stderr": self.fail, "code": 1}
-        if argv == ["nvidia-smi", "-rgc"]:
+        if max_mhz is None:
             self.cap = None
-        elif argv[:2] == ["nvidia-smi", "-lgc"]:
-            self.cap = int(argv[2].split(",", 1)[1])
+        else:
+            self.cap = max_mhz
         return {"ok": True, "code": 0, "stdout": "", "stderr": "", "error": None}
 
 
@@ -176,15 +210,15 @@ def test_apply_sets_and_clears_and_surfaces_permission_error() -> None:
     set_ok = apply_clock(runner, "head", 2000)
     assert set_ok["ok"] is True
     assert set_ok["gpu"]["clock_cap_mhz"] == 2000
-    assert runner.applied == [["nvidia-smi", "-lgc", "0,2000"]]
+    assert runner.applied == [["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,2000"]]
     cleared = apply_clock(runner, "head", None)
     assert cleared["ok"] is True
     assert cleared["gpu"]["clock_cap_mhz"] is None
-    assert runner.applied[-1] == ["nvidia-smi", "-rgc"]
-    denied = ClockRunner(fail="Unable to set GPU locked clocks \"(gpuClockMin 0, gpuClockMax 2000)\" for GPU 00000000:01:00.0: Insufficient Permissions")
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-rgc"]
+    denied = ClockRunner(fail="sudo: a password is required")
     out = apply_clock(denied, "head", 2000)
     assert out["ok"] is False
-    assert "Insufficient Permissions" in out["error"]
+    assert "sudo: a password is required" in out["error"]
     high = apply_clock(ClockRunner(), "head", 9000)
     assert high["ok"] is False
     assert "between 0 and 3003" in high["error"]
@@ -231,7 +265,7 @@ def test_api_sets_clock_and_refuses_when_locked(clock_server) -> None:
     assert status == 200, body
     assert body["ok"] is True
     assert body["gpu"]["clock_cap_mhz"] == 2000
-    assert runner.applied[-1] == ["nvidia-smi", "-lgc", "0,2000"]
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,2000"]
     lock.acquire("test")
     status, body = _post(url, {"max_mhz": 1800, "from_ui": True})
     assert status == 403
@@ -241,3 +275,94 @@ def test_api_sets_clock_and_refuses_when_locked(clock_server) -> None:
     status, _body = _post(url, {"max_mhz": 1800, "from_ui": True})
     assert status == 403
     assert runner.applied == applied
+
+
+def test_apply_uses_queried_indexes_and_ignores_injected_index_text() -> None:
+    runner = ClockRunner(indexes=[0, 1])
+    out = apply_clock(runner, "head", 1800)
+    assert out["ok"] is True
+    assert runner.applied == [
+        ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,1800"],
+        ["sudo", "-n", "nvidia-smi", "-i", "1", "-lgc", "0,1800"],
+    ]
+    poisoned = ClockRunner(index_text="0;rm -rf /\n00\n-1\n")
+    bad = apply_clock(poisoned, "head", 1800)
+    assert bad["ok"] is False
+    assert poisoned.applied == []
+    assert "index could not be read" in bad["error"]
+
+
+def test_api_ignores_client_gpu_index_and_reports_sudo_failure(clock_server) -> None:
+    base, runner, lock = clock_server
+    url = base + "/api/nodes/a/gpu-clocks"
+    status, body = _post(url, {"max_mhz": 1800, "gpu": "0;id", "index": "-1", "from_ui": True})
+    assert status == 200, body
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,1800"]
+    runner.fail = "sudo: a password is required"
+    status, body = _post(url, {"max_mhz": 1700, "from_ui": True})
+    assert status == 502
+    assert body["ok"] is False
+    assert body["error"] == "sudo: a password is required"
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,1700"]
+
+def test_api_sets_and_clears_clock_on_worker(clock_server) -> None:
+    base, runner, lock = clock_server
+    url = base + "/api/nodes/b/gpu-clocks"
+    status, body = _post(url, {"max_mhz": 1800, "from_ui": True})
+    assert status == 200, body
+    assert body["ok"] is True
+    assert body["id"] == "b"
+    assert body["role"] == "worker"
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,1800"]
+    status, body = _post(url, {"max_mhz": None, "from_ui": True})
+    assert status == 200, body
+    assert body["ok"] is True
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-rgc"]
+
+
+def test_ssh_runner_builds_sudo_n_argv_and_run_argv_refuses_nvidia_smi(monkeypatch) -> None:
+    import subprocess
+
+    import sparksi.remote as remote_mod
+    from sparksi.remote import SshRunner
+
+    seen: list[list[str]] = []
+
+    def fake(cmd, *a, **k):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(remote_mod.subprocess, "run", fake)
+    runner = SshRunner({"hosts": {"head": {"ssh": "spark-x"}}})
+    ok = runner.run_gpu_clock("head", 0, 2000)
+    assert ok["ok"] is True
+    cmd = seen[-1]
+    assert cmd[cmd.index("spark-x") + 1 :] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,2000"]
+    cleared = runner.run_gpu_clock("head", 0, None)
+    assert cleared["ok"] is True
+    assert seen[-1][seen[-1].index("spark-x") + 1 :] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-rgc"]
+
+    def fail(cmd, *a, **k):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 1, "", "sudo: a password is required")
+
+    monkeypatch.setattr(remote_mod.subprocess, "run", fail)
+    denied = runner.run_gpu_clock("head", 0, 1800)
+    assert denied["ok"] is False
+    assert denied["error"] == "sudo: a password is required"
+
+    seen.clear()
+    monkeypatch.setattr(remote_mod.subprocess, "run", fake)
+    bad_index = runner.run_gpu_clock("head", -1, 2000)
+    assert bad_index["ok"] is False
+    injected = runner.run_gpu_clock("head", 0, "2000;id")  # type: ignore[arg-type]
+    assert injected["ok"] is False
+    assert seen == []
+
+    refused = runner.run_argv("head", ["nvidia-smi", "-lgc", "0,2000"])
+    assert refused["ok"] is False
+    assert "nvidia-smi" in (refused.get("error") or "")
+    refused_sudo = runner.run_argv("head", ["sudo", "-n", "nvidia-smi", "-i", "0", "-rgc"])
+    assert refused_sudo["ok"] is False
+    assert "nvidia-smi" in (refused_sudo.get("error") or "")
+    assert seen == []

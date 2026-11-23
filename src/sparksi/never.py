@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import re
+
 MUTATOR_VERBS = ("load", "evict", "install")
 
 REFUSE_MSG = (
@@ -51,6 +53,9 @@ NVIDIA_SMI_DENY_SUBSTR = (
     "lock-gpu-clocks",
     "lock-memory-clocks",
 )
+
+# Only a non-negative integer may appear as a GPU index or a max MHz in a cap command.
+CLOCK_LOCK_INT = re.compile(r"(?:0|[1-9][0-9]*)")
 
 
 class Refused(RuntimeError):
@@ -146,32 +151,43 @@ def nvidia_smi_is_readonly(rest: list[str]) -> bool:
     return True
 
 
-def nvidia_smi_is_clock_lock(argv: list[str] | tuple[str, ...]) -> bool:
-    """True only for ``nvidia-smi -lgc 0,<int>`` or ``nvidia-smi -rgc`` (and long forms).
+def clock_lock_int_text(value: int) -> str:
+    """Return a digits-only form of a non-negative int, or raise."""
+    if type(value) is not int or value < 0:
+        raise ValueError("expected a non-negative integer")
+    text = format(value, "d")
+    if CLOCK_LOCK_INT.fullmatch(text) is None or int(text) != value:
+        raise ValueError("expected a non-negative integer")
+    return text
 
-    No sudo, no other flags, no other lock range. The page sends a max MHz; the
-    controller always locks from 0 to that max, which is the form nvidia-smi
-    documents for a cap.
+
+def nvidia_smi_is_clock_lock(argv: list[str] | tuple[str, ...]) -> bool:
+    """True only for the two cap commands, with a validated GPU index and MHz.
+
+    The only allowed shapes are::
+
+        sudo -n nvidia-smi -i <gpu> -lgc 0,<MHz>
+        sudo -n nvidia-smi -i <gpu> -rgc
+
+    ``<gpu>`` and ``<MHz>`` are non-negative integers with no extra flags,
+    no path to sudo or nvidia-smi, and no other sudo use.
     """
-    if not argv or any(not isinstance(part, str) or not part for part in argv):
+    parts = list(argv)
+    if not parts or any(not isinstance(part, str) or not part for part in parts):
         return False
-    prog = argv[0].rsplit("/", 1)[-1]
-    if prog != "nvidia-smi":
+    if parts[:4] != ["sudo", "-n", "nvidia-smi", "-i"]:
         return False
-    rest = list(argv[1:])
-    if rest == ["-rgc"] or rest == ["--reset-gpu-clocks"]:
-        return True
-    spec = ""
-    if len(rest) == 2 and rest[0] == "-lgc":
-        spec = rest[1]
-    elif len(rest) == 1 and rest[0].startswith("--lock-gpu-clocks="):
-        spec = rest[0].split("=", 1)[1]
-    else:
-        return False
-    if not spec.startswith("0,") or " " in spec or "\t" in spec:
-        return False
-    rhs = spec[2:]
-    return bool(rhs) and rhs.isdigit() and (rhs == "0" or not rhs.startswith("0"))
+    if len(parts) == 6 and parts[5] == "-rgc":
+        return CLOCK_LOCK_INT.fullmatch(parts[4]) is not None
+    if len(parts) == 7 and parts[5] == "-lgc":
+        spec = parts[6]
+        if not spec.startswith("0,"):
+            return False
+        return (
+            CLOCK_LOCK_INT.fullmatch(parts[4]) is not None
+            and CLOCK_LOCK_INT.fullmatch(spec[2:]) is not None
+        )
+    return False
 
 
 def observation_refusal(argv: list[str] | tuple[str, ...]) -> str | None:
@@ -180,6 +196,8 @@ def observation_refusal(argv: list[str] | tuple[str, ...]) -> str | None:
         return "refusing empty observation"
     prog = argv[0].rsplit("/", 1)[-1]
     rest = list(argv[1:])
+    if prog == "sudo":
+        return "refusing non-readonly command"
     if prog == "free" and rest in (["-b"], ["-m"], ["-g"]):
         return None
     if prog == "cat" and rest == ["/proc/meminfo"]:
