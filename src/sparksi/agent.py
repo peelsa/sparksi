@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import tarfile
@@ -2023,11 +2024,37 @@ def _files_read(req: dict) -> dict:
         if os.path.islink(path):
             links.append(path)
             continue
-        if files_only and os.path.isdir(path):
-            skipped[path] = "dir"
-            continue
-        if files_only and os.path.isfile(path) and os.path.getsize(path) > file_max:
-            skipped[path] = "large"
+        if files_only:
+            # Decide on one stat and read what was stated: a path swapped for a folder,
+            # a link or a larger file after the check is never read as a folder.
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                out[path] = None
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                skipped[path] = "dir"
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_size > file_max:
+                skipped[path] = "large" if stat.S_ISREG(info.st_mode) else "special"
+                continue
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as handle:
+                now = os.fstat(handle.fileno())
+                if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+                    return {"ok": False, "error": f"{raw} changed while it was read"}
+                data = handle.read(file_max + 1)
+            if len(data) > file_max:
+                skipped[path] = "large"
+                continue
+            total += len(data)
+            if total > FILES_MAX_BYTES:
+                return {"ok": False, "error": "files are too large to copy into a recipe folder"}
+            out[path] = {
+                "data": base64.b64encode(data).decode("ascii"),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "executable": bool(now.st_mode & 0o111),
+            }
             continue
         if os.path.isfile(path):
             candidates = [path]

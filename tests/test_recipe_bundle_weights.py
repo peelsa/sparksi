@@ -166,3 +166,118 @@ def test_outside_the_weights_root_a_large_file_is_still_refused(service, monkeyp
     catalog = {"library": [{"id": MODEL, "title": "Example", "local": {CFG.head.name: str(service / "model")}}]}
     plan = rb.plan_bundle(catalog, _Sparks(), MODEL)
     assert any("modelopt.py" in p and "--keep" in p for p in plan.problems)
+
+
+def _one_role(svc, extra: list[str], placement: str = "head") -> None:
+    role = _role(svc)
+    role["mounts"] = [*role["mounts"], *extra]
+    save_recipe(MODEL, {
+        "kind": "pinned", "engine": "vllm", "placement": placement, "port": 8014, "imported_from": "", "port_note": "",
+        "rendezvous_ports": [], "roles": {"head": role},
+    })
+
+
+def test_links_hard_links_and_a_linked_folder_under_the_weights_root(service):
+    """A link stays; a hard link and a file reached through a linked folder are regular files and are pinned."""
+    os.link(service / "attention.py", service / "hard.py")
+    os.symlink(service / "model", service / "linked-dir")
+    (service / "model" / "small.json").write_bytes(b"{}\n")
+    os.symlink(service / "modelopt.py", service / "soft.py")
+    _one_role(service, [f"{service}/hard.py:/opt/hard.py", f"{service}/linked-dir/small.json:/opt/small.json", f"{service}/soft.py:/opt/soft.py"])
+    view = rb.plan_bundle(_catalog(service), _Sparks(), MODEL).view()
+    assert view["ok"], view["problems"]
+    paths = {f["path"]: f["sha256"] for f in view["files"]}
+    assert paths["files/opt/hard.py"] == hashlib.sha256(PATCHES["attention.py"]).hexdigest()
+    assert paths["files/opt/small.json"] == hashlib.sha256(b"{}\n").hexdigest()
+    assert "files/opt/soft.py" not in paths and f"head: {service}/soft.py:/opt/soft.py" in view["kept"]
+
+
+def test_a_file_mount_that_is_the_weights_root_itself(service):
+    small = service / "config.json"
+    small.write_bytes(b'{"a": 1}\n')
+    big = service / "model" / "weights.safetensors"
+    save_recipe(MODEL, {
+        "kind": "pinned", "engine": "vllm", "placement": "head", "port": 8014, "imported_from": "", "port_note": "",
+        "rendezvous_ports": [], "roles": {"head": {**_role(service), "mounts": [f"{small}:/cfg.json", f"{big}:/models/w"]}},
+    })
+    catalog = {"library": [{"id": MODEL, "title": "Example", "local": {CFG.head.name: str(small)}}]}
+    view = rb.plan_bundle(catalog, _Sparks(), MODEL).view()
+    assert view["ok"], view["problems"]
+    assert [f["path"] for f in view["files"]] == ["files/cfg.json", "files/models/w"]  # big is not under this root: copied as before
+    catalog["library"][0]["local"] = {CFG.head.name: str(big)}
+    view = rb.plan_bundle(catalog, _Sparks(), MODEL).view()
+    assert [f["path"] for f in view["files"]] == ["files/cfg.json", "files/models/w"]  # 256 bytes is within the limit
+    os.truncate(big, 600)
+    import sparksi.recipes.bundle as mod
+
+    old = mod.MAX_FILE_BYTES
+    try:
+        mod.MAX_FILE_BYTES = 500
+        view = rb.plan_bundle(catalog, _Sparks(), MODEL).view()
+    finally:
+        mod.MAX_FILE_BYTES = old
+    assert view["ok"] and [f["path"] for f in view["files"]] == ["files/cfg.json"] and any("/models/w" in k for k in view["kept"])
+
+
+def test_many_small_files_under_the_weights_root_hit_the_folder_cap(service, monkeypatch):
+    monkeypatch.setattr(rb, "MAX_TOTAL_BYTES", 1000)
+    _one_role(service, [])
+    plan = rb.plan_bundle(_catalog(service), _Sparks(), MODEL)
+    assert plan.problems == ["the files to bundle add up to more than 0 MiB, so leave the largest mounts as they are with --keep"]
+    assert plan.view()["version"] == ""  # a refused bundle shows no version
+    assert rb.write_bundle(plan)[0] is False
+
+
+def test_a_spark_that_does_not_answer_refuses_instead_of_keeping_a_weights_file(service):
+    _one_role(service, [])
+
+    class Dark(_Sparks):
+        def invoke(self, host, req, timeout=20):
+            if req.get("op") == "files_read" and str(req["paths"][0]).endswith("modelopt.py"):
+                raise TimeoutError("timed out")
+            return super().invoke(host, req, timeout)
+
+    plan = rb.plan_bundle(_catalog(service), Dark(), MODEL)
+    assert plan.problems == [f"could not read {service}/modelopt.py on spark-1 (timed out)"]
+    assert plan.view()["version"] == ""
+
+
+def test_a_missing_or_unreadable_weights_path_stays(service, monkeypatch):
+    _one_role(service, [f"{service}/gone.py:/opt/gone.py", f"{service}/blocked/x.py:/opt/x.py"])
+    monkeypatch.setitem(agent._CFG, "blocked_prefixes", [str(service / "blocked")])
+    view = rb.plan_bundle(_catalog(service), _Sparks(), MODEL).view()
+    assert view["ok"], view["problems"]
+    assert {f"head: {service}/gone.py:/opt/gone.py", f"head: {service}/blocked/x.py:/opt/x.py"} <= set(view["kept"])
+
+
+def test_a_weights_file_swapped_after_its_stat_is_never_read_as_something_else(service, monkeypatch):
+    path = str(service / "modelopt.py")
+    real_fstat = os.fstat
+
+    def swapped(fd):
+        info = real_fstat(fd)
+        return os.stat_result((info.st_mode, info.st_ino + 1, *tuple(info)[2:]))
+
+    monkeypatch.setattr(agent.os, "fstat", swapped)
+    out = agent.main({"op": "files_read", "paths": [path], "files_only": True, "file_max": 1 << 20})
+    assert out["ok"] is False and "changed while it was read" in out["error"]
+    monkeypatch.setattr(agent.os, "fstat", real_fstat)
+    # A file that grew past the limit after the stat is left where it is, not read whole.
+    real_open = agent.os.open
+
+    def grow(p, flags, *a):
+        fd = real_open(p, flags, *a)
+        if p == path:
+            with open(path, "ab") as handle:
+                handle.write(b"x" * 4096)
+        return fd
+
+    monkeypatch.setattr(agent.os, "open", grow)
+    out = agent.main({"op": "files_read", "paths": [path], "files_only": True, "file_max": 2048})
+    assert out["ok"] and out["files"] == {} and out["skipped"] == {path: "large"}
+    # A folder in place of the file is never walked: the read opens without following and is a regular file only.
+    monkeypatch.setattr(agent.os, "open", real_open)
+    os.remove(path)
+    os.mkdir(path)
+    out = agent.main({"op": "files_read", "paths": [path], "files_only": True, "file_max": 1 << 20})
+    assert out["skipped"] == {path: "dir"} and out["files"] == {}
