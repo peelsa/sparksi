@@ -64,10 +64,10 @@ See [config.md](config.md) for one to four Sparks and every key.
 `sparksi serve --port 7510` runs a second copy on another port for a dry check.
 
 Open `http://127.0.0.1:7500` (or the controller's tailnet address on port
-7500) in a browser. Overview shows one card per configured Spark.
+7500) in a browser. Overview shows one card per configured Spark, including a GPU max-clock field and Save.
 
 The lock is ON when Sparksi starts with no lock file. You can look at
-everything, but Load, Unload and Network edits wait until you press Unlock.
+everything, but Load, Unload, Network edits and saving a GPU max-clock cap wait until you press Unlock.
 See [lock.md](lock.md).
 
 To load a model:

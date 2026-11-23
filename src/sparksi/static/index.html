@@ -821,6 +821,54 @@
   .serve-box h2 { margin: 0 0 var(--s2); font-size: 16px; line-height: 1.2; }
   .serve-box p { margin: 0; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
   .serve-box .serve-meta { color: var(--muted); font-weight: 500; }
+
+  .gpu-clock {
+    margin-top: var(--s3);
+    padding-top: var(--s3);
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--s2);
+  }
+  .gpu-clock .gpu-clock-read,
+  .gpu-clock .gpu-clock-range,
+  .gpu-clock .gpu-clock-msg {
+    flex: 1 0 100%;
+    margin: 0;
+    font-weight: 500;
+    color: var(--muted);
+  }
+  .gpu-clock .gpu-clock-read { color: var(--text); font-weight: 600; }
+  .gpu-clock label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    flex: 1 1 8rem;
+  }
+  .gpu-clock input {
+    min-height: 44px;
+    width: 100%;
+    max-width: 10rem;
+    padding: var(--s2);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text);
+  }
+  .gpu-clock .gpu-clock-msg.is-error { color: var(--pith); font-weight: 600; }
+  #gpu-clock-confirm {
+    background: var(--surface);
+    color: var(--text);
+    border: 2px solid var(--peel);
+    border-radius: var(--radius);
+    padding: 18px 22px;
+    max-width: 420px;
+  }
+  #gpu-clock-confirm::backdrop { background: rgba(19, 59, 1, 0.55); }
+  #gpu-clock-confirm h3 { margin: 0 0 12px; color: var(--pulp); font-weight: 700; }
+  #gpu-clock-confirm .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
   .serve-link {
     display: flex;
     flex-direction: column;
@@ -1266,6 +1314,14 @@
   <div class="actions">
     <button type="button" id="model-confirm-cancel">Cancel</button>
     <button type="button" id="model-confirm-ok" class="primary">Load</button>
+  </div>
+</dialog>
+<dialog id="gpu-clock-confirm" aria-labelledby="gpu-clock-confirm-title">
+  <h3 id="gpu-clock-confirm-title">Change GPU clock cap?</h3>
+  <p class="note" id="gpu-clock-confirm-note"></p>
+  <div class="actions">
+    <button type="button" id="gpu-clock-confirm-cancel">Cancel</button>
+    <button type="button" id="gpu-clock-confirm-ok" class="primary">Save</button>
   </div>
 </dialog>
 <div id="view-library" class="view" hidden>
@@ -3659,6 +3715,7 @@
       body.className = "serve-body";
       section.appendChild(heading);
       section.appendChild(body);
+      section.appendChild(gpuClockForm(role));
       box.appendChild(section);
     });
     return box;
@@ -3732,6 +3789,244 @@
       }
     }
   }
+
+  /* gpu-clock-start */
+  var gpuClockDraft = {};
+  var gpuClockSaving = {};
+  var gpuClockConfirmPending = null;
+  function gpuClockFact(role) {
+    var fact = null;
+    (nodeFacts || []).forEach(function (node) {
+      if (!node) return;
+      if (node.role === role || node.id === roleId(role) || node.name === roleName(role)) fact = node;
+    });
+    return fact;
+  }
+  function gpuClockGpu(role) {
+    var fact = gpuClockFact(role);
+    return (fact && fact.gpu) || {};
+  }
+  function gpuClockRunning(role) {
+    if (typeof serveEntries === "function") {
+      var listed = serveEntries(role) || [];
+      if (listed.length) return true;
+    }
+    if (typeof runningOn === "function") {
+      var rows = runningOn(role) || [];
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i] && !rows[i].protected) return true;
+      }
+    }
+    return false;
+  }
+  function gpuClockForm(role) {
+    var box = document.createElement("div");
+    box.className = "gpu-clock";
+    box.setAttribute("data-role", role);
+    var read = document.createElement("p");
+    read.className = "gpu-clock-read";
+    var range = document.createElement("p");
+    range.className = "gpu-clock-range";
+    var label = document.createElement("label");
+    var caption = document.createElement("span");
+    caption.textContent = "Max clock (MHz)";
+    var input = document.createElement("input");
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.autocomplete = "off";
+    input.placeholder = "No cap";
+    input.setAttribute("aria-label", "GPU max clock in MHz for " + roleWord(role));
+    input.addEventListener("input", function () {
+      gpuClockDraft[role] = { value: input.value, dirty: true };
+    });
+    label.appendChild(caption);
+    label.appendChild(input);
+    var save = document.createElement("button");
+    save.type = "button";
+    save.textContent = "Save";
+    save.addEventListener("click", function () { saveGpuClock(role); });
+    var msg = document.createElement("p");
+    msg.className = "note gpu-clock-msg";
+    msg.setAttribute("aria-live", "polite");
+    box.appendChild(read);
+    box.appendChild(range);
+    box.appendChild(label);
+    box.appendChild(save);
+    box.appendChild(msg);
+    return box;
+  }
+  function gpuClockBox(role) {
+    var root = el("serving-lines");
+    if (!root) return null;
+    return root.querySelector('.gpu-clock[data-role="' + role + '"]');
+  }
+  function paintGpuClocks() {
+    if (typeof ensureServing === "function") ensureServing();
+    sparkRoles().forEach(function (role) {
+      var box = gpuClockBox(role);
+      if (!box) return;
+      var gpu = gpuClockGpu(role);
+      var fact = gpuClockFact(role);
+      var read = box.querySelector(".gpu-clock-read");
+      var range = box.querySelector(".gpu-clock-range");
+      var input = box.querySelector("input");
+      var save = box.querySelector("button");
+      var msg = box.querySelector(".gpu-clock-msg");
+      var clock = gpu.clock_mhz;
+      var cap = gpu.clock_cap_mhz;
+      var min = gpu.clock_min_mhz != null ? gpu.clock_min_mhz : 0;
+      var max = gpu.clock_max_mhz;
+      var clockText = clock != null ? (trimNum(clock, 0) + " MHz") : "unavailable";
+      var capText = cap != null ? (trimNum(cap, 0) + " MHz") : "none";
+      if (read) setText(read, "Clock " + clockText + " · Cap " + capText);
+      if (range) {
+        if (max != null) setText(range, "Allowed " + trimNum(min, 0) + "–" + trimNum(max, 0) + " MHz");
+        else setText(range, "Allowed range unknown");
+      }
+      var draft = gpuClockDraft[role] || {};
+      if (input && document.activeElement !== input && !draft.dirty) {
+        input.value = cap != null ? String(Math.round(Number(cap))) : "";
+        gpuClockDraft[role] = { value: input.value, dirty: false };
+      }
+      var locked = typeof lockOn === "function" && lockOn();
+      if (save) {
+        save.disabled = !!gpuClockSaving[role] || locked || (fact && fact.reachable === false);
+        save.title = locked ? "Unlock first, then Save." : (gpuClockSaving[role] ? "Saving…" : "");
+      }
+      if (msg && !gpuClockSaving[role] && !(draft && draft.holdMsg)) {
+        if (locked) {
+          msg.className = "note gpu-clock-msg";
+          setText(msg, "Unlock first, then Save.");
+        } else if (fact && fact.reachable === false) {
+          msg.className = "note gpu-clock-msg";
+          setText(msg, "Unreachable");
+        } else if (!msg.className || msg.className.indexOf("is-error") === -1) {
+          if (!draft.keepOk) setText(msg, "");
+        }
+      }
+    });
+  }
+  function parseGpuClockInput(raw) {
+    var text = String(raw == null ? "" : raw).trim();
+    if (text === "") return { ok: true, value: null };
+    if (!/^[0-9]+$/.test(text)) return { ok: false, error: "Enter a whole number of MHz, or leave the box empty to clear the cap." };
+    return { ok: true, value: parseInt(text, 10) };
+  }
+  function gpuClockErrorText(reply) {
+    var body = (reply && reply.body) || {};
+    var err = body.error || body.message || "";
+    if (err) return String(err);
+    if (!reply) return "Save failed.";
+    return "Save failed (" + (reply.status || "no response") + ").";
+  }
+  function closeGpuClockConfirm(run) {
+    var dlg = el("gpu-clock-confirm");
+    var fn = gpuClockConfirmPending;
+    gpuClockConfirmPending = null;
+    if (dlg && dlg.open) dlg.close();
+    if (run && fn) fn();
+  }
+  function confirmGpuClock(note, proceed) {
+    var dlg = el("gpu-clock-confirm");
+    if (!dlg || !dlg.showModal) {
+      if (window.confirm(note)) proceed();
+      return;
+    }
+    gpuClockConfirmPending = proceed;
+    setText("gpu-clock-confirm-note", note);
+    if (!dlg.open) dlg.showModal();
+  }
+  function sendGpuClock(role, mhz) {
+    if (gpuClockSaving[role]) return;
+    gpuClockSaving[role] = true;
+    var box = gpuClockBox(role);
+    var save = box && box.querySelector("button");
+    var msg = box && box.querySelector(".gpu-clock-msg");
+    if (save) save.disabled = true;
+    if (msg) {
+      msg.className = "note gpu-clock-msg";
+      setText(msg, "Saving…");
+    }
+    var id = roleId(role);
+    jpost("/api/nodes/" + encodeURIComponent(id) + "/gpu-clocks", { max_mhz: mhz, from_ui: true }).then(function (r) {
+      gpuClockSaving[role] = false;
+      var body = (r && r.body) || {};
+      if (r && r.ok && body.ok) {
+        var fact = gpuClockFact(role);
+        if (fact) fact.gpu = body.gpu || fact.gpu;
+        else nodeFacts = (nodeFacts || []).concat([{ role: role, id: id, name: roleName(role), reachable: true, gpu: body.gpu || {} }]);
+        gpuClockDraft[role] = { value: mhz == null ? "" : String(mhz), dirty: false, keepOk: true };
+        if (msg) {
+          msg.className = "note gpu-clock-msg";
+          setText(msg, mhz == null ? "Cap cleared." : ("Cap set to " + mhz + " MHz."));
+        }
+        paintGpuClocks();
+        return;
+      }
+      if (msg) {
+        msg.className = "note gpu-clock-msg is-error";
+        setText(msg, gpuClockErrorText(r));
+      }
+      gpuClockDraft[role] = Object.assign({}, gpuClockDraft[role], { holdMsg: true, dirty: true });
+      paintGpuClocks();
+    }).catch(function (err) {
+      gpuClockSaving[role] = false;
+      if (msg) {
+        msg.className = "note gpu-clock-msg is-error";
+        setText(msg, (err && err.timeout) ? "No answer from Sparksi. Try again." : "Save failed.");
+      }
+      gpuClockDraft[role] = Object.assign({}, gpuClockDraft[role], { holdMsg: true, dirty: true });
+      paintGpuClocks();
+    });
+  }
+  function saveGpuClock(role) {
+    if (gpuClockSaving[role]) return;
+    var box = gpuClockBox(role);
+    var input = box && box.querySelector("input");
+    var msg = box && box.querySelector(".gpu-clock-msg");
+    if (typeof lockOn === "function" && lockOn()) {
+      if (msg) {
+        msg.className = "note gpu-clock-msg";
+        setText(msg, "Unlock first, then Save.");
+      }
+      return;
+    }
+    var parsed = parseGpuClockInput(input ? input.value : "");
+    if (!parsed.ok) {
+      if (msg) {
+        msg.className = "note gpu-clock-msg is-error";
+        setText(msg, parsed.error);
+      }
+      gpuClockDraft[role] = { value: input ? input.value : "", dirty: true, holdMsg: true };
+      return;
+    }
+    var gpu = gpuClockGpu(role);
+    var min = gpu.clock_min_mhz != null ? Number(gpu.clock_min_mhz) : 0;
+    var max = gpu.clock_max_mhz;
+    if (parsed.value != null && (max == null || max !== max)) {
+      if (msg) {
+        msg.className = "note gpu-clock-msg is-error";
+        setText(msg, "The GPU did not report a maximum clock, so the cap cannot be checked or set.");
+      }
+      return;
+    }
+    if (parsed.value != null && (parsed.value < min || parsed.value > Number(max))) {
+      if (msg) {
+        msg.className = "note gpu-clock-msg is-error";
+        setText(msg, "Enter a clock between " + Math.round(min) + " and " + Math.round(Number(max)) + " MHz, or leave the box empty to clear the cap.");
+      }
+      return;
+    }
+    var go = function () { sendGpuClock(role, parsed.value); };
+    if (gpuClockRunning(role)) {
+      var label = roleWord(role);
+      var what = parsed.value == null ? ("clear the GPU clock cap on " + label) : ("set the GPU max clock on " + label + " to " + parsed.value + " MHz");
+      confirmGpuClock("A model is running on this Spark. " + what.charAt(0).toUpperCase() + what.slice(1) + "? This cap lasts until reboot or until you clear it.", go);
+      return;
+    }
+    go();
+  }
+  /* gpu-clock-end */
   function paintServing() {
     var box = ensureServing();
     if (!box) return;
@@ -3952,6 +4247,7 @@
   }
   function paintOverview() {
     paintServing();
+    paintGpuClocks();
     paintRibbon();
     paintZones();
     paintArchiveGb();
@@ -10252,6 +10548,11 @@
     if (el("model-load")) el("model-load").addEventListener("click", function () { loadModel(); });
     if (el("model-confirm-ok")) el("model-confirm-ok").addEventListener("click", function () { closeModelConfirm(true); });
     if (el("model-confirm-cancel")) el("model-confirm-cancel").addEventListener("click", function () { closeModelConfirm(false); });
+    if (el("gpu-clock-confirm-ok")) el("gpu-clock-confirm-ok").addEventListener("click", function () { closeGpuClockConfirm(true); });
+    if (el("gpu-clock-confirm-cancel")) el("gpu-clock-confirm-cancel").addEventListener("click", function () { closeGpuClockConfirm(false); });
+    if (el("gpu-clock-confirm")) {
+      el("gpu-clock-confirm").addEventListener("cancel", function (ev) { ev.preventDefault(); closeGpuClockConfirm(false); });
+    }
     if (el("model-confirm")) {
       el("model-confirm").addEventListener("cancel", function (ev) { ev.preventDefault(); closeModelConfirm(false); });
       /* The close event is queued: it can land after the next dialog opened, so it only clears a dialog that stayed shut. */

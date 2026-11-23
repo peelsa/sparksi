@@ -47,7 +47,7 @@ from sparksi.jobs import (
     start_switch,
 )
 from sparksi.log import logger
-from sparksi.nodes import node_report
+from sparksi.nodes import invalidate_cache, node_report, node_specs
 from sparksi.launch import monitor_loaded, plan_switch
 from sparksi.library import fleet, row_by_id, sync_report
 from sparksi.models import list_models
@@ -317,6 +317,13 @@ def _run_id(path: str) -> str | None:
 def _run_stop_id(path: str) -> str | None:
     parts = path.strip("/").split("/")
     if len(parts) == 4 and parts[0] == "api" and parts[1] == "runs" and parts[3] == "stop" and valid_id(parts[2]):
+        return parts[2]
+    return None
+
+
+def _gpu_clocks_node(path: str) -> str | None:
+    parts = path.strip("/").split("/")
+    if len(parts) == 4 and parts[0] == "api" and parts[1] == "nodes" and parts[3] == "gpu-clocks" and valid_id(parts[2]):
         return parts[2]
     return None
 
@@ -1277,6 +1284,48 @@ class Handler(BaseHTTPRequestHandler):
         READS.expire()
         return self._json(200 if stopped else 500, {"stopped": stopped, "error": detail, "host": host, "port": port, "container": container})
 
+    def _set_gpu_clocks(self, node_key: str, body: dict[str, Any], token: str | None) -> None:
+        """Apply or clear a per-Spark GPU max-clock cap. No sudo; no persistence."""
+        from sparksi.gpu_clocks import apply_clock, parse_request_mhz
+
+        if not _writes_allowed(self, body, token):
+            return None
+        cat = load_catalog()
+        spec = None
+        for item in node_specs(cat):
+            if node_key in (item["id"], item["name"], item["role"], item["key"]):
+                spec = item
+                break
+        if spec is None:
+            return self._json(404, {"error": "Unknown Spark.", "ok": False})
+        max_mhz, why = parse_request_mhz(body)
+        if why:
+            return self._json(400, {"error": why, "ok": False, "id": spec["id"], "role": spec["role"]})
+        runner = active_runner(cat)
+        result = apply_clock(runner, spec["key"], max_mhz)
+        gpu = result.get("gpu") or {}
+        payload = {
+            "ok": bool(result.get("ok")),
+            "id": spec["id"],
+            "name": spec["name"],
+            "role": spec["role"],
+            "gpu": gpu,
+        }
+        if result.get("error"):
+            payload["error"] = result["error"]
+        if result.get("ok"):
+            if max_mhz is None:
+                note_activity("gpu-clock", f"GPU clock cap cleared on {spec['id']}")
+            else:
+                note_activity("gpu-clock", f"GPU max clock {max_mhz} MHz on {spec['id']}")
+            invalidate_cache()
+            READS.expire()
+            SLOW_READS.expire()
+            return self._json(200, payload)
+        # Permission and nvidia-smi failures are shown as written so the page can quote them.
+        status = 400 if "Enter a clock" in str(result.get("error") or "") or "cannot be checked" in str(result.get("error") or "") else 502
+        return self._json(status, payload)
+
     def do_POST(self) -> None:  # noqa: N802
         if STATE.readonly:
             return self._json(403, {"error": "read-only stage"})
@@ -1286,6 +1335,9 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             body = self._body_json()
             token = _read_token(self, body)
+            node_key = _gpu_clocks_node(path)
+            if node_key:
+                return self._set_gpu_clocks(node_key, body, token)
             if path == "/api/lock":
                 data = STATE.lock.acquire("api").to_dict()
                 note_activity("lock", "Lock on")

@@ -32,7 +32,15 @@ NVIDIA_SMI_ALLOW_PREFIX = (
     "--format",
     "--list-gpus",
 )
-NVIDIA_SMI_ALLOW_EXACT = {"-L", "-h", "--help", "--format=csv,noheader,nounits"}
+NVIDIA_SMI_ALLOW_EXACT = {"-L", "-h", "--help", "--format=csv,noheader,nounits", "-q", "--query"}
+NVIDIA_SMI_DISPLAY_SECTIONS = frozenset({
+    "CLOCK",
+    "CLOCKS",
+    "SUPPORTED_CLOCKS",
+    "UTILIZATION",
+    "TEMPERATURE",
+    "PERFORMANCE",
+})
 NVIDIA_SMI_DENY_SUBSTR = (
     "reset",
     "persistenced",
@@ -40,6 +48,8 @@ NVIDIA_SMI_DENY_SUBSTR = (
     "power-limit",
     "gpu-reset",
     "applications-clocks",
+    "lock-gpu-clocks",
+    "lock-memory-clocks",
 )
 
 
@@ -103,21 +113,65 @@ def nvidia_smi_is_readonly(rest: list[str]) -> bool:
     """Query/list flags only. Refuse reset / persistenced / any mutate argv."""
     if not rest:
         return False
-    for a in rest:
+    i = 0
+    while i < len(rest):
+        a = rest[i]
         al = a.lower()
-        if a in ("-r", "--gpu-reset", "--reset"):
+        if a in ("-r", "--gpu-reset", "--reset", "-lgc", "-rgc", "-ac", "-rac", "-pl"):
             return False
         if any(s in al for s in NVIDIA_SMI_DENY_SUBSTR):
             return False
         if a.startswith("--query-") or a.startswith("--format"):
+            i += 1
             continue
         if a in NVIDIA_SMI_ALLOW_EXACT or a.startswith("--list"):
+            i += 1
+            continue
+        if a == "-d" or a.startswith("--display="):
+            if a == "-d":
+                if i + 1 >= len(rest):
+                    return False
+                section = rest[i + 1]
+                i += 2
+            else:
+                section = a.split("=", 1)[1]
+                i += 1
+            if section.upper() not in NVIDIA_SMI_DISPLAY_SECTIONS:
+                return False
             continue
         if a.startswith("-"):
             return False
         # positional leftovers not allowed
         return False
     return True
+
+
+def nvidia_smi_is_clock_lock(argv: list[str] | tuple[str, ...]) -> bool:
+    """True only for ``nvidia-smi -lgc 0,<int>`` or ``nvidia-smi -rgc`` (and long forms).
+
+    No sudo, no other flags, no other lock range. The page sends a max MHz; the
+    controller always locks from 0 to that max, which is the form nvidia-smi
+    documents for a cap.
+    """
+    if not argv or any(not isinstance(part, str) or not part for part in argv):
+        return False
+    prog = argv[0].rsplit("/", 1)[-1]
+    if prog != "nvidia-smi":
+        return False
+    rest = list(argv[1:])
+    if rest == ["-rgc"] or rest == ["--reset-gpu-clocks"]:
+        return True
+    spec = ""
+    if len(rest) == 2 and rest[0] == "-lgc":
+        spec = rest[1]
+    elif len(rest) == 1 and rest[0].startswith("--lock-gpu-clocks="):
+        spec = rest[0].split("=", 1)[1]
+    else:
+        return False
+    if not spec.startswith("0,") or " " in spec or "\t" in spec:
+        return False
+    rhs = spec[2:]
+    return bool(rhs) and rhs.isdigit() and (rhs == "0" or not rhs.startswith("0"))
 
 
 def observation_refusal(argv: list[str] | tuple[str, ...]) -> str | None:
