@@ -82,7 +82,9 @@ class Bundle:
         }
 
     def version(self) -> str:
-        """The folder version this bundle will have once written; "" when the recipe cannot be saved."""
+        """The folder version this bundle will have once written; "" when it is refused or cannot be saved."""
+        if self.problems:
+            return ""
         try:
             settings = hashlib.sha256(recipe_text(self.recipe).encode("utf-8")).hexdigest()
         except (TypeError, ValueError):
@@ -114,18 +116,37 @@ def _weights_roots(catalog: dict[str, Any], model_id: str) -> list[str]:
     return [root for root in roots if root]
 
 
-def _read(runner: Any, host: str, path: str) -> tuple[dict[str, Any] | None, str]:
+# Why ``_read`` left a weights-root path where it is: a folder, a file over the limit,
+# a special file, a link, nothing there, or a path the agent may not read. Any other
+# failure (no answer, a file that changed while it was read) refuses the bundle.
+_STAYS = ("dir", "large", "special", "link", "missing", "refused")
+
+
+def _read(runner: Any, host: str, path: str, files_only: bool = False) -> tuple[dict[str, Any] | None, str]:
+    """Files read from ``host``; with ``files_only`` a folder or a file over the limit is not read.
+
+    Such a path comes back as None with a reason in ``_STAYS`` (or a sentence for a failure).
+    """
+    req: dict[str, Any] = {"op": "files_read", "paths": [path]}
+    if files_only:
+        req.update(files_only=True, file_max=MAX_FILE_BYTES)
     try:
-        result = runner.invoke(host, {"op": "files_read", "paths": [path]}, timeout=READ_TIMEOUT_S)
+        result = runner.invoke(host, req, timeout=READ_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 — reported as one sentence
         return None, str(exc)
     if not isinstance(result, dict) or not result.get("ok"):
-        return None, str((result or {}).get("error") or "no answer")
+        why = str((result or {}).get("error") or "no answer") if isinstance(result, dict) else "no answer"
+        # The agent never reads a blocked path or one outside the mount roots; such a
+        # weights mount stays as it is, as it did before. A Spark that did not answer refuses.
+        return None, "refused" if files_only and why.startswith("refusing") else why
+    skipped = result.get("skipped") if isinstance(result.get("skipped"), dict) else {}
+    if skipped:
+        return None, str(next(iter(skipped.values())))
     if result.get("links"):
-        return None, f"{path} holds a link, which a recipe folder does not carry"
+        return None, "link" if files_only else f"{path} holds a link, which a recipe folder does not carry"
     found = result.get("files") or {}
     if not any(found.values()):
-        return None, f"{path} is not there"
+        return None, "missing" if files_only else f"{path} is not there"
     return found, ""
 
 
@@ -184,15 +205,19 @@ def plan_bundle(
             text = str(mount)
             source, _sep, rest = text.partition(":")
             target, _sep2, opts = rest.partition(":")
-            if (
-                not source.startswith("/") or not target.startswith("/")
-                or _under(source, skip) or os.path.normpath(source) in keep_set
-            ):
+            if not source.startswith("/") or not target.startswith("/") or os.path.normpath(source) in keep_set:
                 if source.startswith("/"):
                     out.kept.append(f"{role_name}: {text}")
                 mounts.append(text)
                 continue
-            found, why = _read(runner, host, source)
+            # Under the weights root only a single file within the size limit is a
+            # recipe input (a patch, a config); folders and large files stay put.
+            weights = _under(source, skip)
+            found, why = _read(runner, host, source, files_only=weights)
+            if found is None and weights and why in _STAYS:
+                out.kept.append(f"{role_name}: {text}")
+                mounts.append(text)
+                continue
             if found is None:
                 out.problems.append(f"could not read {source} on {host} ({why})")
                 mounts.append(text)
