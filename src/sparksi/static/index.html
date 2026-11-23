@@ -3807,6 +3807,7 @@
     return (fact && fact.gpu) || {};
   }
   function gpuClockRunning(role) {
+    if (typeof observedServing === "function" && (observedServing(role) || []).length) return true;
     if (typeof serveEntries === "function") {
       var listed = serveEntries(role) || [];
       if (listed.length) return true;
@@ -3874,10 +3875,16 @@
       var msg = box.querySelector(".gpu-clock-msg");
       var clock = gpu.clock_mhz;
       var cap = gpu.clock_cap_mhz;
-      var min = gpu.clock_min_mhz != null ? gpu.clock_min_mhz : 0;
+      var min = gpu.clock_min_mhz != null ? Math.max(1, gpu.clock_min_mhz) : 1;
       var max = gpu.clock_max_mhz;
       var clockText = clock != null ? (trimNum(clock, 0) + " MHz") : "unavailable";
-      var capText = cap != null ? (trimNum(cap, 0) + " MHz") : "none";
+      var memo = gpu.clock_cap_set || null;
+      var shown = cap != null ? cap : (memo && memo.mhz != null ? memo.mhz : null);
+      var capText;
+      if (cap != null) capText = trimNum(cap, 0) + " MHz";
+      else if (gpu.clock_cap_reported) capText = "none";
+      else if (memo) capText = memo.mhz != null ? (trimNum(memo.mhz, 0) + " MHz, set from Sparksi") : "none, cleared from Sparksi";
+      else capText = "not reported by the GPU";
       if (read) setText(read, "Clock " + clockText + " · Cap " + capText);
       if (range) {
         if (max != null) setText(range, "Allowed " + trimNum(min, 0) + "–" + trimNum(max, 0) + " MHz");
@@ -3885,7 +3892,7 @@
       }
       var draft = gpuClockDraft[role] || {};
       if (input && document.activeElement !== input && !draft.dirty) {
-        input.value = cap != null ? String(Math.round(Number(cap))) : "";
+        input.value = shown != null ? String(Math.round(Number(shown))) : "";
         gpuClockDraft[role] = { value: input.value, dirty: false };
       }
       var locked = typeof lockOn === "function" && lockOn();
@@ -3936,7 +3943,7 @@
     setText("gpu-clock-confirm-note", note);
     if (!dlg.open) dlg.showModal();
   }
-  function sendGpuClock(role, mhz) {
+  function sendGpuClock(role, mhz, confirmed) {
     if (gpuClockSaving[role]) return;
     gpuClockSaving[role] = true;
     var box = gpuClockBox(role);
@@ -3948,9 +3955,21 @@
       setText(msg, "Saving…");
     }
     var id = roleId(role);
-    jpost("/api/nodes/" + encodeURIComponent(id) + "/gpu-clocks", { max_mhz: mhz, from_ui: true }).then(function (r) {
+    var req = { max_mhz: mhz, from_ui: true };
+    if (confirmed) req.confirm_running = true;
+    jpost("/api/nodes/" + encodeURIComponent(id) + "/gpu-clocks", req).then(function (r) {
       gpuClockSaving[role] = false;
       var body = (r && r.body) || {};
+      if (!confirmed && r && r.status === 409 && body.needs_confirm) {
+        /* Sparksi sees a model this page did not: ask, then send again with the OK. */
+        if (msg) {
+          msg.className = "note gpu-clock-msg";
+          setText(msg, "");
+        }
+        paintGpuClocks();
+        confirmGpuClock(String(body.error || "A model is running on this Spark.") + " This cap lasts until reboot or until you clear it.", function () { sendGpuClock(role, mhz, true); });
+        return;
+      }
       if (r && r.ok && body.ok) {
         var fact = gpuClockFact(role);
         if (fact) fact.gpu = body.gpu || fact.gpu;
@@ -4001,7 +4020,7 @@
       return;
     }
     var gpu = gpuClockGpu(role);
-    var min = gpu.clock_min_mhz != null ? Number(gpu.clock_min_mhz) : 0;
+    var min = gpu.clock_min_mhz != null ? Math.max(1, Number(gpu.clock_min_mhz)) : 1;
     var max = gpu.clock_max_mhz;
     if (parsed.value != null && (max == null || max !== max)) {
       if (msg) {
@@ -4017,14 +4036,14 @@
       }
       return;
     }
-    var go = function () { sendGpuClock(role, parsed.value); };
     if (gpuClockRunning(role)) {
+      var go = function () { sendGpuClock(role, parsed.value, true); };
       var label = roleWord(role);
       var what = parsed.value == null ? ("clear the GPU clock cap on " + label) : ("set the GPU max clock on " + label + " to " + parsed.value + " MHz");
       confirmGpuClock("A model is running on this Spark. " + what.charAt(0).toUpperCase() + what.slice(1) + "? This cap lasts until reboot or until you clear it.", go);
       return;
     }
-    go();
+    sendGpuClock(role, parsed.value, false);
   }
   /* gpu-clock-end */
   function paintServing() {

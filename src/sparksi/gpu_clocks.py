@@ -7,13 +7,16 @@ Setting or clearing it uses only ``sudo -n nvidia-smi -i <gpu> -lgc 0,<MHz>``
 or ``sudo -n nvidia-smi -i <gpu> -rgc`` (non-interactive, never a prompt).
 No other command is run with sudo, and sudoers is never edited. If sudo -n
 fails, the error is returned as written. Range limits come from the GPU's
-own nvidia-smi report. When the GPU does not report a minimum, 0 is used
-because that is the lower bound nvidia-smi documents for ``-lgc MIN,MAX``.
+own nvidia-smi report. When the GPU does not report a minimum, 1 MHz is the
+lowest cap, so a typed 0 is never applied as a 0 MHz ceiling. The ``-lgc``
+minimum is always 0.
 The GPU index is read from nvidia-smi, never from the browser.
 """
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 from sparksi.never import clock_lock_int_text, nvidia_smi_is_clock_lock
@@ -27,6 +30,18 @@ QUERY_CLOCK = ["nvidia-smi", "-q", "--display=CLOCK"]
 QUERY_INDEX = ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"]
 
 _FIELD_NAMES = frozenset({"graphics", "sm", "memory", "video", "min", "max"})
+_LOCK_SECTIONS = frozenset({"gpu locked clocks", "locked clocks"})
+
+# Lowest cap accepted when the GPU reports no supported-clock minimum. 0 is refused so a
+# box typed as "0" is never read as "no cap" and applied as a 0 MHz ceiling.
+MIN_CAP_FLOOR_MHZ = 1
+
+# What Sparksi itself last applied per Spark, in this dashboard process only. Shown when the
+# driver does not report a locked clock. Never written to disk; a Spark reboot drops the real
+# cap, which is why the page labels this as "set from Sparksi" rather than as a GPU reading.
+_MEMO_LOCK = threading.Lock()
+_LAST_SET: dict[str, dict[str, Any]] = {}
+_SAVING: set[str] = set()
 
 
 def clock_lock_argv(gpu_index: int, max_mhz: int | None) -> list[str]:
@@ -88,6 +103,7 @@ def parse_clock_report(text: str) -> dict[str, int | None]:
     cap_min: int | None = None
     reported_min: int | None = None
     supported: list[int] = []
+    cap_reported = False
     section = ""
     for raw in text.splitlines():
         line = raw.strip()
@@ -98,6 +114,8 @@ def parse_clock_report(text: str) -> dict[str, int | None]:
         if not name:
             if _is_heading(label):
                 section = label
+                if section.lower() in _LOCK_SECTIONS:
+                    cap_reported = True
                 if section.lower() == "supported clocks" and trailing:
                     # "Supported Clocks : N/A"
                     if _mhz(trailing) is None:
@@ -114,7 +132,7 @@ def parse_clock_report(text: str) -> dict[str, int | None]:
                 max_mhz = value
             elif key == "supported clocks":
                 supported.append(value)
-        elif key in {"gpu locked clocks", "locked clocks"}:
+        elif key in _LOCK_SECTIONS:
             if name == "max":
                 cap = value
             elif name == "min":
@@ -129,6 +147,9 @@ def parse_clock_report(text: str) -> dict[str, int | None]:
         "clock_min_mhz": reported_min,
         "clock_cap_mhz": cap,
         "clock_cap_min_mhz": cap_min,
+        # Some drivers (GB10 on 580.x among them) print no locked-clocks section at all,
+        # so "no cap reported" is not the same as "no cap".
+        "clock_cap_reported": cap_reported,
     }
 
 
@@ -140,8 +161,8 @@ def validation_bounds(gpu: dict[str, Any] | None) -> tuple[int, int | None]:
         low = int(reported_min) if reported_min is not None else 0
     except (TypeError, ValueError):
         low = 0
-    if low < 0:
-        low = 0
+    if low < MIN_CAP_FLOOR_MHZ:
+        low = MIN_CAP_FLOOR_MHZ
     reported_max = gpu.get("clock_max_mhz")
     try:
         high = int(reported_max) if reported_max is not None else None
@@ -231,36 +252,89 @@ def gpu_indices(runner: Any, host: str, timeout: int = 8) -> tuple[list[int], st
     return [], err or "The GPU index could not be read, so the cap was not changed."
 
 
+def remember_cap(host: str, max_mhz: int | None) -> None:
+    """Note what Sparksi just applied on ``host`` (in memory only)."""
+    with _MEMO_LOCK:
+        _LAST_SET[str(host)] = {"mhz": max_mhz, "at": time.time()}
+
+
+def with_memo(host: str, gpu: dict[str, Any]) -> dict[str, Any]:
+    """Add ``clock_cap_set`` when the driver does not report a locked clock itself."""
+    out = dict(gpu or {})
+    if out.get("clock_cap_reported") or out.get("clock_cap_mhz") is not None:
+        out.pop("clock_cap_set", None)
+        return out
+    with _MEMO_LOCK:
+        memo = _LAST_SET.get(str(host))
+        if memo is not None:
+            out["clock_cap_set"] = dict(memo)
+    return out
+
+
+def begin_save(host: str) -> bool:
+    """Claim the one in-flight save for ``host``. False when another save is running."""
+    with _MEMO_LOCK:
+        if str(host) in _SAVING:
+            return False
+        _SAVING.add(str(host))
+        return True
+
+
+def end_save(host: str) -> None:
+    with _MEMO_LOCK:
+        _SAVING.discard(str(host))
+
+
+def reset_for_tests() -> None:
+    with _MEMO_LOCK:
+        _LAST_SET.clear()
+        _SAVING.clear()
+
+
 def apply_clock(runner: Any, host: str, max_mhz: int | None, timeout: int = 8) -> dict[str, Any]:
-    """Set or clear the cap with sudo -n, then read the clocks back."""
+    """Set or clear the cap with sudo -n, then read the clocks back.
+
+    ``kind`` on a failure is ``"invalid"`` (nothing was run) or ``"failed"`` (sudo, ssh,
+    or nvidia-smi refused or errored; the message is passed through as written).
+    """
     before = read_clocks(runner, host, timeout=timeout)
     gpu = dict(before.get("gpu") or {})
     err = validate_max_mhz(max_mhz, gpu)
     if err:
-        return {"ok": False, "error": err, "gpu": gpu}
+        return {"ok": False, "kind": "invalid", "error": err, "gpu": with_memo(host, gpu)}
     indexes, index_err = gpu_indices(runner, host, timeout=timeout)
     if not indexes:
-        return {"ok": False, "error": index_err or "The GPU index could not be read, so the cap was not changed.", "gpu": gpu}
+        return {
+            "ok": False,
+            "kind": "failed",
+            "error": index_err or "The GPU index could not be read, so the cap was not changed.",
+            "gpu": with_memo(host, gpu),
+        }
     run = getattr(runner, "run_gpu_clock", None)
     if run is None:
-        return {"ok": False, "error": "runner cannot set GPU clocks", "gpu": gpu}
+        return {"ok": False, "kind": "failed", "error": "runner cannot set GPU clocks", "gpu": with_memo(host, gpu)}
     result: dict[str, Any] | None = None
-    for index in indexes:
+    for done, index in enumerate(indexes):
         result = run(host, index, max_mhz, timeout=timeout)
-        if not isinstance(result, dict):
-            return {"ok": False, "error": "runner returned a non-object", "gpu": gpu}
-        if not result.get("ok"):
-            message = str(result.get("error") or result.get("stderr") or result.get("stdout") or "nvidia-smi failed").strip()
+        ok = isinstance(result, dict) and bool(result.get("ok"))
+        if not ok:
+            if not isinstance(result, dict):
+                message = "runner returned a non-object"
+            else:
+                message = str(result.get("error") or result.get("stderr") or result.get("stdout") or "nvidia-smi failed").strip()
+            if done:
+                # An earlier GPU on this Spark already took the new setting.
+                remember_cap(host, max_mhz)
             after = read_clocks(runner, host, timeout=timeout)
             return {
                 "ok": False,
+                "kind": "failed",
                 "error": message or "nvidia-smi failed",
-                "gpu": dict(after.get("gpu") or gpu),
+                "gpu": with_memo(host, dict(after.get("gpu") or gpu)),
             }
+    remember_cap(host, max_mhz)
     after = read_clocks(runner, host, timeout=timeout)
     out_gpu = dict(after.get("gpu") or gpu)
     if max_mhz is None:
-        # A driver that does not report locked clocks still treated a successful -rgc as cleared.
-        if "clock_cap_mhz" not in out_gpu:
-            out_gpu["clock_cap_mhz"] = None
-    return {"ok": True, "error": None, "gpu": out_gpu}
+        out_gpu.setdefault("clock_cap_mhz", None)
+    return {"ok": True, "kind": None, "error": None, "gpu": with_memo(host, out_gpu)}

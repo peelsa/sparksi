@@ -133,7 +133,9 @@ def test_parse_clock_report_and_csv() -> None:
     assert open_gpu["clock_max_mhz"] == 3003
     assert open_gpu["clock_cap_mhz"] is None
     assert open_gpu["clock_min_mhz"] is None
+    assert open_gpu["clock_cap_reported"] is False
     capped = parse_clock_report(CLOCK_WITH_CAP)
+    assert capped["clock_cap_reported"] is True
     assert capped["clock_mhz"] == 1800
     assert capped["clock_max_mhz"] == 3003
     assert capped["clock_cap_mhz"] == 2000
@@ -155,9 +157,10 @@ def test_validate_and_request_body() -> None:
     gpu = {"clock_min_mhz": None, "clock_max_mhz": 3003}
     assert validate_max_mhz(None, gpu) is None
     assert validate_max_mhz(2000, gpu) is None
-    assert validate_max_mhz(0, gpu) is None
+    assert "between 1 and 3003" in (validate_max_mhz(0, gpu) or "")
+    assert validate_max_mhz(1, gpu) is None
     assert validate_max_mhz(3003, gpu) is None
-    assert "between 0 and 3003" in (validate_max_mhz(3004, gpu) or "")
+    assert "between 1 and 3003" in (validate_max_mhz(3004, gpu) or "")
     assert "maximum clock" in (validate_max_mhz(2000, {}) or "")
     gpu_min = {"clock_min_mhz": 210, "clock_max_mhz": 3003}
     assert "between 210 and 3003" in (validate_max_mhz(100, gpu_min) or "")
@@ -225,7 +228,8 @@ def test_apply_sets_and_clears_and_surfaces_permission_error() -> None:
     assert "sudo: a password is required" in out["error"]
     high = apply_clock(ClockRunner(), "head", 9000)
     assert high["ok"] is False
-    assert "between 0 and 3003" in high["error"]
+    assert "between 1 and 3003" in high["error"]
+    assert high["kind"] == "invalid"
 
 
 @pytest.fixture
@@ -234,6 +238,9 @@ def clock_server(monkeypatch, tmp_path):
     lock = Lock(tmp_path / "lock")
     lock.release()
     STATE.lock = lock
+    import sparksi.gpu_clocks as gpu_clocks_mod
+
+    gpu_clocks_mod.reset_for_tests()
     runner = ClockRunner()
     STATE.runner = runner
     httpd = DualServer(("127.0.0.1", 0), Handler)
@@ -370,3 +377,144 @@ def test_ssh_runner_builds_sudo_n_argv_and_run_argv_refuses_nvidia_smi(monkeypat
     assert refused_sudo["ok"] is False
     assert "nvidia-smi" in (refused_sudo.get("error") or "")
     assert seen == []
+
+
+# Real GB10 report shape (driver 580.x): no locked-clocks section, sample blocks carry Max/Min N/A.
+CLOCK_GB10 = """
+GPU 0000000F:01:00.0
+    Clocks
+        Graphics                                       : 2437 MHz
+        SM                                             : 2437 MHz
+        Memory                                         : N/A
+        Video                                          : 2132 MHz
+    Max Clocks
+        Graphics                                       : 3003 MHz
+    SM Clock Samples
+        Duration                                       : N/A
+        Max                                            : N/A
+        Min                                            : N/A
+    Clock Policy
+        Auto Boost                                     : N/A
+"""
+
+
+class Gb10Runner(ClockRunner):
+    """A driver that applies -lgc but never prints the lock back."""
+
+    def capture(self, host, argv, timeout=8):
+        if argv == QUERY_CLOCK:
+            return {"ok": True, "code": 0, "stdout": CLOCK_GB10, "stderr": ""}
+        return super().capture(host, argv, timeout)
+
+
+def test_gb10_report_keeps_cap_unknown_and_memo_shows_what_was_set() -> None:
+    import sparksi.gpu_clocks as gpu_clocks_mod
+
+    gpu_clocks_mod.reset_for_tests()
+    parsed = parse_clock_report(CLOCK_GB10)
+    assert parsed["clock_mhz"] == 2437
+    assert parsed["clock_max_mhz"] == 3003
+    assert parsed["clock_cap_mhz"] is None
+    assert parsed["clock_cap_reported"] is False
+    runner = Gb10Runner()
+    out = apply_clock(runner, "head", 2000)
+    assert out["ok"] is True
+    assert out["gpu"]["clock_cap_set"]["mhz"] == 2000
+    assert gpu_clocks_mod.with_memo("worker", {"clock_cap_reported": False}).get("clock_cap_set") is None
+    cleared = apply_clock(runner, "head", None)
+    assert cleared["ok"] is True
+    assert cleared["gpu"]["clock_cap_set"]["mhz"] is None
+    # A driver that does report the lock wins over the memo.
+    assert "clock_cap_set" not in gpu_clocks_mod.with_memo("head", {"clock_cap_reported": True, "clock_cap_mhz": None})
+    gpu_clocks_mod.reset_for_tests()
+
+
+def test_partial_multi_gpu_failure_is_failed_and_remembered() -> None:
+    import sparksi.gpu_clocks as gpu_clocks_mod
+
+    gpu_clocks_mod.reset_for_tests()
+
+    class Half(Gb10Runner):
+        def run_gpu_clock(self, host, gpu_index, max_mhz, timeout=8):
+            if gpu_index == 1:
+                self.applied.append(clock_lock_argv(gpu_index, max_mhz))
+                return {"ok": False, "error": "sudo: a password is required", "code": 1}
+            return super().run_gpu_clock(host, gpu_index, max_mhz, timeout)
+
+    out = apply_clock(Half(indexes=[0, 1]), "head", 1500)
+    assert out["ok"] is False
+    assert out["kind"] == "failed"
+    assert out["error"] == "sudo: a password is required"
+    assert out["gpu"]["clock_cap_set"]["mhz"] == 1500
+    gpu_clocks_mod.reset_for_tests()
+
+
+def test_api_needs_confirm_while_a_model_runs(clock_server, monkeypatch) -> None:
+    import sparksi.serve as serve_mod
+
+    base, runner, lock = clock_server
+    loaded = [{"host": "a", "name": "m", "port": 8000}]
+    monkeypatch.setattr(serve_mod, "monitor_loaded", lambda: loaded)
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True})
+    assert status == 409
+    assert body["needs_confirm"] is True
+    assert "running" in body["error"]
+    assert runner.applied == []
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True, "confirm_running": "yes"})
+    assert status == 409, "only a JSON true is an OK"
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True, "confirm_running": True})
+    assert status == 200, body
+    # A pair spanning the worker also counts there; a video service does not.
+    loaded[:] = [{"host": "a", "span": ["a", "b"], "port": 8000}]
+    status, body = _post(base + "/api/nodes/b/gpu-clocks", {"max_mhz": 2000, "from_ui": True})
+    assert status == 409
+    loaded[:] = [{"host": "b", "video_service": True, "kind": "video_service", "port": 8188}]
+    status, body = _post(base + "/api/nodes/b/gpu-clocks", {"max_mhz": 2000, "from_ui": True})
+    assert status == 200, body
+    # Unknown monitor state also asks.
+    monkeypatch.setattr(serve_mod, "monitor_loaded", lambda: None)
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 1900, "from_ui": True})
+    assert status == 409
+    assert body["needs_confirm"] is True
+
+
+def test_api_refuses_a_second_save_while_one_runs(clock_server) -> None:
+    import sparksi.gpu_clocks as gpu_clocks_mod
+    from sparksi.catalog import load_catalog
+    from sparksi.nodes import node_specs
+
+    base, runner, lock = clock_server
+    key = next(item["key"] for item in node_specs(load_catalog()) if item["id"] == "a")
+    assert gpu_clocks_mod.begin_save(key)
+    assert not gpu_clocks_mod.begin_save(key)
+    try:
+        status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True})
+        assert status == 409
+        assert "already running" in body["error"]
+        assert runner.applied == []
+    finally:
+        gpu_clocks_mod.end_save(key)
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True})
+    assert status == 200, body
+    # The claim is released after each save, success or failure.
+    assert gpu_clocks_mod.begin_save(key)
+    gpu_clocks_mod.end_save(key)
+
+
+def test_api_unknown_spark_and_lock_with_token(clock_server) -> None:
+    base, runner, lock = clock_server
+    status, body = _post(base + "/api/nodes/zz/gpu-clocks", {"max_mhz": 2000, "from_ui": True})
+    assert status == 404
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": "2000;id", "from_ui": True})
+    assert status == 400
+    assert runner.applied == []
+
+
+def test_local_runner_run_argv_refuses_nvidia_smi() -> None:
+    from sparksi.remote import LocalRunner
+
+    calls = []
+    runner = LocalRunner(lambda h, r, t: {"ok": True}, argv_fn=lambda h, r, t: calls.append(r) or {"ok": True})
+    out = runner.run_argv("head", ["/usr/bin/nvidia-smi", "-rgc"])
+    assert out["ok"] is False
+    assert calls == []

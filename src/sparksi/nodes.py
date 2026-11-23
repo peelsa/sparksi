@@ -399,6 +399,10 @@ def _read_node(catalog: dict[str, Any], spec: dict[str, str], call: Any) -> dict
         for key, value in parse_clock_report(clock_raw.get("stdout") or "").items():
             if value is not None:
                 gpu[key] = value
+    if gpu:
+        from sparksi.gpu_clocks import with_memo
+
+        gpu = with_memo(spec["key"], gpu)
     card["gpu"] = gpu or None
     ports_raw = call(["ss", "-ltn"])
     listeners = parse_ss_ltn(ports_raw.get("stdout") or "")

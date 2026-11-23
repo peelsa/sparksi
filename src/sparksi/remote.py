@@ -224,6 +224,8 @@ class LocalRunner:
         return out
 
     def run_argv(self, host: str, argv: list[str], timeout: int = 3600) -> dict[str, Any]:
+        if any(isinstance(a, str) and a.rsplit("/", 1)[-1] == "nvidia-smi" for a in argv or []):
+            return {"ok": False, "error": "refusing nvidia-smi on the launch path"}
         if self.argv_fn is None:
             return {"ok": False, "error": "no argv runner"}
         out = self.argv_fn(host, {"argv": argv}, timeout)

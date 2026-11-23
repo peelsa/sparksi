@@ -17,7 +17,7 @@ def _run(extra: str, *, roles: list[str] | None = None) -> object:
     role_js = json.dumps(role_list)
     preamble = r"""
 var nodeFacts = [
-  { role: "head", id: "a", name: "spark-a", reachable: true, gpu: { util_pct: 4, temp_c: 40, clock_mhz: 2411, clock_max_mhz: 3003, clock_cap_mhz: null } },
+  { role: "head", id: "a", name: "spark-a", reachable: true, gpu: { util_pct: 4, temp_c: 40, clock_mhz: 2411, clock_max_mhz: 3003, clock_cap_mhz: null, clock_cap_reported: true } },
   { role: "worker", id: "b", name: "spark-b", reachable: true, gpu: { util_pct: 1, temp_c: 38, clock_mhz: 2405, clock_max_mhz: 3003, clock_cap_mhz: 2000 } },
   { role: "node3", id: "c", name: "spark-c", reachable: true, gpu: { clock_mhz: 2000, clock_max_mhz: 3003, clock_min_mhz: 210, clock_cap_mhz: null } },
   { role: "node4", id: "d", name: "spark-d", reachable: false, gpu: null }
@@ -149,7 +149,7 @@ def test_each_spark_gets_a_clock_box_and_save() -> None:
     assert head["value"] == ""
     assert head["save"] == "Save"
     assert head["disabled"] is False
-    assert "0–3003" in head["range"] or "0-3003" in head["range"] or "0–3003" in head["range"]
+    assert "1–3003" in head["range"]
     assert worker["read"] == "Clock 2405 MHz · Cap 2000 MHz"
     assert worker["value"] == "2000"
     assert "Head" in head["label"]
@@ -216,3 +216,76 @@ def test_running_model_asks_before_save() -> None:
     assert len(got["notes"]) == 1
     assert "running" in got["notes"][0].lower()
     assert "2000" in got["notes"][0]
+
+
+def test_unreported_cap_shows_what_sparksi_set_not_none() -> None:
+    got = _run(
+        """
+        nodeFacts[0].gpu = { clock_mhz: 2411, clock_max_mhz: 3003, clock_cap_reported: false };
+        nodeFacts[1].gpu = { clock_mhz: 1990, clock_max_mhz: 3003, clock_cap_reported: false, clock_cap_set: { mhz: 2000, at: 1 } };
+        paintGpuClocks();
+        var head = gpuClockBox("head");
+        var worker = gpuClockBox("worker");
+        process.stdout.write(JSON.stringify({
+          head: head.querySelector(".gpu-clock-read").textContent,
+          worker: worker.querySelector(".gpu-clock-read").textContent,
+          workerValue: worker.querySelector("input").value
+        }));
+        """
+    )
+    assert got["head"] == "Clock 2411 MHz · Cap not reported by the GPU"
+    assert got["worker"] == "Clock 1990 MHz · Cap 2000 MHz, set from Sparksi"
+    assert got["workerValue"] == "2000"
+
+
+def test_zero_is_refused_on_the_page() -> None:
+    got = _run(
+        """
+        paintGpuClocks();
+        var head = gpuClockBox("head");
+        head.querySelector("input").value = "0";
+        saveGpuClock("head");
+        process.stdout.write(JSON.stringify({ msg: head.querySelector(".gpu-clock-msg").textContent, posts: posted.length }));
+        """
+    )
+    assert got["posts"] == 0
+    assert "between 1 and 3003" in got["msg"]
+
+
+def test_confirmed_save_sends_the_ok_and_server_ask_reprompts() -> None:
+    got = _run(
+        """
+        var notes = [];
+        confirmGpuClock = function (note, proceed) { notes.push(note); proceed(); };
+        globalThis.runningRoles = { head: true };
+        paintGpuClocks();
+        var head = gpuClockBox("head");
+        head.querySelector("input").value = "2000";
+        saveGpuClock("head");
+        var afterLocal = posted.slice();
+        globalThis.runningRoles = {};
+        var replies = [
+          { ok: false, status: 409, body: { ok: false, needs_confirm: true, error: "A model is running on this Spark." } },
+          { ok: true, status: 200, body: { ok: true, gpu: { clock_mhz: 1800, clock_max_mhz: 3003, clock_cap_mhz: 1800 } } }
+        ];
+        jpost = function (url, body) { posted.push({ url: url, body: body }); return Promise.resolve(replies.shift()); };
+        var worker = gpuClockBox("worker");
+        worker.querySelector("input").value = "1800";
+        saveGpuClock("worker");
+        setTimeout(function () {
+          process.stdout.write(JSON.stringify({
+            afterLocal: afterLocal,
+            posted: posted,
+            notes: notes,
+            msg: worker.querySelector(".gpu-clock-msg").textContent
+          }));
+        }, 20);
+        """
+    )
+    assert got["afterLocal"][0]["body"]["confirm_running"] is True
+    worker_posts = [p for p in got["posted"] if p["url"].endswith("/b/gpu-clocks")]
+    assert len(worker_posts) == 2
+    assert "confirm_running" not in worker_posts[0]["body"]
+    assert worker_posts[1]["body"]["confirm_running"] is True
+    assert len(got["notes"]) == 2
+    assert "Cap set to 1800" in got["msg"]
