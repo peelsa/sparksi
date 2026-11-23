@@ -145,6 +145,10 @@ def test_parse_clock_report_and_csv() -> None:
     assert parse_gpu_indices("0\n") == [0]
     assert parse_gpu_indices("0\n1\n") == [0, 1]
     assert parse_gpu_indices("0;id\n00\n-1\nindex\n 2 \n") == [2]
+    spaced = "Clocks\n" + "Graphics" + " " * 200 + ":" + " " * 200 + "2411 MHz\nMax Clocks\nGraphics:3003\n"
+    parsed = parse_clock_report(spaced)
+    assert parsed["clock_mhz"] == 2411
+    assert parsed["clock_max_mhz"] == 3003
 
 
 def test_validate_and_request_body() -> None:

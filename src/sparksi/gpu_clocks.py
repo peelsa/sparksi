@@ -14,7 +14,6 @@ The GPU index is read from nvidia-smi, never from the browser.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from sparksi.never import clock_lock_int_text, nvidia_smi_is_clock_lock
@@ -27,9 +26,7 @@ QUERY_CSV = [
 QUERY_CLOCK = ["nvidia-smi", "-q", "--display=CLOCK"]
 QUERY_INDEX = ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"]
 
-_MHZ = re.compile(r"(-?\d+)\s*(?:MHz)?\s*$", re.I)
-_SECTION = re.compile(r"^([A-Za-z][A-Za-z0-9 ]+?)\s*(?::\s*(.*))?$")
-_FIELD = re.compile(r"^(Graphics|SM|Memory|Video|Min|Max)\s*:\s*(.*)$", re.I)
+_FIELD_NAMES = frozenset({"graphics", "sm", "memory", "video", "min", "max"})
 
 
 def clock_lock_argv(gpu_index: int, max_mhz: int | None) -> list[str]:
@@ -59,17 +56,28 @@ def parse_gpu_indices(text: str) -> list[int]:
     return out
 
 
+def _split_label(line: str) -> tuple[str, str | None]:
+    """Split a report line at the first colon. No regex."""
+    if ":" not in line:
+        return line.strip(), None
+    left, right = line.split(":", 1)
+    return left.strip(), right.strip()
+
+
+def _is_heading(label: str) -> bool:
+    return bool(label) and label[0].isalpha() and all(ch.isalnum() or ch == " " for ch in label)
+
+
 def _mhz(raw: str) -> int | None:
     text = (raw or "").strip()
     if not text or text.upper() in {"N/A", "[N/A]", "[NOT SUPPORTED]", "NOT SUPPORTED"}:
         return None
-    match = _MHZ.search(text)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
+    if text.lower().endswith("mhz"):
+        text = text[:-3].rstrip()
+    if text.startswith("-"):
+        digits = text[1:]
+        return -int(digits) if digits.isdigit() else None
+    return int(text) if text.isdigit() else None
 
 
 def parse_clock_report(text: str) -> dict[str, int | None]:
@@ -85,20 +93,17 @@ def parse_clock_report(text: str) -> dict[str, int | None]:
         line = raw.strip()
         if not line:
             continue
-        field = _FIELD.match(line)
-        heading = _SECTION.match(line) if not field else None
-        if heading and heading.group(1) not in {"Graphics", "SM", "Memory", "Video", "Min", "Max"}:
-            section = heading.group(1).strip()
-            trailing = heading.group(2)
-            if section.lower() == "supported clocks" and trailing:
-                # "Supported Clocks : N/A"
-                if _mhz(trailing) is None:
-                    continue
+        label, trailing = _split_label(line)
+        name = label.lower() if label.lower() in _FIELD_NAMES else ""
+        if not name:
+            if _is_heading(label):
+                section = label
+                if section.lower() == "supported clocks" and trailing:
+                    # "Supported Clocks : N/A"
+                    if _mhz(trailing) is None:
+                        continue
             continue
-        if not field:
-            continue
-        name = field.group(1).lower()
-        value = _mhz(field.group(2))
+        value = _mhz(trailing or "")
         if value is None:
             continue
         key = section.lower()
