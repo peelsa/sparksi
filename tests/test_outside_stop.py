@@ -345,6 +345,11 @@ class FakeRunner:
         if req.get("op") == "probe":
             return {"ok": True, "unmanaged_containers": dict(self.containers.get(host, {}))}
         if req.get("op") == "stop_outside":
+            # The SSH runner resolves a Spark-only op through the catalog hosts, keyed by node name.
+            from sparksi.remote import recipe_target_error
+
+            hosts = {node.name: {"ssh": node.ssh} for node in CFG.nodes}
+            assert recipe_target_error(host, {"hosts": hosts}) is None, host
             return dict(self.reply)
         return {"ok": False, "error": "unexpected"}
 
@@ -426,7 +431,7 @@ def test_bare_process_offered_and_stopped_with_lock_on(site):
         STATE.lock.release()
     assert status == 200, body
     assert body["stopped"] is True and body["gpu_freed_mib"] == 5000
-    assert site["runner"].stops() == [(site["host"], {"op": "stop_outside", "port": 8020, "keep": ["keepme"]})]
+    assert site["runner"].stops() == [(site["name"], {"op": "stop_outside", "port": 8020, "keep": ["keepme"]})]
     assert site["notes"] == [("stop", f"emergency stop llama on {site['name']} port 8020: stopped with TERM, port closed, GPU freed 5000 MiB", site["host"])]
 
 
@@ -436,7 +441,7 @@ def test_container_offered_and_stopped(site):
     assert items[8030]["container"] == "boxed-server" and items[8030]["emergency"] is True
     status, body = ask(site["port"], "POST", "/api/outside/stop", _body(site, port=8030, container="boxed-server"))
     assert status == 200, body
-    assert site["runner"].stops() == [(site["host"], {"op": "stop_outside", "port": 8030, "keep": ["keepme"], "container": "boxed-server"})]
+    assert site["runner"].stops() == [(site["name"], {"op": "stop_outside", "port": 8030, "keep": ["keepme"], "container": "boxed-server"})]
 
 
 @pytest.mark.parametrize(

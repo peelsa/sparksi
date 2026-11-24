@@ -1419,7 +1419,8 @@ class Handler(BaseHTTPRequestHandler):
         req: dict[str, Any] = {"op": "stop_outside", "port": port, "keep": sorted(_outside_keep(cat))}
         if container:
             req["container"] = container
-        result = runner.invoke(host, req, timeout=90)
+        # A Spark-only op: the runner resolves it like a recipe op, by the node's name.
+        result = runner.invoke(spark, req, timeout=90)
         if not isinstance(result, dict):
             result = {"ok": False, "error": "no answer"}
         stopped = bool(result.get("stopped"))
