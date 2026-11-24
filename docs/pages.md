@@ -6,9 +6,7 @@ The sidebar links are Overview, Model Manager, Library, Archive, Network, Option
 
 ## Overview (`/overview`)
 
-The serving boxes at the top show what each Spark is running: the model name, the state (for example Ready), the port, and the endpoint URL with a Copy button. When two Sparks share one run, a link between their boxes says so.
-
-Each Spark's box also has a GPU max-clock field in MHz and a Save button. The current clock and the cap already applied are shown as read-only. An empty field means no cap. Save needs the lock off. If a model is running on that Spark, Save asks first. The cap is applied immediately with sudo -n nvidia-smi (non-interactive, and no other sudo use) and does not return after a reboot. A failed command, including a sudo or permissions error, is shown on the box. The allowed range comes from that GPU's own report; with no reported minimum the lowest cap is 1 MHz. Some drivers, GB10 among them, do not print an applied cap back; then the box says the cap is not reported, or shows the cap Sparksi last set since the dashboard started, labelled as set from Sparksi.
+The serving boxes at the top show what each Spark is running: the model name, the state (for example Ready), the port, and the endpoint URL with a Copy button. When two Sparks share one run, a link between their boxes says so. Each box also shows the live GPU clock speed (for example 2405 MHz) on the same heading line.
 
 "Models started outside Sparksi" lists models answering on a Spark that Sparksi did not start. The Stop button for them is off unless `sparksi.toml` sets `[controller] stop_unmanaged = true`. When it is on, Stop asks first and needs the lock off.
 
@@ -61,6 +59,8 @@ Discover lists each machine it found with its addresses, where it was seen, and 
 ## Options (`/options`)
 
 Optional settings. Each is saved one line at a time in `sparksi.toml` with a backup; nothing starts or stops and the lock is not needed.
+
+The page also has a GPU max-clock row per Spark: the current clock, the allowed range, and the cap already applied. An empty field means no cap. Saving does not need Unlock. A warning on the control says not to change the clock during an active decode. If a model is running or decoding on that Spark, Save asks first (the server also refuses without that OK, including when it cannot tell). The cap is applied immediately with sudo -n nvidia-smi (non-interactive, and no other sudo use) and does not return after a reboot. A failed command, including a sudo or permissions error, is shown on the row. The allowed range comes from that GPU's own report; with no reported minimum the lowest cap is 1 MHz. Some drivers, GB10 among them, do not print an applied cap back; then the row says the cap is not reported, or shows the cap Sparksi last set since the dashboard started, labelled as set from Sparksi.
 
 - Storage path (`archive.root`)
 - Storage name (`archive.label`)

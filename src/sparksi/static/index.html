@@ -818,18 +818,20 @@
     border-radius: var(--radius);
     padding: var(--s3);
   }
-  .serve-box h2 { margin: 0 0 var(--s2); font-size: 16px; line-height: 1.2; }
+  .serve-box h2 { margin: 0 0 var(--s2); font-size: 16px; line-height: 1.2; white-space: nowrap; }
   .serve-box p { margin: 0; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
   .serve-box .serve-meta { color: var(--muted); font-weight: 500; }
+  .serve-box h2 .serve-clock { font-weight: 500; color: var(--muted); }
+  .serve-box h2 .serve-clock:not(:empty)::before { content: " · "; font-weight: 500; }
 
   .gpu-clock {
-    margin-top: var(--s3);
-    padding-top: var(--s3);
-    border-top: 1px solid var(--border);
     display: flex;
     flex-wrap: wrap;
     align-items: flex-end;
     gap: var(--s2);
+    margin: 0;
+    padding: var(--s2) 0;
+    border-bottom: 1px solid var(--border);
   }
   .gpu-clock .gpu-clock-read,
   .gpu-clock .gpu-clock-range,
@@ -1033,6 +1035,9 @@
   .opt-restart {
     color: var(--zest);
   }
+  #opt-gpu-clocks { margin: var(--s4) 0 var(--s3); }
+  #opt-gpu-clocks h3 { margin: 0 0 var(--s2); font-size: 16px; line-height: 1.2; }
+  #opt-gpu-clock-warning { font-weight: 600; color: var(--zest); margin: 0 0 var(--s2); }
 </style>
 </head>
 <body>
@@ -1174,7 +1179,12 @@
 </div>
 <div id="view-options" class="view" hidden>
   <h2>Options</h2>
-  <p class="note">Optional features. Machines and roles are on the Network page. Each Save changes one line of sparksi.toml and keeps a backup; nothing starts or stops.</p>
+  <p class="note">Optional features. Machines and roles are on the Network page. Settings Save changes one line of sparksi.toml and keeps a backup; nothing starts or stops. GPU clock caps are applied immediately and are not kept across a reboot.</p>
+  <section id="opt-gpu-clocks" aria-labelledby="opt-gpu-clocks-h">
+    <h3 id="opt-gpu-clocks-h">GPU max clock</h3>
+    <p class="note" id="opt-gpu-clock-warning">Don't change the clock during an active decode.</p>
+    <div id="opt-gpu-clock-rows"></div>
+  </section>
   <div id="opt-list"></div>
   <p class="note" id="opt-note" aria-live="polite"></p>
 </div>
@@ -1888,6 +1898,10 @@
       }
       var serving = el("serving-lines");
       if (serving) clear(serving);
+      /* Options keeps one GPU clock row per Spark; rebuild them for the new set. */
+      var clockRows = el("opt-gpu-clock-rows");
+      if (clockRows) clear(clockRows);
+      if (typeof paintGpuClocks === "function" && pageName().page === "options") paintGpuClocks();
     }
   }
 
@@ -3710,12 +3724,17 @@
       section.className = "serve-box";
       section.setAttribute("data-role", role);
       var heading = document.createElement("h2");
-      heading.textContent = roleWord(role);
+      var title = document.createElement("span");
+      title.className = "serve-title";
+      title.textContent = roleWord(role);
+      var clock = document.createElement("span");
+      clock.className = "serve-clock";
+      heading.appendChild(title);
+      heading.appendChild(clock);
       var body = document.createElement("div");
       body.className = "serve-body";
       section.appendChild(heading);
       section.appendChild(body);
-      section.appendChild(gpuClockForm(role));
       box.appendChild(section);
     });
     return box;
@@ -3806,20 +3825,39 @@
     var fact = gpuClockFact(role);
     return (fact && fact.gpu) || {};
   }
-  function gpuClockRunning(role) {
-    if (typeof observedServing === "function" && (observedServing(role) || []).length) return true;
-    if (typeof serveEntries === "function") {
-      var listed = serveEntries(role) || [];
-      if (listed.length) return true;
+  function gpuClockActivity(role) {
+    var names = {};
+    var fact = gpuClockFact(role);
+    [roleId(role), roleName(role), fact && fact.id, fact && fact.name, fact && fact.key].forEach(function (n) {
+      if (n) names[String(n)] = true;
+    });
+    var loaded = (typeof lastMonitor !== "undefined" && lastMonitor && lastMonitor.loaded) || [];
+    var running = false;
+    for (var i = 0; i < loaded.length; i++) {
+      var rec = loaded[i];
+      if (!rec || rec.video_service === true || rec.kind === "video_service") continue;
+      /* A loaded row with no host is on the head, as the server reads it. */
+      var host = rec.host || roleId("head");
+      var span = rec.span || [];
+      var hit = !!names[host];
+      for (var s = 0; s < span.length; s++) if (names[span[s]]) hit = true;
+      if (!hit) continue;
+      var raw = String(rec.state || "").toUpperCase();
+      var tok = rec.tok_s;
+      if (raw === "GEN" || raw === "GENERATING" || raw === "VIDEO" || (tok != null && tok !== "" && Number(tok) >= 1)) return "decoding";
+      running = true;
     }
+    if (typeof observedServing === "function" && (observedServing(role) || []).length) running = true;
+    if (typeof serveEntries === "function" && (serveEntries(role) || []).length) running = true;
     if (typeof runningOn === "function") {
       var rows = runningOn(role) || [];
-      for (var i = 0; i < rows.length; i++) {
-        if (rows[i] && !rows[i].protected) return true;
+      for (var j = 0; j < rows.length; j++) {
+        if (rows[j] && !rows[j].protected) running = true;
       }
     }
-    return false;
+    return running ? "running" : "";
   }
+  function gpuClockRunning(role) { return !!gpuClockActivity(role); }
   function gpuClockForm(role) {
     var box = document.createElement("div");
     box.className = "gpu-clock";
@@ -3856,13 +3894,35 @@
     box.appendChild(msg);
     return box;
   }
+  function ensureGpuClockForms() {
+    var root = el("opt-gpu-clock-rows");
+    if (!root) return root;
+    if (root.querySelector(".gpu-clock")) return root;
+    sparkRoles().forEach(function (role) {
+      root.appendChild(gpuClockForm(role));
+    });
+    return root;
+  }
   function gpuClockBox(role) {
-    var root = el("serving-lines");
+    var root = el("opt-gpu-clock-rows");
     if (!root) return null;
     return root.querySelector('.gpu-clock[data-role="' + role + '"]');
   }
-  function paintGpuClocks() {
+  function paintServeClocks() {
     if (typeof ensureServing === "function") ensureServing();
+    var root = el("serving-lines");
+    if (!root) return;
+    sparkRoles().forEach(function (role) {
+      var section = root.querySelector('.serve-box[data-role="' + role + '"]');
+      var clock = section && section.querySelector(".serve-clock");
+      if (!clock) return;
+      var mhz = gpuClockGpu(role).clock_mhz;
+      setText(clock, mhz != null ? (trimNum(mhz, 0) + " MHz") : "");
+    });
+  }
+  function paintGpuClocks() {
+    if (typeof ensureGpuClockForms !== "function") return;
+    ensureGpuClockForms();
     sparkRoles().forEach(function (role) {
       var box = gpuClockBox(role);
       if (!box) return;
@@ -3895,16 +3955,12 @@
         input.value = shown != null ? String(Math.round(Number(shown))) : "";
         gpuClockDraft[role] = { value: input.value, dirty: false };
       }
-      var locked = typeof lockOn === "function" && lockOn();
       if (save) {
-        save.disabled = !!gpuClockSaving[role] || locked || (fact && fact.reachable === false);
-        save.title = locked ? "Unlock first, then Save." : (gpuClockSaving[role] ? "Saving…" : "");
+        save.disabled = !!gpuClockSaving[role] || (fact && fact.reachable === false);
+        save.title = gpuClockSaving[role] ? "Saving…" : "";
       }
       if (msg && !gpuClockSaving[role] && !(draft && draft.holdMsg)) {
-        if (locked) {
-          msg.className = "note gpu-clock-msg";
-          setText(msg, "Unlock first, then Save.");
-        } else if (fact && fact.reachable === false) {
+        if (fact && fact.reachable === false) {
           msg.className = "note gpu-clock-msg";
           setText(msg, "Unreachable");
         } else if (!msg.className || msg.className.indexOf("is-error") === -1) {
@@ -4003,13 +4059,6 @@
     var box = gpuClockBox(role);
     var input = box && box.querySelector("input");
     var msg = box && box.querySelector(".gpu-clock-msg");
-    if (typeof lockOn === "function" && lockOn()) {
-      if (msg) {
-        msg.className = "note gpu-clock-msg";
-        setText(msg, "Unlock first, then Save.");
-      }
-      return;
-    }
     var parsed = parseGpuClockInput(input ? input.value : "");
     if (!parsed.ok) {
       if (msg) {
@@ -4036,11 +4085,18 @@
       }
       return;
     }
-    if (gpuClockRunning(role)) {
+    var activity = gpuClockActivity(role);
+    if (activity) {
       var go = function () { sendGpuClock(role, parsed.value, true); };
       var label = roleWord(role);
       var what = parsed.value == null ? ("clear the GPU clock cap on " + label) : ("set the GPU max clock on " + label + " to " + parsed.value + " MHz");
-      confirmGpuClock("A model is running on this Spark. " + what.charAt(0).toUpperCase() + what.slice(1) + "? This cap lasts until reboot or until you clear it.", go);
+      var asked = what.charAt(0).toUpperCase() + what.slice(1) + "? This cap lasts until reboot or until you clear it.";
+      var warn = "Don't change the clock during an active decode. ";
+      if (activity === "decoding") {
+        confirmGpuClock("This Spark is decoding now. " + warn + asked, go);
+      } else {
+        confirmGpuClock("A model is running on this Spark. " + warn + asked, go);
+      }
       return;
     }
     sendGpuClock(role, parsed.value, false);
@@ -4266,7 +4322,7 @@
   }
   function paintOverview() {
     paintServing();
-    paintGpuClocks();
+    paintServeClocks();
     paintRibbon();
     paintZones();
     paintArchiveGb();
@@ -5820,6 +5876,7 @@
   var OPT_SCHEME = "http:" + "//";
 
   function loadOptions() {
+    if (typeof paintGpuClocks === "function") paintGpuClocks();
     jget("/api/options").then(function (r) {
       if (r.ok && r.body) {
         paintOptions(r.body);
@@ -10625,6 +10682,7 @@
         paintMachine("worker");
         paintOverview();
       }
+      if (pageName().page === "options" && typeof paintGpuClocks === "function") paintGpuClocks();
       if (pageName().page !== "models") return;
       sparkSig = "";
       paintSparkLive();
