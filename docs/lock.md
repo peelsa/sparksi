@@ -13,7 +13,6 @@ Actions that need the lock OFF:
 - Legacy library run/stop/switch
 - Stopping a model started outside Sparksi
 - Network page changes (add, remove, role change)
-- Saving a GPU max-clock cap on Overview
 
 Actions that do not need the lock:
 
@@ -63,7 +62,7 @@ Other prompts:
 - Load default recipe after editing fields: "Reset these fields to the default recipe?"
 - Network add, remove and role changes. Each says a backup is kept and nothing starts or stops. Removing a Spark also warns that recipes saved for it stop working until a Spark takes its role again.
 - Stopping a model started outside Sparksi (when that is turned on): the model, machine, port and container
-- Saving a GPU max-clock cap while a model is running on that Spark. The cap is applied with `sudo -n nvidia-smi` only (non-interactive, never a password prompt, and no other sudo use) and is not kept across a reboot. A sudo or nvidia-smi error is shown on the box.
+- Saving a GPU max-clock cap on Options while a model is running or decoding on that Spark. The page also warns not to change the clock during an active decode. The cap is applied with `sudo -n nvidia-smi` only (non-interactive, never a password prompt, and no other sudo use) and is not kept across a reboot. A sudo or nvidia-smi error is shown on the row. This action does not need Unlock.
 
 ## Things Sparksi never does
 

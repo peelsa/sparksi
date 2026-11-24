@@ -328,12 +328,32 @@ def _gpu_clocks_node(path: str) -> str | None:
     return None
 
 
+def _gpu_clock_activity(rec: dict[str, Any]) -> str | None:
+    """``decoding`` or ``running`` for a live loaded model, else None.
+
+    An active decode is GEN/GENERATING/VIDEO, or a reported decode rate of at least
+    1 tok/s — the same signals the dashboard already uses.
+    """
+    if rec.get("video_service") is True or rec.get("kind") == "video_service":
+        return None
+    raw = str(rec.get("state") or "").upper()
+    tok = rec.get("tok_s")
+    try:
+        rate = float(tok) if tok not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        rate = 0.0
+    if raw in {"GEN", "GENERATING", "VIDEO"} or rate >= 1.0:
+        return "decoding"
+    return "running"
+
+
 def _gpu_clock_busy(spec: dict[str, str]) -> str | None:
     """Why a clock change on this Spark needs a second OK, or None when nothing is running.
 
     A loaded model on the Spark (or spanning it, for a pair), or a Sparksi run that names it
-    and has not stopped, counts. When the monitor card cannot be read, the answer is unknown,
-    so the change also needs the OK.
+    and has not stopped, counts. When the monitor card can tell the Spark is decoding,
+    the message says so. When the card cannot be read, the answer is unknown, so the
+    change also needs the OK.
     """
     names = {spec.get("id"), spec.get("name"), spec.get("key")}
     names.discard(None)
@@ -341,15 +361,21 @@ def _gpu_clock_busy(spec: dict[str, str]) -> str | None:
     loaded = monitor_loaded()
     if loaded is None:
         return "Sparksi cannot tell whether a model is running on this Spark. Confirm to change the GPU clock cap anyway."
+    found: str | None = None
     for rec in loaded:
         if not isinstance(rec, dict):
             continue
-        if rec.get("video_service") is True or rec.get("kind") == "video_service":
+        activity = _gpu_clock_activity(rec)
+        if not activity:
             continue
         host = rec.get("host") or CFG.head.id
         span = rec.get("span") or []
         if host in names or any(item in names for item in span):
-            return "A model is running on this Spark. Confirm to change the GPU clock cap while it runs."
+            if activity == "decoding":
+                return "This Spark is decoding now. Confirm to change the GPU clock cap during an active decode."
+            found = "A model is running on this Spark. Confirm to change the GPU clock cap while it runs."
+    if found:
+        return found
     try:
         from sparksi.recipes.runs import list_runs
 
@@ -1323,12 +1349,14 @@ class Handler(BaseHTTPRequestHandler):
         READS.expire()
         return self._json(200 if stopped else 500, {"stopped": stopped, "error": detail, "host": host, "port": port, "container": container})
 
-    def _set_gpu_clocks(self, node_key: str, body: dict[str, Any], token: str | None) -> None:
-        """Apply or clear a per-Spark GPU max-clock cap with sudo -n only; no persistence."""
+    def _set_gpu_clocks(self, node_key: str, body: dict[str, Any]) -> None:
+        """Apply or clear a per-Spark GPU max-clock cap with sudo -n only; no persistence.
+
+        This action does not use the lock. Same-origin JSON is still required
+        (``_config_write_ok``). A running or decoding model needs confirm_running.
+        """
         from sparksi.gpu_clocks import apply_clock, begin_save, end_save, parse_request_mhz
 
-        if not _writes_allowed(self, body, token):
-            return None
         cat = load_catalog()
         spec = None
         for item in node_specs(cat):
@@ -1398,7 +1426,7 @@ class Handler(BaseHTTPRequestHandler):
             token = _read_token(self, body)
             node_key = _gpu_clocks_node(path)
             if node_key:
-                return self._set_gpu_clocks(node_key, body, token)
+                return self._set_gpu_clocks(node_key, body)
             if path == "/api/lock":
                 data = STATE.lock.acquire("api").to_dict()
                 note_activity("lock", "Lock on")

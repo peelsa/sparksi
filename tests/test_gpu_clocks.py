@@ -269,7 +269,7 @@ def _post(url: str, body: dict, origin: str | None = None) -> tuple[int, dict]:
         raise
 
 
-def test_api_sets_clock_and_refuses_when_locked(clock_server) -> None:
+def test_api_sets_clock_while_locked(clock_server) -> None:
     base, runner, lock = clock_server
     url = base + "/api/nodes/a/gpu-clocks"
     status, body = _post(url, {"max_mhz": 2000, "from_ui": True})
@@ -279,13 +279,13 @@ def test_api_sets_clock_and_refuses_when_locked(clock_server) -> None:
     assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,2000"]
     lock.acquire("test")
     status, body = _post(url, {"max_mhz": 1800, "from_ui": True})
-    assert status == 403
-    assert "Unlock first" in body["error"]
-    # A second click while locked still only refuses; nothing new is applied.
-    applied = list(runner.applied)
-    status, _body = _post(url, {"max_mhz": 1800, "from_ui": True})
-    assert status == 403
-    assert runner.applied == applied
+    assert status == 200, body
+    assert body["ok"] is True
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,1800"]
+    # API callers also do not need the unlock token for this action.
+    status, body = _post(url, {"max_mhz": 1700})
+    assert status == 200, body
+    assert runner.applied[-1] == ["sudo", "-n", "nvidia-smi", "-i", "0", "-lgc", "0,1700"]
 
 
 def test_apply_uses_queried_indexes_and_ignores_injected_index_text() -> None:
@@ -462,6 +462,14 @@ def test_api_needs_confirm_while_a_model_runs(clock_server, monkeypatch) -> None
     assert runner.applied == []
     status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True, "confirm_running": "yes"})
     assert status == 409, "only a JSON true is an OK"
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True, "confirm_running": True})
+    assert status == 200, body
+    # An active decode is called out with a more precise message.
+    loaded[:] = [{"host": "a", "name": "m", "port": 8000, "state": "GEN", "tok_s": 42}]
+    status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True})
+    assert status == 409
+    assert body["needs_confirm"] is True
+    assert "decoding" in body["error"]
     status, body = _post(base + "/api/nodes/a/gpu-clocks", {"max_mhz": 2000, "from_ui": True, "confirm_running": True})
     assert status == 200, body
     # A pair spanning the worker also counts there; a video service does not.

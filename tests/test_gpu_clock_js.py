@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Overview Spark boxes have a per-Spark GPU max-clock field and Save."""
+"""Options has a per-Spark GPU max-clock field and Save; Overview shows the live clock only."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ var nodeFacts = [
 var gpuClockDraft = {};
 var gpuClockSaving = {};
 var gpuClockConfirmPending = null;
+var lastMonitor = null;
 var posted = [];
 function sparkRoles() { return ROLES; }
 function roleId(role) { return role === "worker" ? "b" : (role === "node3" ? "c" : (role === "node4" ? "d" : "a")); }
@@ -97,14 +98,28 @@ function query(root, sel) {
 }
 var serving = makeEl("div");
 serving.id = "serving-lines";
+var clockRows = makeEl("div");
+clockRows.id = "opt-gpu-clock-rows";
 var confirmNote = makeEl("p");
 confirmNote.id = "gpu-clock-confirm-note";
-var ids = { "serving-lines": serving, "gpu-clock-confirm-note": confirmNote, "gpu-clock-confirm": null };
+var ids = { "serving-lines": serving, "opt-gpu-clock-rows": clockRows, "gpu-clock-confirm-note": confirmNote, "gpu-clock-confirm": null };
 function el(id) { return ids[id] || null; }
 function ensureServing() {
-  if (serving.querySelector && serving.children.some(function (c) { return c.className === "gpu-clock"; })) return serving;
+  if (serving.querySelector && serving.children.some(function (c) { return c.className === "serve-box"; })) return serving;
   sparkRoles().forEach(function (role) {
-    serving.appendChild(gpuClockForm(role));
+    var section = makeEl("section");
+    section.className = "serve-box";
+    section.setAttribute("data-role", role);
+    var heading = makeEl("h2");
+    var title = makeEl("span");
+    title.className = "serve-title";
+    title.textContent = roleWord(role);
+    var clock = makeEl("span");
+    clock.className = "serve-clock";
+    heading.appendChild(title);
+    heading.appendChild(clock);
+    section.appendChild(heading);
+    serving.appendChild(section);
   });
   return serving;
 }
@@ -125,7 +140,7 @@ def test_each_spark_gets_a_clock_box_and_save() -> None:
     got = _run(
         """
         paintGpuClocks();
-        var boxes = serving.children.map(function (box) {
+        var boxes = clockRows.children.map(function (box) {
           var input = box.querySelector("input");
           var read = box.querySelector(".gpu-clock-read");
           var btn = box.querySelector("button");
@@ -156,26 +171,30 @@ def test_each_spark_gets_a_clock_box_and_save() -> None:
     assert "Worker" in worker["label"]
 
 
-def test_four_sparks_and_unlock_first() -> None:
+def test_four_sparks_save_without_unlock() -> None:
     got = _run(
         """
         globalThis.lockIsOn = true;
         paintGpuClocks();
-        var boxes = serving.children.map(function (box) {
+        var boxes = clockRows.children.map(function (box) {
           return {
             role: box.getAttribute("data-role"),
             msg: box.querySelector(".gpu-clock-msg") && box.querySelector(".gpu-clock-msg").textContent,
             disabled: box.querySelector("button") && box.querySelector("button").disabled
           };
         });
-        process.stdout.write(JSON.stringify({ boxes: boxes, count: serving.children.length }));
+        process.stdout.write(JSON.stringify({ boxes: boxes, count: clockRows.children.length }));
         """,
         roles=["head", "worker", "node3", "node4"],
     )
     assert got["count"] == 4
     assert [row["role"] for row in got["boxes"]] == ["head", "worker", "node3", "node4"]
-    assert all(row["disabled"] is True for row in got["boxes"][:3])
-    assert all("Unlock first" in (row["msg"] or "") for row in got["boxes"][:3])
+    assert got["boxes"][0]["disabled"] is False
+    assert got["boxes"][1]["disabled"] is False
+    assert got["boxes"][2]["disabled"] is False
+    assert got["boxes"][3]["disabled"] is True  # unreachable
+    assert all("Unlock first" not in (row["msg"] or "") for row in got["boxes"])
+    assert "Unreachable" in (got["boxes"][3]["msg"] or "")
 
 
 def test_bad_input_and_in_flight_second_click_do_not_post_twice() -> None:
@@ -215,6 +234,7 @@ def test_running_model_asks_before_save() -> None:
     assert got["posts"] == 0
     assert len(got["notes"]) == 1
     assert "running" in got["notes"][0].lower()
+    assert "active decode" in got["notes"][0].lower()
     assert "2000" in got["notes"][0]
 
 
@@ -289,3 +309,55 @@ def test_confirmed_save_sends_the_ok_and_server_ask_reprompts() -> None:
     assert worker_posts[1]["body"]["confirm_running"] is True
     assert len(got["notes"]) == 2
     assert "Cap set to 1800" in got["msg"]
+
+
+def test_overview_shows_clock_without_a_save_box() -> None:
+    got = _run(
+        """
+        paintServeClocks();
+        var boxes = serving.children.map(function (section) {
+          var clock = section.querySelector(".serve-clock");
+          return {
+            role: section.getAttribute("data-role"),
+            title: section.querySelector(".serve-title") && section.querySelector(".serve-title").textContent,
+            clock: clock && clock.textContent,
+            hasInput: !!section.querySelector("input"),
+            hasSave: !!(section.querySelector("button") && section.querySelector("button").textContent === "Save")
+          };
+        });
+        process.stdout.write(JSON.stringify({ boxes: boxes, forms: clockRows.children.length }));
+        """,
+        roles=["head", "worker"],
+    )
+    assert [row["role"] for row in got["boxes"]] == ["head", "worker"]
+    assert got["boxes"][0]["title"] == "Head"
+    assert got["boxes"][0]["clock"] == "2411 MHz"
+    assert got["boxes"][1]["clock"] == "2405 MHz"
+    assert all(row["hasInput"] is False and row["hasSave"] is False for row in got["boxes"])
+    assert got["forms"] == 0
+
+
+def test_decoding_model_asks_with_decode_warning() -> None:
+    got = _run(
+        """
+        lastMonitor = { loaded: [{ host: "a", state: "GEN", tok_s: 42 }] };
+        var notes = [];
+        confirmGpuClock = function (note, proceed) { notes.push(note); };
+        paintGpuClocks();
+        var head = gpuClockBox("head");
+        head.querySelector("input").value = "2000";
+        saveGpuClock("head");
+        process.stdout.write(JSON.stringify({ notes: notes, posts: posted.length }));
+        """
+    )
+    assert got["posts"] == 0
+    assert len(got["notes"]) == 1
+    assert "decoding" in got["notes"][0].lower()
+    assert "active decode" in got["notes"][0].lower()
+
+
+def test_options_page_carries_the_decode_warning() -> None:
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert "Don't change the clock during an active decode." in html
+    assert 'id="opt-gpu-clocks"' in html
+    assert "gpuClockForm(role)" not in html.split("function ensureServing()", 1)[1].split("function fillServeBody", 1)[0]

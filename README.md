@@ -40,7 +40,7 @@ cp config/catalog.example.yaml ~/.config/sparksi/catalog.yaml
 
 ## Safety
 
-- The lock is ON by default. Load, Unload, Restart, Network edits and saving a GPU max-clock cap on Overview need Unlock (15 minutes from the page). The clock cap is applied with sudo -n nvidia-smi only, and is not kept across a reboot.
+- The lock is ON by default. Load, Unload, Restart and Network edits need Unlock (15 minutes from the page). A GPU max-clock cap is set on Options, does not need Unlock, is applied with sudo -n nvidia-smi only, and is not kept across a reboot.
 - Load, Unload and Restart each ask first, with the model, the machines and the port.
 - The browser sends fields and never a command string.
 - The dashboard listens on loopback plus one tailnet address and always refuses `0.0.0.0`, `::` and `*`. Other refused addresses come from a deny list; see [Listen addresses](docs/config.md#listen-addresses).
