@@ -22,6 +22,7 @@ Actions that do not need the lock:
 - Copying weights between the archive and a Spark, and deleting a local copy (a transfer queue)
 - Options settings
 - Saving a GPU max-clock cap on Options (it still asks first while a model is running or decoding)
+- Emergency stop of a server started outside Sparksi, from the Overview (it always asks first, naming the model, Spark and port). API callers without the page still need the unlock key.
 
 ## Unlocking
 
@@ -63,6 +64,7 @@ Other prompts:
 - Load default recipe after editing fields: "Reset these fields to the default recipe?"
 - Network add, remove and role changes. Each says a backup is kept and nothing starts or stops. Removing a Spark also warns that recipes saved for it stop working until a Spark takes its role again.
 - Stopping a model started outside Sparksi (when that is turned on): the model, machine, port and container
+- Emergency stop of a server started outside Sparksi: the model, Spark and port, and whether it stops a container or the process on that port. The server refuses the stop unless the request repeats all three. This action does not need Unlock. It never uses sudo: another user's process is left running and the page shows the command to run.
 - Saving a GPU max-clock cap on Options while a model is running or decoding on that Spark. The page also warns not to change the clock during an active decode. The cap is applied with `sudo -n nvidia-smi` only (non-interactive, never a password prompt, and no other sudo use) and is not kept across a reboot. A sudo or nvidia-smi error is shown on the row. This action does not need Unlock.
 
 ## Things Sparksi never does

@@ -21,6 +21,7 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 # --- COMPAT: node copy of sparksi.compat (stdlib only; tests/test_compat.py keeps it equal) ---
@@ -152,6 +153,8 @@ def main(req: dict) -> dict:
             return _service(req)
         if op == "stop_unmanaged":
             return _stop_unmanaged(req)
+        if op == "stop_outside":
+            return _stop_outside(req)
         if op == "files_check":
             return _files_check(req)
         if op == "files_stage":
@@ -539,6 +542,408 @@ def _stop_unmanaged(req: dict) -> dict:
     if proc.returncode != 0:
         return {"ok": False, "stopped": False, "error": (proc.stderr or proc.stdout or "docker stop failed").strip()[-400:]}
     return {"ok": True, "stopped": True, "container": name, "port": port}
+
+
+# --- Emergency stop for a server started outside Sparksi (op stop_outside) ---
+# The controller only asks for a port its page showed under "Started outside Sparksi".
+# Everything is checked again here; nothing is started, removed or restarted.
+
+# A listener with one of these names is plumbing, never a model server.
+_OUTSIDE_KEEP_COMM = frozenset({
+    "init", "systemd", "sshd", "sudo", "su", "login", "tmux", "tmux: server", "screen",
+    "dockerd", "containerd", "docker-proxy", "containerd-shim", "containerd-shim-runc-v2",
+    "tailscaled", "rpcbind", "smbd", "nmbd", "cupsd", "systemd-resolved", "nfsd",
+})
+# Container and process names that are web front ends or Sparksi's own helpers.
+_OUTSIDE_KEEP_SUBSTRINGS = ("openwebui", "open-webui", "announce", "sparksi-agent")
+# comm is cut to 15 characters, so long plumbing names are matched by prefix.
+_OUTSIDE_KEEP_PREFIXES = ("systemd", "containerd", "docker", "tmux", "sshd", "dbus", "polkit", "agetty")
+_OUTSIDE_GRACE_DEFAULT = 15
+_OUTSIDE_GRACE_MAX = 30
+_OUTSIDE_KILL_WAIT = 10
+_OUTSIDE_PROC = "/proc"
+
+
+def _outside_fail(error: str, **extra) -> dict:
+    out = {"ok": False, "stopped": False, "error": error}
+    out.update(extra)
+    return out
+
+
+def _listen_inodes(port: int) -> set[str]:
+    """Socket inodes listening on TCP ``port`` (IPv4 and IPv6), from /proc/net."""
+    found: set[str] = set()
+    for name in ("tcp", "tcp6"):
+        try:
+            with open(os.path.join(_OUTSIDE_PROC, "net", name), encoding="ascii", errors="replace") as fh:
+                lines = fh.read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10 or parts[3] != "0A":  # 0A is LISTEN
+                continue
+            try:
+                local_port = int(parts[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if local_port == port and parts[9] != "0":
+                found.add(parts[9])
+    return found
+
+
+def _pid_dirs() -> list[int]:
+    try:
+        names = os.listdir(_OUTSIDE_PROC)
+    except OSError:
+        return []
+    return [int(n) for n in names if n.isdigit()]
+
+
+def _socket_pids(inodes: set[str]) -> tuple[set[int], bool]:
+    """(pids holding one of ``inodes``, whether some process fds could not be read)."""
+    wanted = {f"socket:[{i}]" for i in inodes}
+    pids: set[int] = set()
+    hidden = False
+    for pid in _pid_dirs():
+        fd_dir = os.path.join(_OUTSIDE_PROC, str(pid), "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except PermissionError:
+            hidden = True
+            continue
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) in wanted:
+                    pids.add(pid)
+                    break
+            except OSError:
+                continue
+    return pids, hidden
+
+
+def _proc_info(pid: int) -> dict | None:
+    """ppid, pgid, start time, state, uid, comm and argv for ``pid``; None when it is gone."""
+    base = os.path.join(_OUTSIDE_PROC, str(pid))
+    try:
+        with open(os.path.join(base, "stat"), encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+        with open(os.path.join(base, "status"), encoding="utf-8", errors="replace") as fh:
+            status = fh.read()
+    except OSError:
+        return None
+    try:
+        comm = raw[raw.index("(") + 1:raw.rindex(")")]
+        rest = raw[raw.rindex(")") + 2:].split()
+        state, ppid, pgid, start = rest[0], int(rest[1]), int(rest[2]), rest[19]
+    except (ValueError, IndexError):
+        return None
+    uid = -1
+    for line in status.splitlines():
+        if line.startswith("Uid:"):
+            try:
+                uid = int(line.split()[1])
+            except (IndexError, ValueError):
+                uid = -1
+            break
+    try:
+        with open(os.path.join(base, "cmdline"), "rb") as fh:
+            argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+    except OSError:
+        argv = []
+    try:
+        with open(os.path.join(base, "cgroup"), encoding="utf-8", errors="replace") as fh:
+            cgroup = fh.read()
+    except OSError:
+        cgroup = ""
+    return {"pid": pid, "ppid": ppid, "pgid": pgid, "start": start, "state": state,
+            "uid": uid, "comm": comm, "argv": argv, "cgroup": cgroup}
+
+
+def _plumbing(info: dict) -> bool:
+    comm = str(info.get("comm") or "")
+    return int(info.get("pid") or 0) <= 1 or comm in _OUTSIDE_KEEP_COMM or comm.startswith(_OUTSIDE_KEEP_PREFIXES)
+
+
+def _in_container(info: dict) -> bool:
+    text = str(info.get("cgroup") or "")
+    return any(mark in text for mark in ("docker", "containerd", "kubepods", "libpod"))
+
+
+def _own_lineage() -> set[int]:
+    """This process and every ancestor, so the stop can never reach its own session."""
+    seen: set[int] = set()
+    pid = os.getpid()
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        info = _proc_info(pid)
+        if not info:
+            break
+        pid = int(info["ppid"])
+    return seen
+
+
+def _outside_targets(listeners: set[int]) -> list[dict]:
+    """The listeners, every descendant, and the members of a process group a target leads."""
+    infos = [i for i in (_proc_info(p) for p in _pid_dirs()) if i]
+    by_parent: dict[int, list[dict]] = {}
+    for info in infos:
+        by_parent.setdefault(int(info["ppid"]), []).append(info)
+    chosen: dict[int, dict] = {}
+    queue = [i for i in infos if i["pid"] in listeners]
+    while queue:
+        info = queue.pop()
+        if info["pid"] in chosen:
+            continue
+        chosen[info["pid"]] = info
+        queue.extend(by_parent.get(info["pid"], []))
+    leaders = {pid for pid, info in chosen.items() if info["pgid"] == pid}
+    for info in infos:
+        if info["pgid"] in leaders and info["pid"] not in chosen:
+            chosen[info["pid"]] = info
+    return sorted(chosen.values(), key=lambda i: i["pid"])
+
+
+def _outside_kept(text: str, keep: list[str]) -> bool:
+    """True when a name or argv matches a protected name: substrings for built-ins, whole parts for the catalog."""
+    low = str(text or "").lower()
+    if not low:
+        return False
+    if _video_process(low) or any(s in low for s in _OUTSIDE_KEEP_SUBSTRINGS):
+        return True
+    parts = set(re.split(r"[\s/=,:]+", low))
+    return any(k and (k in parts or k == low) for k in keep)
+
+
+def _gpu_apps() -> dict[int, int] | None:
+    """{pid: MiB} of GPU compute processes, or None when nvidia-smi could not be asked."""
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out: dict[int, int] = {}
+    for line in (proc.stdout or "").splitlines():
+        bits = [b.strip() for b in line.split(",")]
+        try:
+            out[int(bits[0])] = int(float(bits[1])) if len(bits) > 1 else 0
+        except (IndexError, ValueError):
+            continue
+    return out
+
+
+def _alive(info: dict) -> bool:
+    now = _proc_info(int(info["pid"]))
+    return bool(now) and now["start"] == info["start"] and now["state"] not in ("Z", "X")
+
+
+def _shown_kill_command(sig: str, pids: list[int]) -> str:
+    """The exact command for a person to run for another user's process: integers only.
+
+    Sparksi never runs it: sudo is used only for the GPU clock cap.
+    """
+    return " ".join(["sudo", "kill", "-s", sig, "--", *[str(int(p)) for p in pids]])
+
+
+def _signal_one(info: dict, signum: int) -> str:
+    """Signal one target only if it is still the same process: "sent", "gone" or "denied".
+
+    A pidfd pins the process before its start time is checked, so a reused PID is never hit.
+    """
+    pid = int(info["pid"])
+    pidfd = -1
+    opener = getattr(os, "pidfd_open", None)
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if opener is not None and sender is not None:
+        try:
+            pidfd = opener(pid)
+        except ProcessLookupError:
+            return "gone"
+        except OSError:
+            pidfd = -1
+    try:
+        if not _alive(info):
+            return "gone"
+        if pidfd >= 0:
+            sender(pidfd, signum)
+        else:
+            os.kill(pid, signum)
+        return "sent"
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "denied"
+    finally:
+        if pidfd >= 0:
+            os.close(pidfd)
+
+
+def _send(sig: str, targets: list[dict]) -> list[int]:
+    """Signal each live target directly; return the PIDs that refused (never retried with sudo)."""
+    signum = getattr(signal, "SIG" + sig)
+    return [int(info["pid"]) for info in targets if _signal_one(info, signum) == "denied"]
+
+
+def _wait_gone(targets: list[dict], seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if not any(_alive(t) for t in targets):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def _wait_closed(port: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if not _listen_inodes(port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def _stop_outside(req: dict) -> dict:
+    """Emergency stop of a server Sparksi did not start, found by the port it listens on.
+
+    A container named by the controller gets ``docker stop`` after the same checks as the
+    page's container Stop. Otherwise the process listening on the port, its descendants and
+    any process group one of them leads get SIGTERM, then SIGKILL after a grace period.
+    Sparksi never uses sudo here: when any of those processes belongs to another user, or is
+    hidden from this user, nothing is signalled and the reply carries the exact command for a
+    person to run instead. A port served by a running ``sparksi-*`` container is always refused.
+    The reply says whether the port closed and whether the GPU let go of the stopped processes.
+    """
+    try:
+        port = int(req.get("port"))
+    except (TypeError, ValueError):
+        return _outside_fail("bad port")
+    if not 1024 <= port <= 65535 or _off_limits(port):
+        return _outside_fail("that port is off limits")
+    keep = [str(k).strip().lower() for k in (req.get("keep") or []) if str(k).strip()]
+    try:
+        grace = int(req.get("grace") or _OUTSIDE_GRACE_DEFAULT)
+    except (TypeError, ValueError):
+        grace = _OUTSIDE_GRACE_DEFAULT
+    grace = max(1, min(grace, _OUTSIDE_GRACE_MAX))
+    container = str(req.get("container") or "")
+    if container:
+        return _stop_outside_container(container, port, keep, req)
+    address = _probe_address(str(req.get("listen_host") or ""))
+    running = _running_containers()
+    if running is not None and port in _sparksi_container_ports(running, address).values():
+        return _outside_fail("that port is served by a Sparksi container; stop it from its run")
+    inodes = _listen_inodes(port)
+    if not inodes:
+        return _outside_fail("nothing is listening on that port now", port_closed=True)
+    pids, hidden = _socket_pids(inodes)
+    if not pids:
+        if hidden:
+            # It may be another user's server or a container's: nothing is signalled and no
+            # kill command is guessed; the shown command only says what holds the port.
+            return _outside_fail(
+                "the process on that port is hidden from Sparksi (another user's or inside a container); "
+                "nothing was stopped. Check what holds the port",
+                command=f"sudo ss -ltnp 'sport = :{port}'",
+            )
+        return _outside_fail("could not find the process listening on that port")
+    mine = _own_lineage()
+    targets = _outside_targets(pids)
+    if any(t["pid"] in mine for t in targets):
+        return _outside_fail("that port belongs to Sparksi's own session; nothing was stopped")
+    listeners = [t for t in targets if t["pid"] in pids]
+    if not listeners:
+        return _outside_fail("could not find the process listening on that port")
+    for info in listeners:
+        if _plumbing(info):
+            return _outside_fail(f"port {port} belongs to {info['comm']}, which Sparksi never stops")
+        if _in_container(info):
+            return _outside_fail("that port is served from a container Sparksi could not name; stop the container on that Spark")
+    for info in targets:
+        if _plumbing(info) or _in_container(info):
+            return _outside_fail("a process in that server's group is outside it; nothing was stopped")
+        if _outside_kept(info["comm"], keep) or _outside_kept(" ".join(info["argv"]), keep):
+            return _outside_fail("that server is protected on this Spark; nothing was stopped")
+    target_pids = [int(t["pid"]) for t in targets]
+    me = os.getuid()
+    others = [int(t["pid"]) for t in targets if t["uid"] != me]
+    if others:
+        # sudo is allowed only for the GPU clock cap: stop nothing and show the command.
+        return _outside_fail(
+            "that server belongs to another user; nothing was stopped",
+            command=_shown_kill_command("TERM", target_pids), pids=target_pids,
+        )
+    gpu_before = _gpu_apps()
+    used_before = sum((gpu_before or {}).get(p, 0) for p in target_pids)
+    denied = _send("TERM", targets)
+    if denied:
+        return _outside_fail(
+            "some of that server's processes refused the signal",
+            command=_shown_kill_command("TERM", denied), pids=target_pids,
+        )
+    signal_used = "TERM"
+    if not _wait_gone(targets, grace):
+        signal_used = "KILL"
+        denied = _send("KILL", targets)
+        if denied:
+            return _outside_fail(
+                "the server did not stop and some processes refused SIGKILL",
+                command=_shown_kill_command("KILL", denied), pids=target_pids,
+            )
+        _wait_gone(targets, _OUTSIDE_KILL_WAIT)
+    left = [int(t["pid"]) for t in targets if _alive(t)]
+    closed = _wait_closed(port, 3)
+    gpu_after = _gpu_apps()
+    gpu_left = sorted(p for p in target_pids if gpu_after is not None and p in gpu_after)
+    stopped = not left and closed
+    out = {
+        "ok": stopped, "stopped": stopped, "port": port, "pids": target_pids, "signal": signal_used,
+        "port_closed": closed, "left": left, "gpu_checked": gpu_after is not None,
+        "gpu_pids_left": gpu_left, "gpu_freed_mib": used_before if gpu_after is not None and not gpu_left else 0,
+    }
+    if not stopped:
+        out["error"] = "the server did not fully stop" if left else "the port is still open"
+    return out
+
+
+def _stop_outside_container(name: str, port: int, keep: list[str], req: dict) -> dict:
+    if not _unmanaged_name_ok(name) or _outside_kept(name, keep):
+        return _outside_fail("that container cannot be stopped from here")
+    running = _running_containers()
+    if running is None:
+        return _outside_fail("docker could not be asked")
+    if name not in running:
+        return _outside_fail("that container is not running")
+    address = _probe_address(str(req.get("listen_host") or ""))
+    if _container_listen_port(name, address) != port:
+        return _outside_fail("that container no longer serves this port")
+    gpu_before = _gpu_apps()
+    try:
+        proc = subprocess.run(
+            ["docker", "stop", "--time", "20", name],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _outside_fail(str(exc)[:400])
+    if proc.returncode != 0:
+        return _outside_fail((proc.stderr or proc.stdout or "docker stop failed").strip()[-400:])
+    closed = _wait_closed(port, 10)
+    gpu_after = _gpu_apps()
+    freed = 0
+    if gpu_before is not None and gpu_after is not None:
+        freed = max(0, sum(gpu_before.values()) - sum(gpu_after.values()))
+    return {
+        "ok": closed, "stopped": closed, "container": name, "port": port, "signal": "docker stop",
+        "port_closed": closed, "gpu_checked": gpu_after is not None, "gpu_freed_mib": freed,
+        **({} if closed else {"error": "the container stopped but the port is still open"}),
+    }
 
 
 def _safe_container_name(name: str) -> bool:

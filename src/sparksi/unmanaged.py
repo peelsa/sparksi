@@ -14,6 +14,11 @@ _NO_DOCKER = "docker could not be asked on this machine"
 _NOT_OURS = "not a container Sparksi can stop; stop it on the machine"
 _OURS = "a Sparksi container; stop it from its run"
 _DISABLED = "stopping models started outside Sparksi is off on this controller ([controller] stop_unmanaged)"
+_PROTECTED = "protected on this controller; stop it on the machine"
+_SPARKSI_PORT = "served by a Sparksi container; stop it from its run"
+_UNKNOWN = "docker could not be asked, so Sparksi cannot tell whether this is its own run"
+# Web front ends and Sparksi's own helpers are never offered an emergency stop.
+_KEEP_SUBSTRINGS = ("openwebui", "open-webui", "announce")
 
 
 def _as_int(value: object) -> int | None:
@@ -202,6 +207,55 @@ def mark_stoppable(
             new["why"] = _OURS
         elif not enabled and container:
             new["why"] = _DISABLED
+        out.append(new)
+    return out
+
+
+def _kept(text: object, keep: frozenset[str] | set[str]) -> bool:
+    low = _clean(text).lower()
+    if not low:
+        return False
+    return low in keep or any(s in low for s in _KEEP_SUBSTRINGS) or any(s in low for s in protect.process_substrings())
+
+
+def mark_emergency(
+    items: list[dict],
+    ours: frozenset[str] | set[str] = frozenset(),
+    keep: frozenset[str] | set[str] = frozenset(),
+    keep_ports: frozenset[int] | set[int] = frozenset(),
+    sparksi_ports: dict[str, set[int]] | None = None,
+) -> list[dict]:
+    """Mark which items may get the emergency stop: never Sparksi's own, protected ones, or ones with a Stop already.
+
+    ``keep`` holds lower-cased names the catalog protects (never_touch.do_not_stop);
+    ``keep_ports`` the ports of catalog rows the config protects; ``sparksi_ports`` the
+    ports each host's running ``sparksi-*`` containers serve (a failed, timed-out or
+    half-up run included). A host missing from it means docker could not be asked there,
+    and then nothing on that host is offered.
+    """
+    sparksi_ports = sparksi_ports or {}
+    out: list[dict] = []
+    for item in items:
+        container = item.get("container")
+        new = {**item, "emergency": False}
+        if item.get("stoppable") or (container and container in ours):
+            out.append(new)
+            continue
+        port = _as_int(item.get("port"))
+        host_ports = sparksi_ports.get(str(item.get("host") or ""))
+        if host_ports is None:
+            new["why"] = _UNKNOWN
+            out.append(new)
+            continue
+        if port in host_ports:
+            new["why"] = _SPARKSI_PORT
+            out.append(new)
+            continue
+        if protect.is_off_limits(port) or port in keep_ports or _kept(item.get("label"), keep) or _kept(container, keep):
+            new["why"] = _PROTECTED
+            out.append(new)
+            continue
+        new["emergency"] = True
         out.append(new)
     return out
 

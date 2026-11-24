@@ -4548,6 +4548,15 @@
         stopUnmanaged(item, btn);
       });
       row.appendChild(btn);
+    } else if (item.emergency) {
+      var ebtn = document.createElement("button");
+      ebtn.type = "button";
+      ebtn.className = "halt";
+      setText(ebtn, "Emergency stop");
+      ebtn.addEventListener("click", function () {
+        emergencyStop(item, ebtn);
+      });
+      row.appendChild(ebtn);
     } else if (item.why) {
       var why = document.createElement("span");
       why.className = "note";
@@ -4592,7 +4601,7 @@
 
     var intro = document.createElement("p");
     intro.className = "note";
-    setText(intro, "Sparksi did not start these. Stopping one stops its container on that machine.");
+    setText(intro, "Sparksi did not start these. Stopping one ends it on that machine.");
     box.appendChild(intro);
 
     for (var i = 0; i < items.length; i++) {
@@ -4657,6 +4666,62 @@
         var err = (r.body && r.body.error) ? r.body.error : "no answer";
         if (err.charAt(err.length - 1) !== ".") {
           err = err + ".";
+        }
+        setText("unmanaged-note", "Not stopped: " + err);
+      }
+    }).catch(function () {
+      setText("unmanaged-note", "Not stopped: no answer from Sparksi.");
+    }).then(function () {
+      unmanagedBusy = false;
+      button.disabled = false;
+      tickUnmanaged();
+    });
+  }
+  function emergencyStop(item, button) {
+    if (unmanagedBusy) {
+      return;
+    }
+    var note = item.container
+      ? "Sparksi did not start it. This stops the container " + item.container + " with docker stop. It works with the lock on."
+      : "Sparksi did not start it. This ends the process listening on port " + item.port + " and its child processes: SIGTERM, then SIGKILL if it does not exit. It works with the lock on.";
+    confirmModelAction({
+      verb: "Emergency stop",
+      model: item.label,
+      machines: item.host_name,
+      port: item.port,
+      note: note,
+      stop: true
+    }, function () {
+      sendEmergencyStop(item, button);
+    });
+  }
+
+  function sendEmergencyStop(item, button) {
+    if (unmanagedBusy) {
+      return;
+    }
+    unmanagedBusy = true;
+    button.disabled = true;
+    setText("unmanaged-note", "Stopping " + item.label + " on " + item.host_name + "\u2026");
+
+    jpost("/api/outside/stop", {
+      host: item.host,
+      port: item.port,
+      container: item.container,
+      from_ui: true,
+      confirm: { model: item.label, spark: item.host_name, port: item.port }
+    }).then(function (r) {
+      var body = r.body || {};
+      if (r.ok && body.stopped) {
+        var gpu = body.gpu_checked ? " GPU freed " + Number(body.gpu_freed_mib || 0) + " MiB." : " GPU not checked.";
+        setText("unmanaged-note", "Stopped " + item.label + " on " + item.host_name + ". Port " + item.port + " closed." + gpu);
+      } else {
+        var err = body.error ? String(body.error) : "no answer";
+        if (err.charAt(err.length - 1) !== ".") {
+          err = err + ".";
+        }
+        if (body.command) {
+          err = err + " Run on " + item.host_name + ": " + body.command;
         }
         setText("unmanaged-note", "Not stopped: " + err);
       }

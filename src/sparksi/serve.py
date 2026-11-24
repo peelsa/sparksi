@@ -782,21 +782,27 @@ def _unmanaged_nodes() -> list[dict[str, Any]]:
     return [{"id": n.id, "name": n.name or n.id, "role": role} for role, n in CFG.role_nodes()]
 
 
-def _unmanaged_containers(runner: Any, host: str) -> dict[str, int] | None:
-    """{container: port} for running containers Sparksi did not start on ``host`` (read-only probe)."""
+def _unmanaged_containers(runner: Any, host: str) -> dict[str, dict[str, int]] | None:
+    """Running containers on ``host`` (read-only probe): {"outside": {name: port}, "sparksi": {name: port}}.
+
+    "outside" are the ones Sparksi did not start; "sparksi" its own ``sparksi-*`` ones, whose
+    ports are never offered an emergency stop whatever the run records say.
+    """
     try:
-        reply = runner.invoke(host, {"op": "probe", "ports": [], "unmanaged_ports": True}, timeout=20)
+        reply = runner.invoke(host, {"op": "probe", "ports": [], "unmanaged_ports": True, "container_ports": True}, timeout=20)
     except Exception:  # noqa: BLE001 - shown as "docker could not be asked"
         return None
     found = reply.get("unmanaged_containers") if isinstance(reply, dict) and reply.get("ok") else None
     if not isinstance(found, dict):
         return None
-    out: dict[str, int] = {}
-    for name, port in found.items():
-        try:
-            out[str(name)] = int(port)
-        except (TypeError, ValueError):
-            continue
+    ours = reply.get("container_ports")
+    out: dict[str, dict[str, int]] = {"outside": {}, "sparksi": {}}
+    for key, raw in (("outside", found), ("sparksi", ours if isinstance(ours, dict) else {})):
+        for name, port in raw.items():
+            try:
+                out[key][str(name)] = int(port)
+            except (TypeError, ValueError):
+                continue
     return out
 
 
@@ -823,11 +829,40 @@ def _unmanaged_items(runner: Any, *, cached: bool, cat: dict[str, Any]) -> tuple
         else:
             got = _unmanaged_containers(runner, host)
         by_host[host] = got
-    items = unmanaged.attach_containers(items, by_host)
+    outside_by_host = {h: (None if got is None else got["outside"]) for h, got in by_host.items()}
+    sparksi_ports = {h: set(got["sparksi"].values()) for h, got in by_host.items() if got is not None}
+    items = unmanaged.attach_containers(items, outside_by_host)
     # A container named in any Sparksi run record is ours, whatever its name or phase.
     ours = unmanaged.sparksi_containers(runs)
     items = unmanaged.mark_stoppable(items, CFG.controller.get("stop_unmanaged") is True, ours)
+    items = unmanaged.mark_emergency(items, ours, _outside_keep(cat), _outside_keep_ports(cat), sparksi_ports)
     return items, checked
+
+
+def _outside_keep_ports(cat: dict[str, Any]) -> set[int]:
+    """Ports of catalog rows the config protects (off-limits ports, never_touch rows)."""
+    from sparksi.models import row_is_protected
+
+    ports: set[int] = set()
+    for row in (cat or {}).get("library") or []:
+        if not isinstance(row, dict) or not row_is_protected(row, cat):
+            continue
+        try:
+            ports.add(int(row.get("port") or 0))
+        except (TypeError, ValueError):
+            continue
+    ports.discard(0)
+    return ports
+
+
+def _outside_keep(cat: dict[str, Any]) -> set[str]:
+    """Lower-cased names the catalog says never to stop (never_touch.do_not_stop)."""
+    touch = (cat or {}).get("never_touch") or {}
+    return {str(item).strip().lower() for item in (touch.get("do_not_stop") or []) if str(item).strip()}
+
+
+# One emergency stop at a time.
+_OUTSIDE_STOP = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1349,6 +1384,73 @@ class Handler(BaseHTTPRequestHandler):
         READS.expire()
         return self._json(200 if stopped else 500, {"stopped": stopped, "error": detail, "host": host, "port": port, "container": container})
 
+    def _outside_stop(self, body: dict[str, Any], token: str) -> None:
+        """Emergency stop of a server Sparksi did not start, container or bare process.
+
+        Works with the lock on: the page asks for a confirmation naming the model, Spark
+        and port, and the body must echo all three. API callers without the page still
+        need the unlock token. The setting stop_unmanaged is not used.
+        """
+        if not bool(body.get("from_ui")):
+            ok, why = STATE.lock.allow_api_write(token)
+            if not ok:
+                return self._json(403, {"error": why, "stopped": False})
+        host = str(body.get("host") or "")
+        container = str(body.get("container") or "") or None
+        try:
+            port = int(body.get("port"))
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "bad port", "stopped": False})
+        if not host or protect.is_off_limits(port):
+            return self._json(400, {"error": "nothing to stop", "stopped": False})
+        if not _OUTSIDE_STOP.acquire(blocking=False):
+            return self._json(409, {"error": "Another emergency stop is running; wait for it to finish.", "stopped": False})
+        try:
+            return self._outside_stop_locked(body, host, container, port)
+        finally:
+            _OUTSIDE_STOP.release()
+
+    def _outside_stop_locked(self, body: dict[str, Any], host: str, container: str | None, port: int) -> None:
+        from sparksi import unmanaged
+
+        cat = load_catalog()
+        runner = active_runner(cat)
+        items, _checked = _unmanaged_items(runner, cached=False, cat=cat)
+        item = unmanaged.same_item(items, host, port, container)
+        if item is None or not item.get("emergency"):
+            return self._json(409, {"error": "That server changed or cannot be stopped from here; reload and check again.", "stopped": False})
+        label = str(item.get("label") or "")
+        spark = str(item.get("host_name") or host)
+        confirm = body.get("confirm") if isinstance(body.get("confirm"), dict) else {}
+        if confirm.get("model") != label or confirm.get("spark") != spark or str(confirm.get("port")) != str(port):
+            return self._json(400, {"error": "Confirm the stop naming the model, Spark and port.", "stopped": False})
+        req: dict[str, Any] = {"op": "stop_outside", "port": port, "keep": sorted(_outside_keep(cat))}
+        if container:
+            req["container"] = container
+        # A Spark-only op: the runner resolves it like a recipe op, by the node's name.
+        result = runner.invoke(spark, req, timeout=90)
+        if not isinstance(result, dict):
+            result = {"ok": False, "error": "no answer"}
+        stopped = bool(result.get("stopped"))
+        detail = str(result.get("error") or "")
+        what = f"emergency stop {label} on {spark} port {port}"
+        if stopped:
+            freed = int(result.get("gpu_freed_mib") or 0)
+            gpu = f", GPU freed {freed} MiB" if result.get("gpu_checked") else ", GPU not checked"
+            note_activity("stop", f"{what}: stopped with {result.get('signal') or 'TERM'}, port closed{gpu}", machine=host)
+        else:
+            note_activity("stop", f"{what} failed: {detail[-200:]}", machine=host)
+        logger().info("emergency stop %s on %s port %s -> %s %s", label, host, port, stopped, detail[-200:])
+        READS.expire()
+        payload = {
+            "stopped": stopped, "error": detail, "host": host, "port": port, "container": container,
+            "label": label, "spark": spark,
+        }
+        for key in ("signal", "port_closed", "gpu_checked", "gpu_freed_mib", "gpu_pids_left", "command", "pids"):
+            if key in result:
+                payload[key] = result[key]
+        return self._json(200 if stopped else 502, payload)
+
     def _set_gpu_clocks(self, node_key: str, body: dict[str, Any]) -> None:
         """Apply or clear a per-Spark GPU max-clock cap with sudo -n only; no persistence.
 
@@ -1472,6 +1574,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(code, payload)
             if path == "/api/unmanaged/stop":
                 return self._unmanaged_stop(body, token)
+            if path == "/api/outside/stop":
+                return self._outside_stop(body, token)
             if path == "/api/stop":
                 if load_in_progress():
                     return self._json(409, {"error": "still loading; stop does not interrupt a load", "stopped": False})
