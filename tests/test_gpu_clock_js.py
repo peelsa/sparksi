@@ -361,3 +361,43 @@ def test_options_page_carries_the_decode_warning() -> None:
     assert "Don't change the clock during an active decode." in html
     assert 'id="opt-gpu-clocks"' in html
     assert "gpuClockForm(role)" not in html.split("function ensureServing()", 1)[1].split("function fillServeBody", 1)[0]
+
+
+def test_decode_detection_covers_pair_span_and_hostless_head_rows() -> None:
+    got = _run(
+        """
+        var out = {};
+        lastMonitor = { loaded: [{ state: "GEN", tok_s: 9 }] };
+        out.hostless = [gpuClockActivity("head"), gpuClockActivity("worker")];
+        lastMonitor = { loaded: [{ host: "a", span: ["a", "b"], state: "IDLE", tok_s: 0 }] };
+        out.pairIdle = [gpuClockActivity("head"), gpuClockActivity("worker")];
+        lastMonitor = { loaded: [{ host: "a", span: ["a", "b"], tok_s: 3 }] };
+        out.pairDecode = [gpuClockActivity("head"), gpuClockActivity("worker"), gpuClockActivity("node3")];
+        lastMonitor = { loaded: [{ host: "b", video_service: true, kind: "video_service", state: "VIDEO" }] };
+        out.video = gpuClockActivity("worker");
+        lastMonitor = null;
+        out.noMonitor = gpuClockActivity("head");
+        process.stdout.write(JSON.stringify(out));
+        """,
+        roles=["head", "worker", "node3"],
+    )
+    assert got["hostless"] == ["decoding", ""]
+    assert got["pairIdle"] == ["running", "running"]
+    assert got["pairDecode"] == ["decoding", "decoding", ""]
+    assert got["video"] == ""
+    assert got["noMonitor"] == ""
+
+
+def test_overview_clock_is_empty_when_unknown() -> None:
+    got = _run(
+        """
+        nodeFacts[0].gpu = { clock_mhz: null, clock_max_mhz: 3003 };
+        nodeFacts[1].gpu = null;
+        paintServeClocks();
+        process.stdout.write(JSON.stringify(serving.children.map(function (s) {
+          return s.querySelector(".serve-clock").textContent;
+        })));
+        """,
+        roles=["head", "worker", "node3", "node4"],
+    )
+    assert got == ["", "", "2000 MHz", ""]

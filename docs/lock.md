@@ -21,6 +21,7 @@ Actions that do not need the lock:
 - Saving, renaming, setting default or deleting recipes
 - Copying weights between the archive and a Spark, and deleting a local copy (a transfer queue)
 - Options settings
+- Saving a GPU max-clock cap on Options (it still asks first while a model is running or decoding)
 
 ## Unlocking
 

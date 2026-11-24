@@ -1898,6 +1898,10 @@
       }
       var serving = el("serving-lines");
       if (serving) clear(serving);
+      /* Options keeps one GPU clock row per Spark; rebuild them for the new set. */
+      var clockRows = el("opt-gpu-clock-rows");
+      if (clockRows) clear(clockRows);
+      if (typeof paintGpuClocks === "function" && pageName().page === "options") paintGpuClocks();
     }
   }
 
@@ -3832,7 +3836,8 @@
     for (var i = 0; i < loaded.length; i++) {
       var rec = loaded[i];
       if (!rec || rec.video_service === true || rec.kind === "video_service") continue;
-      var host = rec.host || "";
+      /* A loaded row with no host is on the head, as the server reads it. */
+      var host = rec.host || roleId("head");
       var span = rec.span || [];
       var hit = !!names[host];
       for (var s = 0; s < span.length; s++) if (names[span[s]]) hit = true;
