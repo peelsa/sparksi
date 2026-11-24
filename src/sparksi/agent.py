@@ -556,6 +556,8 @@ _OUTSIDE_KEEP_COMM = frozenset({
 })
 # Container and process names that are web front ends or Sparksi's own helpers.
 _OUTSIDE_KEEP_SUBSTRINGS = ("openwebui", "open-webui", "announce", "sparksi-agent")
+# comm is cut to 15 characters, so long plumbing names are matched by prefix.
+_OUTSIDE_KEEP_PREFIXES = ("systemd", "containerd", "docker", "tmux", "sshd", "dbus", "polkit", "agetty")
 _OUTSIDE_GRACE_DEFAULT = 15
 _OUTSIDE_GRACE_MAX = 30
 _OUTSIDE_KILL_WAIT = 10
@@ -660,6 +662,11 @@ def _proc_info(pid: int) -> dict | None:
             "uid": uid, "comm": comm, "argv": argv, "cgroup": cgroup}
 
 
+def _plumbing(info: dict) -> bool:
+    comm = str(info.get("comm") or "")
+    return int(info.get("pid") or 0) <= 1 or comm in _OUTSIDE_KEEP_COMM or comm.startswith(_OUTSIDE_KEEP_PREFIXES)
+
+
 def _in_container(info: dict) -> bool:
     text = str(info.get("cgroup") or "")
     return any(mark in text for mark in ("docker", "containerd", "kubepods", "libpod"))
@@ -736,37 +743,51 @@ def _alive(info: dict) -> bool:
     return bool(now) and now["start"] == info["start"] and now["state"] not in ("Z", "X")
 
 
-def _kill_command(sig: str, pids: list[int]) -> list[str]:
-    """The exact argv used with sudo -n for another user's process: integers only."""
-    return ["sudo", "-n", "/usr/bin/kill", "-s", sig, "--", *[str(int(p)) for p in pids]]
+def _shown_kill_command(sig: str, pids: list[int]) -> str:
+    """The exact command for a person to run for another user's process: integers only.
+
+    Sparksi never runs it: sudo is used only for the GPU clock cap.
+    """
+    return " ".join(["sudo", "kill", "-s", sig, "--", *[str(int(p)) for p in pids]])
 
 
-def _send(sig: str, targets: list[dict]) -> tuple[bool, str]:
-    """Signal each live target: our own directly, another user's through sudo -n kill."""
-    me = os.getuid()
-    others: list[int] = []
-    for info in targets:
-        if not _alive(info):
-            continue
-        if info["uid"] == me:
-            try:
-                os.kill(int(info["pid"]), getattr(signal, "SIG" + sig))
-            except ProcessLookupError:
-                continue
-            except PermissionError:
-                others.append(int(info["pid"]))
-        else:
-            others.append(int(info["pid"]))
-    if not others:
-        return True, ""
-    argv = _kill_command(sig, others)
+def _signal_one(info: dict, signum: int) -> str:
+    """Signal one target only if it is still the same process: "sent", "gone" or "denied".
+
+    A pidfd pins the process before its start time is checked, so a reused PID is never hit.
+    """
+    pid = int(info["pid"])
+    pidfd = -1
+    opener = getattr(os, "pidfd_open", None)
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if opener is not None and sender is not None:
+        try:
+            pidfd = opener(pid)
+        except ProcessLookupError:
+            return "gone"
+        except OSError:
+            pidfd = -1
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return False, " ".join(["sudo", *argv[2:]])
-    if proc.returncode != 0:
-        return False, " ".join(["sudo", *argv[2:]])
-    return True, ""
+        if not _alive(info):
+            return "gone"
+        if pidfd >= 0:
+            sender(pidfd, signum)
+        else:
+            os.kill(pid, signum)
+        return "sent"
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "denied"
+    finally:
+        if pidfd >= 0:
+            os.close(pidfd)
+
+
+def _send(sig: str, targets: list[dict]) -> list[int]:
+    """Signal each live target directly; return the PIDs that refused (never retried with sudo)."""
+    signum = getattr(signal, "SIG" + sig)
+    return [int(info["pid"]) for info in targets if _signal_one(info, signum) == "denied"]
 
 
 def _wait_gone(targets: list[dict], seconds: float) -> bool:
@@ -795,9 +816,10 @@ def _stop_outside(req: dict) -> dict:
     A container named by the controller gets ``docker stop`` after the same checks as the
     page's container Stop. Otherwise the process listening on the port, its descendants and
     any process group one of them leads get SIGTERM, then SIGKILL after a grace period.
-    Another user's process is signalled only with ``sudo -n /usr/bin/kill``; when sudo needs
-    a password the reply carries the exact command to run instead. The reply says whether
-    the port closed and whether the GPU let go of the stopped processes.
+    Sparksi never uses sudo here: when any of those processes belongs to another user, or is
+    hidden from this user, nothing is signalled and the reply carries the exact command for a
+    person to run instead. A port served by a running ``sparksi-*`` container is always refused.
+    The reply says whether the port closed and whether the GPU let go of the stopped processes.
     """
     try:
         port = int(req.get("port"))
@@ -814,49 +836,66 @@ def _stop_outside(req: dict) -> dict:
     container = str(req.get("container") or "")
     if container:
         return _stop_outside_container(container, port, keep, req)
+    address = _probe_address(str(req.get("listen_host") or ""))
+    running = _running_containers()
+    if running is not None and port in _sparksi_container_ports(running, address).values():
+        return _outside_fail("that port is served by a Sparksi container; stop it from its run")
     inodes = _listen_inodes(port)
     if not inodes:
         return _outside_fail("nothing is listening on that port now", port_closed=True)
     pids, hidden = _socket_pids(inodes)
     if not pids:
         if hidden:
+            # It may be another user's server or a container's: nothing is signalled and no
+            # kill command is guessed; the shown command only says what holds the port.
             return _outside_fail(
-                "the process on that port belongs to another user; run the command shown on that Spark",
-                command=f"sudo fuser -k -TERM {port}/tcp",
+                "the process on that port is hidden from Sparksi (another user's or inside a container); "
+                "nothing was stopped. Check what holds the port",
+                command=f"sudo ss -ltnp 'sport = :{port}'",
             )
         return _outside_fail("could not find the process listening on that port")
     mine = _own_lineage()
-    targets = [t for t in _outside_targets(pids) if t["pid"] not in mine]
+    targets = _outside_targets(pids)
+    if any(t["pid"] in mine for t in targets):
+        return _outside_fail("that port belongs to Sparksi's own session; nothing was stopped")
     listeners = [t for t in targets if t["pid"] in pids]
     if not listeners:
         return _outside_fail("could not find the process listening on that port")
     for info in listeners:
-        if info["pid"] <= 1 or info["comm"] in _OUTSIDE_KEEP_COMM:
+        if _plumbing(info):
             return _outside_fail(f"port {port} belongs to {info['comm']}, which Sparksi never stops")
         if _in_container(info):
             return _outside_fail("that port is served from a container Sparksi could not name; stop the container on that Spark")
     for info in targets:
-        if info["pid"] <= 1 or _in_container(info):
+        if _plumbing(info) or _in_container(info):
             return _outside_fail("a process in that server's group is outside it; nothing was stopped")
         if _outside_kept(info["comm"], keep) or _outside_kept(" ".join(info["argv"]), keep):
             return _outside_fail("that server is protected on this Spark; nothing was stopped")
-    gpu_before = _gpu_apps()
     target_pids = [int(t["pid"]) for t in targets]
-    used_before = sum((gpu_before or {}).get(p, 0) for p in target_pids)
-    ok, command = _send("TERM", targets)
-    if not ok:
+    me = os.getuid()
+    others = [int(t["pid"]) for t in targets if t["uid"] != me]
+    if others:
+        # sudo is allowed only for the GPU clock cap: stop nothing and show the command.
         return _outside_fail(
-            "that server belongs to another user and sudo needs a password; run the command shown on that Spark",
-            command=command, pids=target_pids,
+            "that server belongs to another user; nothing was stopped",
+            command=_shown_kill_command("TERM", target_pids), pids=target_pids,
+        )
+    gpu_before = _gpu_apps()
+    used_before = sum((gpu_before or {}).get(p, 0) for p in target_pids)
+    denied = _send("TERM", targets)
+    if denied:
+        return _outside_fail(
+            "some of that server's processes refused the signal",
+            command=_shown_kill_command("TERM", denied), pids=target_pids,
         )
     signal_used = "TERM"
     if not _wait_gone(targets, grace):
         signal_used = "KILL"
-        ok, command = _send("KILL", targets)
-        if not ok:
+        denied = _send("KILL", targets)
+        if denied:
             return _outside_fail(
-                "the server did not stop and sudo needs a password to force it; run the command shown on that Spark",
-                command=command, pids=target_pids,
+                "the server did not stop and some processes refused SIGKILL",
+                command=_shown_kill_command("KILL", denied), pids=target_pids,
             )
         _wait_gone(targets, _OUTSIDE_KILL_WAIT)
     left = [int(t["pid"]) for t in targets if _alive(t)]

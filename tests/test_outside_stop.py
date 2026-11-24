@@ -186,55 +186,110 @@ def test_never_signals_its_own_process(agent_cfg):
         s.listen()
         out = agent._stop_outside({"port": s.getsockname()[1]})
     assert out["stopped"] is False
-    assert "could not find" in out["error"]
+    assert "own session" in out["error"]
 
 
-def test_other_users_process_uses_exact_sudo_kill_or_returns_the_command(dummy, agent_cfg, monkeypatch):
-    port, proc, child = dummy()
+def _no_sudo(monkeypatch) -> list[list[str]]:
+    """Record every subprocess argv; any sudo call fails the test."""
     calls: list[list[str]] = []
     real_run = subprocess.run
 
     def fake_run(argv, **kw):
-        if argv and argv[0] == "sudo":
-            calls.append(list(argv))
-            return subprocess.CompletedProcess(argv, 1, "", "sudo: a password is required")
+        calls.append(list(argv))
+        assert argv[0] != "sudo", argv
         return real_run(argv, **kw)
 
-    monkeypatch.setattr(agent.os, "getuid", lambda: 99999)
     monkeypatch.setattr(agent.subprocess, "run", fake_run)
+    return calls
+
+
+def test_other_users_process_is_never_signalled_and_the_command_is_shown(dummy, agent_cfg, monkeypatch):
+    port, proc, child = dummy()
+    calls = _no_sudo(monkeypatch)
+    sent: list[int] = []
+    monkeypatch.setattr(agent, "_signal_one", lambda info, signum: sent.append(info["pid"]) or "sent")
+    monkeypatch.setattr(agent.os, "getuid", lambda: 99999)
+    out = agent._stop_outside({"port": port})
+    assert out["stopped"] is False and "another user" in out["error"]
+    pids = sorted([proc.pid, child])
+    assert out["command"] == "sudo kill -s TERM -- " + " ".join(map(str, pids))
+    assert sent == []
+    assert not any(c and c[0] == "sudo" for c in calls)
+    assert proc.poll() is None and not _gone(child)
+
+
+def test_signal_refused_shows_the_command_and_never_uses_sudo(dummy, agent_cfg, monkeypatch):
+    port, proc, child = dummy()
+    calls = _no_sudo(monkeypatch)
+    monkeypatch.setattr(agent, "_signal_one", lambda info, signum: "denied")
     out = agent._stop_outside({"port": port})
     assert out["stopped"] is False
-    pids = sorted([proc.pid, child])
-    assert calls == [["sudo", "-n", "/usr/bin/kill", "-s", "TERM", "--", *map(str, pids)]]
-    assert out["command"] == "sudo /usr/bin/kill -s TERM -- " + " ".join(map(str, pids))
+    assert out["command"].startswith("sudo kill -s TERM -- ")
+    assert not any(c and c[0] == "sudo" for c in calls)
     assert proc.poll() is None
 
 
-def test_other_users_process_stopped_when_sudo_is_allowed(dummy, agent_cfg, monkeypatch):
-    port, proc, child = dummy()
-    real_run = subprocess.run
-
-    def fake_run(argv, **kw):
-        if argv and argv[0] == "sudo":
-            assert argv[:6] == ["sudo", "-n", "/usr/bin/kill", "-s", "TERM", "--"]
-            for pid in argv[6:]:
-                os.kill(int(pid), 15)
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        return real_run(argv, **kw)
-
-    monkeypatch.setattr(agent.os, "getuid", lambda: 99999)
-    monkeypatch.setattr(agent.subprocess, "run", fake_run)
-    out = agent._stop_outside({"port": port})
-    assert out["stopped"] is True, out
-    proc.wait(timeout=5)
-
-
-def test_unreadable_owner_returns_the_command(agent_cfg, monkeypatch):
+def test_hidden_owner_shows_only_a_lookup_command(agent_cfg, monkeypatch):
+    monkeypatch.setattr(agent, "_running_containers", lambda: [])
     monkeypatch.setattr(agent, "_listen_inodes", lambda port: {"123"})
     monkeypatch.setattr(agent, "_socket_pids", lambda inodes: (set(), True))
+    calls = _no_sudo(monkeypatch)
     out = agent._stop_outside({"port": 8020})
-    assert out["stopped"] is False
-    assert out["command"] == "sudo fuser -k -TERM 8020/tcp"
+    assert out["stopped"] is False and "nothing was stopped" in out["error"]
+    assert out["command"] == "sudo ss -ltnp 'sport = :8020'"
+    assert "kill" not in out["command"] and "fuser" not in out["command"]
+    assert calls == []
+
+
+def test_port_of_a_sparksi_container_is_refused_before_any_signal(dummy, agent_cfg, monkeypatch):
+    """A failed, timed-out or half-up Sparksi run still serving: never touched, whatever the records say."""
+    port, proc, child = dummy()
+    monkeypatch.setattr(agent, "_running_containers", lambda: ["sparksi-glm-head", "sparksi-glm-worker"])
+    monkeypatch.setattr(agent, "_container_listen_port", lambda name, address: port)
+    sent: list[int] = []
+    monkeypatch.setattr(agent, "_signal_one", lambda info, signum: sent.append(info["pid"]) or "sent")
+    out = agent._stop_outside({"port": port})
+    assert out["stopped"] is False and "Sparksi container" in out["error"]
+    assert sent == [] and proc.poll() is None and not _gone(child)
+
+
+def test_plumbing_anywhere_in_the_group_is_refused(dummy, agent_cfg, monkeypatch):
+    port, proc, child = dummy()
+    real = agent._proc_info
+
+    def fake(pid):
+        info = real(pid)
+        if info and pid == child:
+            info = dict(info, comm="systemd-resolve")
+        return info
+
+    monkeypatch.setattr(agent, "_proc_info", fake)
+    out = agent._stop_outside({"port": port})
+    assert out["stopped"] is False and "nothing was stopped" in out["error"]
+    assert proc.poll() is None
+
+
+def test_own_session_in_the_targets_refuses_everything(dummy, agent_cfg, monkeypatch):
+    port, proc, child = dummy()
+    monkeypatch.setattr(agent, "_own_lineage", lambda: {child})
+    sent: list[int] = []
+    monkeypatch.setattr(agent, "_signal_one", lambda info, signum: sent.append(info["pid"]) or "sent")
+    out = agent._stop_outside({"port": port})
+    assert out["stopped"] is False and "own session" in out["error"]
+    assert sent == []
+
+
+def test_reused_pid_is_never_signalled(dummy, agent_cfg):
+    _port, proc, _child = dummy()
+    info = dict(agent._proc_info(proc.pid), start="1")  # same PID, different start time
+    assert agent._signal_one(info, 15) == "gone"
+    time.sleep(0.2)
+    assert proc.poll() is None
+
+
+def test_no_sudo_kill_left_in_the_agent():
+    assert not hasattr(agent, "_kill_command")
+    assert "/usr/bin/kill" not in open(agent.__file__, encoding="utf-8").read()
 
 
 class _Docker:
@@ -314,10 +369,19 @@ def test_mark_emergency():
         _item(port=8026, container="ComfyUI-box"),
     ]
     items.append(_item(port=8027, label="video"))
-    out = unmanaged.mark_emergency(items, ours={"sparksi-x-head"}, keep={"keepme"}, keep_ports={8027})
-    assert [i["emergency"] for i in out] == [True, True, False, False, False, False, False, False]
+    items.append(_item(port=8028))
+    items.append(_item(host="s2", port=8020))
+    out = unmanaged.mark_emergency(items, ours={"sparksi-x-head"}, keep={"keepme"}, keep_ports={8027}, sparksi_ports={"s1": {8028}})
+    assert [i["emergency"] for i in out] == [True, True, False, False, False, False, False, False, False, False]
     assert out[7]["why"] == unmanaged._PROTECTED
     assert out[4]["why"] == unmanaged._PROTECTED and out[5]["why"] == unmanaged._PROTECTED
+    assert out[8]["why"] == unmanaged._SPARKSI_PORT
+    assert out[9]["why"] == unmanaged._UNKNOWN  # docker not asked on s2: nothing offered there
+
+
+def test_mark_emergency_without_docker_answers_offers_nothing():
+    out = unmanaged.mark_emergency([_item()])
+    assert out[0]["emergency"] is False and out[0]["why"] == unmanaged._UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -337,13 +401,15 @@ def _raw(n: int) -> dict:
 class FakeRunner:
     def __init__(self, containers: dict[str, dict[str, int]]):
         self.containers = containers
+        self.sparksi: dict[str, dict[str, int]] = {}
         self.calls: list[tuple[str, dict]] = []
         self.reply = {"ok": True, "stopped": True, "signal": "TERM", "port_closed": True, "gpu_checked": True, "gpu_freed_mib": 5000, "pids": [10, 11]}
 
     def invoke(self, host, req, timeout=60):
         self.calls.append((host, dict(req)))
         if req.get("op") == "probe":
-            return {"ok": True, "unmanaged_containers": dict(self.containers.get(host, {}))}
+            return {"ok": True, "unmanaged_containers": dict(self.containers.get(host, {})),
+                    "container_ports": dict(self.sparksi.get(host, {}))}
         if req.get("op") == "stop_outside":
             # The SSH runner resolves a Spark-only op through the catalog hosts, keyed by node name.
             from sparksi.remote import recipe_target_error
@@ -460,11 +526,38 @@ def test_confirmation_must_name_model_spark_and_port(site, confirm):
 
 def test_failure_is_logged_and_returns_the_command(site):
     _items(site["port"])
-    site["runner"].reply = {"ok": False, "stopped": False, "error": "sudo needs a password", "command": "sudo /usr/bin/kill -s TERM -- 10"}
+    site["runner"].reply = {"ok": False, "stopped": False, "error": "that server belongs to another user; nothing was stopped", "command": "sudo kill -s TERM -- 10"}
     status, body = ask(site["port"], "POST", "/api/outside/stop", _body(site))
     assert status == 502
-    assert body["command"] == "sudo /usr/bin/kill -s TERM -- 10"
-    assert site["notes"][0][1].endswith("failed: sudo needs a password")
+    assert body["command"] == "sudo kill -s TERM -- 10"
+    assert site["notes"][0][1].endswith("failed: that server belongs to another user; nothing was stopped")
+
+
+@pytest.mark.parametrize("phase", ["failed", "timed_out", "stopped", "ready"])
+def test_half_up_sparksi_container_port_never_offered(site, monkeypatch, phase):
+    """A Sparksi container still serving the port hides the button, whatever its run record says."""
+    host = site["host"]
+    site["runner"].sparksi[host] = {"sparksi-glm-head": 8020}
+    monkeypatch.setattr("sparksi.recipes.runs.list_runs", lambda: [{"id": "r9", "phase": phase, "port": 9999, "nodes": [{"host": host, "container": "sparksi-glm-head"}]}])
+    items = _items(site["port"])
+    assert items[8020]["emergency"] is False and items[8020]["why"] == unmanaged._SPARKSI_PORT
+    status, _ = ask(site["port"], "POST", "/api/outside/stop", _body(site))
+    assert status == 409 and site["runner"].stops() == []
+
+
+def test_docker_unknown_never_offered(site, monkeypatch):
+    real = site["runner"].invoke
+
+    def no_docker(host, req, timeout=60):
+        if req.get("op") == "probe":
+            return {"ok": False, "error": "docker down"}
+        return real(host, req, timeout)
+
+    monkeypatch.setattr(site["runner"], "invoke", no_docker)
+    items = _items(site["port"])
+    assert items and all(i["emergency"] is False for i in items.values())
+    status, _ = ask(site["port"], "POST", "/api/outside/stop", _body(site))
+    assert status == 409
 
 
 def test_protected_label_not_offered_and_refused(site, monkeypatch):

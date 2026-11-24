@@ -41,8 +41,10 @@ const { webkit } = require("playwright");
     page.on("dialog", (d) => { out.dialogs.push(d.message()); d.dismiss(); });
     let reply = { stopped: true, port_closed: true, gpu_checked: true, gpu_freed_mib: 5000, signal: "TERM" };
     let status = 200;
+    let delay = 0;
     await page.route("**/api/outside/stop", async (route) => {
       out.posts.push(route.request().postDataJSON());
+      if (delay) await new Promise((r) => setTimeout(r, delay));
       await route.fulfill({ status: status, contentType: "application/json", body: JSON.stringify(reply) });
     });
     const base = "http://127.0.0.1:" + process.env.PAGE_PORT;
@@ -94,11 +96,16 @@ const { webkit } = require("playwright");
     await page.click("#model-confirm-ok");
     await page.waitForFunction(() => document.querySelector("#unmanaged-note").textContent.startsWith("Stopped"));
     out.note1 = await page.$eval("#unmanaged-note", (el) => el.textContent);
-    reply = { stopped: false, error: "that server belongs to another user and sudo needs a password; run the command shown on that Spark", command: "sudo /usr/bin/kill -s TERM -- 4242" };
+    reply = { stopped: false, error: "that server belongs to another user; nothing was stopped", command: "sudo kill -s TERM -- 4242" };
     status = 502;
+    delay = 800;
     await page.click(rowSel(2));
     out.dialog2 = await facts();
     await page.click("#model-confirm-ok");
+    // A second click while that stop is in flight opens nothing and sends nothing.
+    await page.waitForTimeout(100);
+    await page.click(rowSel(1));
+    out.inFlight = { open: await page.evaluate(() => document.getElementById("model-confirm").open), posts: out.posts.length };
     await page.waitForFunction(() => document.querySelector("#unmanaged-note").textContent.startsWith("Not stopped"));
     out.note2 = await page.$eval("#unmanaged-note", (el) => el.textContent);
   } finally {
@@ -188,7 +195,9 @@ def test_emergency_stop_button_confirms_and_posts_with_the_lock_on(page_server):
     assert out["posts"][1]["container"] == "boxed-server"
     assert out["posts"][1]["confirm"] == {"model": "boxed", "spark": "spark-3", "port": 8030}
     assert out["note2"] == (
-        "Not stopped: that server belongs to another user and sudo needs a password; run the command shown on that Spark."
-        " Run on spark-3: sudo /usr/bin/kill -s TERM -- 4242"
+        "Not stopped: that server belongs to another user; nothing was stopped."
+        " Run on spark-3: sudo kill -s TERM -- 4242"
     )
+    assert out["inFlight"] == {"open": False, "posts": 2}
+    assert len(out["posts"]) == 2
     assert STATE.lock.read().locked is True

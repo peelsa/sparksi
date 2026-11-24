@@ -4678,6 +4678,9 @@
     });
   }
   function emergencyStop(item, button) {
+    if (unmanagedBusy) {
+      return;
+    }
     var note = item.container
       ? "Sparksi did not start it. This stops the container " + item.container + " with docker stop. It works with the lock on."
       : "Sparksi did not start it. This ends the process listening on port " + item.port + " and its child processes: SIGTERM, then SIGKILL if it does not exit. It works with the lock on.";
@@ -4694,6 +4697,9 @@
   }
 
   function sendEmergencyStop(item, button) {
+    if (unmanagedBusy) {
+      return;
+    }
     unmanagedBusy = true;
     button.disabled = true;
     setText("unmanaged-note", "Stopping " + item.label + " on " + item.host_name + "\u2026");

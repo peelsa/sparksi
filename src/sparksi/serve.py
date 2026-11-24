@@ -782,21 +782,27 @@ def _unmanaged_nodes() -> list[dict[str, Any]]:
     return [{"id": n.id, "name": n.name or n.id, "role": role} for role, n in CFG.role_nodes()]
 
 
-def _unmanaged_containers(runner: Any, host: str) -> dict[str, int] | None:
-    """{container: port} for running containers Sparksi did not start on ``host`` (read-only probe)."""
+def _unmanaged_containers(runner: Any, host: str) -> dict[str, dict[str, int]] | None:
+    """Running containers on ``host`` (read-only probe): {"outside": {name: port}, "sparksi": {name: port}}.
+
+    "outside" are the ones Sparksi did not start; "sparksi" its own ``sparksi-*`` ones, whose
+    ports are never offered an emergency stop whatever the run records say.
+    """
     try:
-        reply = runner.invoke(host, {"op": "probe", "ports": [], "unmanaged_ports": True}, timeout=20)
+        reply = runner.invoke(host, {"op": "probe", "ports": [], "unmanaged_ports": True, "container_ports": True}, timeout=20)
     except Exception:  # noqa: BLE001 - shown as "docker could not be asked"
         return None
     found = reply.get("unmanaged_containers") if isinstance(reply, dict) and reply.get("ok") else None
     if not isinstance(found, dict):
         return None
-    out: dict[str, int] = {}
-    for name, port in found.items():
-        try:
-            out[str(name)] = int(port)
-        except (TypeError, ValueError):
-            continue
+    ours = reply.get("container_ports")
+    out: dict[str, dict[str, int]] = {"outside": {}, "sparksi": {}}
+    for key, raw in (("outside", found), ("sparksi", ours if isinstance(ours, dict) else {})):
+        for name, port in raw.items():
+            try:
+                out[key][str(name)] = int(port)
+            except (TypeError, ValueError):
+                continue
     return out
 
 
@@ -823,11 +829,13 @@ def _unmanaged_items(runner: Any, *, cached: bool, cat: dict[str, Any]) -> tuple
         else:
             got = _unmanaged_containers(runner, host)
         by_host[host] = got
-    items = unmanaged.attach_containers(items, by_host)
+    outside_by_host = {h: (None if got is None else got["outside"]) for h, got in by_host.items()}
+    sparksi_ports = {h: set(got["sparksi"].values()) for h, got in by_host.items() if got is not None}
+    items = unmanaged.attach_containers(items, outside_by_host)
     # A container named in any Sparksi run record is ours, whatever its name or phase.
     ours = unmanaged.sparksi_containers(runs)
     items = unmanaged.mark_stoppable(items, CFG.controller.get("stop_unmanaged") is True, ours)
-    items = unmanaged.mark_emergency(items, ours, _outside_keep(cat), _outside_keep_ports(cat))
+    items = unmanaged.mark_emergency(items, ours, _outside_keep(cat), _outside_keep_ports(cat), sparksi_ports)
     return items, checked
 
 
