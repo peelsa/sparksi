@@ -64,6 +64,24 @@ def test_parse_metrics_ignores_bad_fractions(value):
     assert si.parse_metrics(page)["kv_pct"] == 20.0
 
 
+def test_parse_metrics_many_engines_labels_nan_and_missing():
+    text = (
+        "# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.\n"
+        'vllm:kv_cache_usage_perc{engine="0",model_name="a{b}c \\"q\\""} 0.25\n'
+        'vllm:kv_cache_usage_perc{engine="1",model_name="other"} 0.5 1732560000000\n'
+        'vllm:kv_cache_usage_perc{engine="2",model_name="x"} NaN\n'
+        'vllm:num_requests_running{engine="0",model_name="a"} 2\n'
+        'vllm:num_requests_running{engine="1",model_name="other"} 1\n'
+        'vllm:num_requests_running{engine="2",model_name="x"} +Inf\n'
+        "vllm:kv_cache_usage_perc_bucket 0.9\n"
+        'vllm:cache_config_info{block_size="16",num_gpu_blocks=""} 1\n'
+    ).encode()
+    out = si.parse_metrics(text)
+    assert out == {"kv_pct": 50.0, "running": 3, "engine": "vllm"}
+    assert si.parse_metrics(b"") == {}
+    assert si.parse_metrics(b"vllm:kv_cache_usage_perc\n") == {}
+
+
 def test_parse_metrics_older_vllm_name():
     assert si.parse_metrics(b"vllm:gpu_cache_usage_perc 0.75\n")["kv_pct"] == 75.0
 
@@ -224,9 +242,70 @@ class FixedCache:
         self.info = info
         self.urls: list[str] = []
 
-    def get(self, url):
+    def get(self, url, key=""):
         self.urls.append(url)
         return dict(self.info)
+
+
+def test_new_run_on_the_same_port_never_shows_the_old_runs_answer():
+    clock = Clock()
+    answers = {"ctx": 1}
+    cache = si.Cache(read=lambda url: dict(answers), clock=clock, spawn=lambda fn: fn())
+    cache.get("u", "old-run")
+    assert cache.get("u", "old-run") == {"ctx": 1}
+    answers["ctx"] = 2
+    # A new run on the same server URL starts empty: the old run's value is not handed over.
+    assert cache.get("u", "new-run") == {}
+    assert cache.get("u", "new-run") == {"ctx": 2}
+
+
+def test_an_old_answer_is_hidden_even_while_its_refresh_runs():
+    clock = Clock()
+    pending: list = []
+    cache = si.Cache(read=lambda url: {"ctx": 1}, clock=clock, spawn=pending.append)
+    cache.get("u", "r")
+    pending.pop()()
+    assert cache.get("u", "r") == {"ctx": 1}
+    clock.now += si.TTL_S + 1
+    assert cache.get("u", "r") == {"ctx": 1}  # stale but recent: shown while the refresh runs
+    assert len(pending) == 1
+    clock.now += si.MAX_STALE_S
+    assert cache.get("u", "r") == {}  # the engine went quiet: nothing old is shown
+    assert len(pending) == 1  # still one refresh in flight, never a second thread
+
+
+def test_off_limits_port_is_never_asked(monkeypatch):
+    from sparksi import protect
+
+    monkeypatch.setattr(protect, "is_off_limits", lambda port: port == 8188)
+    cache = FixedCache(INFO)
+    body = {"runs": [{"id": "r1", "phase": "ready", "port": 8188, "health": {"host": "spark-1"}}]}
+    assert si.attach(body, lambda host: "100.64.0.11", cache) is body
+    assert cache.urls == []
+
+
+@pytest.mark.parametrize("phase", ["failed", "timed_out", "stopping", "starting", "waiting_health", "stopped"])
+def test_only_ready_runs_are_asked(phase):
+    cache = FixedCache(INFO)
+    body = {"runs": [{"id": "r1", "phase": phase, "port": 8014, "health": {"host": "spark-1"}, "failed_side": "worker"}],
+            "serving": [{"role": "head", "run_id": "r1"}]}
+    assert si.attach(body, lambda host: "100.64.0.11", cache) is body
+    assert cache.urls == []
+
+
+def test_pair_run_is_read_from_its_lead_and_named_on_both_cards():
+    cache = FixedCache(INFO)
+    addresses = {"spark-1": "100.64.0.11", "spark-2": "100.64.0.12"}
+    body = {
+        "runs": [
+            {"id": "pair", "phase": "ready", "port": 8014, "health": {"host": "spark-1"}},
+            {"id": "solo", "phase": "ready", "port": 8020, "health": {"host": "spark-2"}},
+        ],
+        "serving": [{"role": "head", "run_id": "pair"}, {"role": "worker", "run_id": "pair"}, {"role": "worker", "run_id": "solo"}],
+    }
+    out = si.attach(body, addresses.get, cache)
+    assert cache.urls == ["http://100.64.0.11:8014", "http://100.64.0.12:8020"]
+    assert [row.get("serving_info") for row in out["serving"]] == [INFO, INFO, INFO]
 
 
 INFO = {"ctx": 850000, "kv_pct": 13.6, "kv_tokens": 1233779, "running": 1, "engine": "vllm"}
@@ -317,7 +396,7 @@ def test_serving_address_falls_back_to_ssh_name(sparks, monkeypatch):
 def test_with_serving_info_uses_the_cache_and_never_fails(sparks, monkeypatch):
     body = {"runs": [{"id": "r1", "phase": "ready", "port": 8014, "health": {"host": sparks[-1].name}}], "serving": []}
     seen: list[str] = []
-    monkeypatch.setattr(si.CACHE, "get", lambda url: seen.append(url) or dict(INFO))
+    monkeypatch.setattr(si.CACHE, "get", lambda url, key="": seen.append(url) or dict(INFO))
     out = serve_mod._with_serving_info(body)
     assert out["runs"][0]["serving_info"] == INFO
     assert seen == [f"http://{sparks[-1].tailscale}:8014"]

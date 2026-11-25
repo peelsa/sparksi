@@ -20,12 +20,13 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable
 
-from sparksi import monitor_hosts
+from sparksi import monitor_hosts, protect
 
 TIMEOUT_S = 1.5  # each socket step
 TOTAL_S = 2.5  # one whole GET
 TTL_S = 10.0  # a good answer is reused this long
 FAIL_TTL_S = 30.0  # a server that gave nothing is asked again after this long
+MAX_STALE_S = 60.0  # an answer older than this is never shown, even while a refresh runs
 MAX_URLS = 16
 
 # Fractions 0..1 of the KV cache in use, by engine.
@@ -240,43 +241,47 @@ class Cache:
         self._clock = clock
         self._spawn = spawn or _spawn
         self._lock = threading.Lock()
-        self._values: OrderedDict[str, tuple[dict, float]] = OrderedDict()
-        self._running: set[str] = set()
+        self._values: OrderedDict[tuple[str, str], tuple[dict, float]] = OrderedDict()
+        self._running: set[tuple[str, str]] = set()
 
-    def get(self, url: str) -> dict:
+    def get(self, url: str, key: str = "") -> dict:
+        """The last answer for ``url`` read for ``key`` (a run id), so a new run on the same port starts empty."""
+        slot = (key, url)
         with self._lock:
-            held = self._values.get(url)
-            value = dict(held[0]) if held else {}
+            held = self._values.get(slot)
+            value: dict = {}
+            fresh = False
             if held is not None:
+                age = self._clock() - held[1]
                 ttl = TTL_S if held[0] else FAIL_TTL_S
-                fresh = (self._clock() - held[1]) < ttl
-            else:
-                fresh = False
-            start = not fresh and url not in self._running
+                fresh = age < ttl
+                if age < MAX_STALE_S:
+                    value = dict(held[0])
+            start = not fresh and slot not in self._running
             if start:
-                self._running.add(url)
+                self._running.add(slot)
         if start:
             try:
-                self._spawn(lambda: self._refresh(url))
+                self._spawn(lambda: self._refresh(slot))
             except Exception:  # noqa: BLE001 - no thread: try again on the next poll
                 with self._lock:
-                    self._running.discard(url)
+                    self._running.discard(slot)
         return value
 
-    def _refresh(self, url: str) -> None:
+    def _refresh(self, slot: tuple[str, str]) -> None:
         try:
             try:
-                value = self._read(url)
+                value = self._read(slot[1])
             except Exception:  # noqa: BLE001 - a reader bug must not stop later refreshes
                 value = {}
             with self._lock:
-                self._values[url] = (dict(value) if isinstance(value, dict) else {}, self._clock())
-                self._values.move_to_end(url)
+                self._values[slot] = (dict(value) if isinstance(value, dict) else {}, self._clock())
+                self._values.move_to_end(slot)
                 while len(self._values) > MAX_URLS:
                     self._values.popitem(last=False)
         finally:
             with self._lock:
-                self._running.discard(url)
+                self._running.discard(slot)
 
     def clear(self) -> None:
         with self._lock:
@@ -320,7 +325,7 @@ def _run_info(run: Any, address_for: Callable[[str], str], cache: Cache) -> dict
         if not isinstance(run, dict) or run.get("phase") != "ready" or not run.get("id"):
             return {}
         port = run.get("port")
-        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535 or protect.is_off_limits(port):
             return {}
         health = run.get("health") if isinstance(run.get("health"), dict) else {}
         host = health.get("host")
@@ -330,6 +335,7 @@ def _run_info(run: Any, address_for: Callable[[str], str], cache: Cache) -> dict
         if not address:
             return {}
         shown = f"[{address}]" if ":" in address and not address.startswith("[") else address
-        return cache.get(f"http://{shown}:{port}")
+        # Keyed by run id too: a stale run's answer never shows on a new run on the same port.
+        return cache.get(f"http://{shown}:{port}", str(run.get("id")))
     except Exception:  # noqa: BLE001 - one odd run never breaks the list
         return {}

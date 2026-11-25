@@ -38,7 +38,7 @@ class _Answers:
         self.info: dict = {}
         self.urls: list[str] = []
 
-    def get(self, url):
+    def get(self, url, key=""):
         self.urls.append(url)
         return dict(self.info)
 
