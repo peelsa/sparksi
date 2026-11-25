@@ -244,6 +244,29 @@ def _with_serving(body: dict[str, Any]) -> dict[str, Any]:
     return attach(body, loaded, hosts, head_id=CFG.head.id, worker_id=worker_id, extra_ids=extra or None)
 
 
+def _serving_address(host: str) -> str:
+    """Where the controller reaches a configured Spark: its tailnet address, else its ssh name. Empty when unknown."""
+    from sparksi.config import CFG
+
+    for node in CFG.nodes:
+        if host and host in (node.id, node.name):
+            for value in (node.tailscale, node.ssh, node.name):
+                text = str(value or "").strip()
+                if text and text != "local" and "@" not in text:
+                    return text
+    return ""
+
+
+def _with_serving_info(body: dict[str, Any]) -> dict[str, Any]:
+    """Context size and KV cache use from each ready run's server: cached, never waits on the network."""
+    from sparksi import serving_info
+
+    try:
+        return serving_info.attach(body, _serving_address)
+    except Exception:  # noqa: BLE001 - the extra facts are optional; the runs still answer
+        return body
+
+
 def _model_suffix(path: str) -> tuple[str, str] | None:
     parts = path.strip("/").split("/")
     if len(parts) == 4 and parts[0] == "api" and parts[1] == "models" and parts[3] in ("recipe", "plan", "service"):
@@ -1169,12 +1192,12 @@ class Handler(BaseHTTPRequestHandler):
                         mirrored = {"runs": [], "stale": True, "source": "unavailable"}
                     if STATE.readonly:
                         return self._json(200, mirrored)
-                    return self._json(200, _with_serving(mirrored))
+                    return self._json(200, _with_serving_info(_with_serving(mirrored)))
                 runner = active_runner(cat)
                 rows = _read("runs", cat, runner, lambda: runs_index(CachedReads(runner), cat))
                 if rows is PENDING:
                     rows = runs_index(None, cat)  # the recorded runs until the nodes answer
-                return self._json(200, _with_serving(dict(rows)))
+                return self._json(200, _with_serving_info(_with_serving(dict(rows))))
             run_hit = _run_id(path)
             if run_hit:
                 if STATE.readonly:

@@ -163,7 +163,7 @@ def _present(run: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(node, dict):
             continue
         nodes.append({"role": node.get("role") or "", "state": node.get("phase") or ""})
-    return {
+    out = {
         "recipe": run.get("model_id") or "",
         "id": run.get("id") or "",
         "state": run.get("phase") or "",
@@ -171,6 +171,24 @@ def _present(run: dict[str, Any]) -> dict[str, Any]:
         "nodes": nodes,
         "started_by": run.get("started_by") or "",
     }
+    info = run.get("serving_info")
+    if isinstance(info, dict) and info:
+        out["serving_info"] = dict(info)
+    return out
+
+
+def _kv_words(info: Any) -> str:
+    """Words such as 850000 ctx · 13.6% KV used from a run's serving_info; empty when the server did not say."""
+    if not isinstance(info, dict):
+        return ""
+    parts: list[str] = []
+    ctx = info.get("ctx")
+    if isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0:
+        parts.append(f"{ctx} ctx")
+    pct = info.get("kv_pct")
+    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+        parts.append(f"{pct:g}% KV used (shared by all requests)")
+    return " · ".join(parts)
 
 
 def _reasons(payload: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -358,7 +376,8 @@ def cmd_runs(args: Any) -> int:
             print("no runs")
         for run in rows:
             where = ", ".join(node["role"] for node in run["nodes"] if node["role"]) or "head"
-            print(f"{run['recipe']}  {run['id']}  {run['state']}  port {run['port']}  {where}  {run['started_by']}")
+            kv = _kv_words(run.get("serving_info"))
+            print(f"{run['recipe']}  {run['id']}  {run['state']}  port {run['port']}  {where}  {run['started_by']}" + (f"  {kv}" if kv else ""))
         for item in live:
             print(f"{item.get('role') or ''}  {item.get('state') or ''}  {item.get('text') or ''}")
     return 0

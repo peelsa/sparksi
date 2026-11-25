@@ -38,7 +38,7 @@ These commands talk only to the controller HTTP API. They never call Docker.
 
 - `sparksi start <recipe-id> [--wait] [--timeout SECS] [--ctx N] [--json]`
 - `sparksi stop <recipe-id|run-id> [--wait] [--timeout SECS] [--json]`
-- `sparksi runs [--json]`
+- `sparksi runs [--json]`: each ready run also shows its context size and KV cache use when its server reports them (`serving_info` in the JSON)
 - `sparksi plan <recipe-id> [--ctx N] [--json]`: dry plan only; starts nothing.
 
 `--timeout` defaults to 180 seconds. The controller applies the lock, the

@@ -818,11 +818,13 @@
     border-radius: var(--radius);
     padding: var(--s3);
   }
-  .serve-box h2 { margin: 0 0 var(--s2); font-size: 16px; line-height: 1.2; white-space: nowrap; }
+  .serve-box h2 { margin: 0 0 var(--s2); font-size: 16px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .serve-box p { margin: 0; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
   .serve-box .serve-meta { color: var(--muted); font-weight: 500; }
   .serve-box h2 .serve-clock { font-weight: 500; color: var(--muted); }
   .serve-box h2 .serve-clock:not(:empty)::before { content: " · "; font-weight: 500; }
+  .serve-box h2 .serve-kv { font-weight: 500; color: var(--muted); }
+  .serve-box h2 .serve-kv:not(:empty)::before { content: " · "; font-weight: 500; }
 
   .gpu-clock {
     display: flex;
@@ -3729,8 +3731,11 @@
       title.textContent = roleWord(role);
       var clock = document.createElement("span");
       clock.className = "serve-clock";
+      var kv = document.createElement("span");
+      kv.className = "serve-kv";
       heading.appendChild(title);
       heading.appendChild(clock);
+      heading.appendChild(kv);
       var body = document.createElement("div");
       body.className = "serve-body";
       section.appendChild(heading);
@@ -3907,6 +3912,52 @@
     var root = el("opt-gpu-clock-rows");
     if (!root) return null;
     return root.querySelector('.gpu-clock[data-role="' + role + '"]');
+  }
+  /* Context size in tokens, short: 1024 multiples as k or M (32k, 128k, 1M), else thousands (850k). */
+  function ctxWords(n) {
+    n = Number(n);
+    if (!(n > 0)) return "";
+    if (n % 1048576 === 0) return (n / 1048576) + "M";
+    if (n % 1024 === 0) return (n / 1024) + "k";
+    if (n >= 1000000) return trimNum(n / 1000000, 2) + "M";
+    if (n >= 1000) return Math.round(n / 1000) + "k";
+    return String(n);
+  }
+  /* "850k ctx · 13% used" for the first run on this card the server reported, and a title that explains it. */
+  function serveKvFacts(role) {
+    var runs = (typeof serveEntries === "function") ? serveEntries(role) : [];
+    for (var i = 0; i < runs.length; i++) {
+      var info = runs[i] && runs[i].serving_info;
+      if (!info || typeof info !== "object") continue;
+      var parts = [];
+      var tips = [];
+      var ctx = ctxWords(info.ctx);
+      if (ctx) {
+        parts.push(ctx + " ctx");
+        tips.push("Context: up to " + Number(info.ctx).toLocaleString("en-US") + " tokens per request.");
+      }
+      if (typeof info.kv_pct === "number" && isFinite(info.kv_pct)) {
+        parts.push(Math.round(info.kv_pct) + "% used");
+        var size = info.kv_tokens ? " of " + Number(info.kv_tokens).toLocaleString("en-US") + " tokens" : "";
+        var busy = typeof info.running === "number" ? " " + info.running + (info.running === 1 ? " request is" : " requests are") + " running." : "";
+        tips.push("KV cache: " + trimNum(info.kv_pct, 1) + "% used" + size + ". This is the cache shared by all requests on this server, not one conversation." + busy);
+      }
+      if (parts.length) return { text: parts.join(" \u00b7 "), title: tips.join(" ") };
+    }
+    return { text: "", title: "" };
+  }
+  function paintServeKv() {
+    var root = el("serving-lines");
+    if (!root) return;
+    sparkRoles().forEach(function (role) {
+      var section = root.querySelector('.serve-box[data-role="' + role + '"]');
+      var kv = section && section.querySelector(".serve-kv");
+      if (!kv) return;
+      var facts = serveKvFacts(role);
+      setText(kv, facts.text);
+      if (facts.title) kv.setAttribute("title", facts.title);
+      else kv.removeAttribute("title");
+    });
   }
   function paintServeClocks() {
     if (typeof ensureServing === "function") ensureServing();
@@ -4157,6 +4208,7 @@
       }
       fillServeBody(body, lines);
     });
+    paintServeKv();
   }
   function gaugeArc(cx, cy, r, startDeg, endDeg) {
     var s = startDeg * Math.PI / 180;
