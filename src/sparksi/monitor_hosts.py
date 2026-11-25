@@ -54,7 +54,8 @@ PATHS: dict[str, tuple[str, ...]] = {
     "Ollama": ("/api/tags", "/api/ps"),
     "": ("/v1/models",),
 }
-_ALLOWED_PATHS = frozenset(p for paths in PATHS.values() for p in paths)
+# Plus llama.cpp /props and /slots: read-only, used for a run's context size and KV cache (serving_info).
+_ALLOWED_PATHS = frozenset(p for paths in PATHS.values() for p in paths) | {"/props", "/slots"}
 
 
 class Refused(ValueError):

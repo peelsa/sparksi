@@ -300,5 +300,5 @@ Plan and every GET work with the lock on. Start and stop need the lock off (or t
 | POST | `/api/models/<id>/recipes/<name>/default` | make it the default |
 | POST | `/api/models/<id>/recipes/<name>/rename` | rename (body `new_name`) |
 | POST | `/api/runs` | start. Returns a run id. Needs the lock off |
-| GET | `/api/runs` and `/api/runs/<id>` | phase, health, per-node log tail |
+| GET | `/api/runs` and `/api/runs/<id>` | phase, health, per-node log tail. The list also adds `serving_info` to each ready run, and to its `serving` rows, when its server reports them: `ctx` (context tokens per request), `kv_pct` (KV cache in use, 0 to 100, shared by all requests), `kv_tokens` (KV cache size in tokens), `running` (requests running) and `engine` |
 | POST | `/api/runs/<id>/stop` | stop. Refuses off-limits ports and `never_touch` |

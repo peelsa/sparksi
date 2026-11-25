@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Overview Spark cards are no taller or wider than they were before the GPU clock cap."""
+"""Overview Spark cards are no taller or wider than they were before the GPU clock cap and the context/KV facts."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+# The longest heading facts the page writes for a large model: "1.23M ctx" is wider than "850k ctx".
+KV_TEXT = "1.23M ctx · 100% used"
 STATIC = ROOT / "src" / "sparksi" / "static"
 INDEX = STATIC / "index.html"
 
@@ -147,7 +149,9 @@ def _box_markup(kind: str, *, clock: str, cap: str, model: bool) -> str:
         extra = ""
     elif kind == "after":
         clock_span = f'<span class="serve-clock">{clock}</span>' if clock else '<span class="serve-clock"></span>'
-        heading = f'<h2><span class="serve-title">Head</span>{clock_span}</h2>'
+        # A serving card also names the context size and KV cache use on the same line.
+        kv_span = f'<span class="serve-kv">{KV_TEXT}</span>' if model else '<span class="serve-kv"></span>'
+        heading = f'<h2><span class="serve-title">Head</span>{clock_span}{kv_span}</h2>'
         extra = ""
     else:
         heading = "<h2>Head</h2>"
@@ -264,7 +268,11 @@ const path = require("path");
           function cards(root) {
             return Array.from(document.querySelectorAll(root + " .serve-box")).map((el) => {
               const r = el.getBoundingClientRect();
-              return { role: el.getAttribute("data-role"), w: Math.round(r.width), h: Math.round(r.height) };
+              const head = el.querySelector("h2");
+              return {
+                role: el.getAttribute("data-role"), w: Math.round(r.width), h: Math.round(r.height),
+                spill: el.scrollWidth > el.clientWidth, headH: head ? Math.round(head.getBoundingClientRect().height) : 0,
+              };
             });
           }
           return {
@@ -370,6 +378,9 @@ def test_overview_cards_match_pre_pr27_footprint(measure_server, tmp_path) -> No
             for left, right in zip(before["cards"], after["cards"], strict=True):
                 assert right["w"] <= left["w"], (width, state, left, right)
                 assert right["h"] <= left["h"], (width, state, left, right)
+                # The heading stays one line and never pushes past the card, even with the KV facts.
+                assert right["headH"] <= left["headH"], (width, state, left, right)
+                assert right["spill"] is False, (width, state, right)
             boxed = pack[f"box-{state}"]
             # The Overview field we removed had made the card taller.
             assert boxed["grid"]["h"] > after["grid"]["h"], (width, state, boxed, after)
